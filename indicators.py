@@ -17,7 +17,6 @@ def add_strategy_indicators(order_book_df: pd.DataFrame, strategy: str = "buy"):
         pd.DataFrame: The input DataFrame with additional columns for the opportunity indicators.
     """
     if strategy == "buy":
-        order_book_df["strategy"] = "buy"
         if not order_book_df["micro_vs_mid"].any():
             logging.info("No micro price above mid-price. No opportunities detected.")
             return order_book_df  # Return early if no opportunities
@@ -25,7 +24,6 @@ def add_strategy_indicators(order_book_df: pd.DataFrame, strategy: str = "buy"):
             order_book_df["micro_price"] - order_book_df["mid_price"]
         )
     elif strategy == "sell":
-        order_book_df["strategy"] = "sell"
         if order_book_df["micro_vs_mid"].all():
             logging.info(
                 "Micro price is above mid-price everywhere. No sell opportunities detected."
