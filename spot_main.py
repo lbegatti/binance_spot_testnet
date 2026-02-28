@@ -6,7 +6,10 @@ import logging
 
 from metrics import get_order_book_metrics
 from quotes import find_best_quote
-from plot_helpers import plot_depth_bid_ask, Client
+from plot_helpers import plot_depth_bid_ask
+
+from binance.client import Client
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True
@@ -36,6 +39,8 @@ best_quotes = []
 
 initial_id = client.get_order_book(symbol="BNBUSDT")["lastUpdateId"]
 
+
+# TODO change the logic to use websockets instead of REST API to avoid the update gap issue and get real-time data.
 for d in depths_limit:
     order_book = client.get_order_book(symbol="BNBUSDT", limit=d)
     current_id = order_book["lastUpdateId"]
@@ -87,13 +92,17 @@ for d in depths_limit:
 
     plot_depth_bid_ask(df=order_depth_df)
 
-## 4.0 Get historical klines for a symbol
-# plot_ohlc_with_volume(
-#     client=client,
-#     symbol="BNBUSDT",
-#     interval=Client.KLINE_INTERVAL_1MINUTE,
-#     lookback="5 day ago UTC",
-# )
-# 4.2 Get recent trades for a symbol
-# 4.3 Get historical trades for a symbol
-# 4.4 Get aggregate trades for a symbol
+all_quotes = pd.concat(best_quotes, ignore_index=True)
+buy_mask = all_quotes["strategy"] == "buy"
+sell_mask = all_quotes["strategy"] == "sell"
+
+latest_buy = (
+    all_quotes[buy_mask].iloc[[-1]].reset_index(drop=True)
+    if not all_quotes[buy_mask].empty
+    else pd.DataFrame()
+)
+latest_sell = (
+    all_quotes[sell_mask].iloc[[-1]].reset_index(drop=True)
+    if not all_quotes[sell_mask].empty
+    else pd.DataFrame()
+)
