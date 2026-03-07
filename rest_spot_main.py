@@ -30,19 +30,26 @@ if not api_key or not api_secret:
 # The 'testnet=True' parameter tells the library to use the testnet.binance.vision URL
 client = Client(api_key, api_secret, testnet=True)
 
+# ---------------------------------------------------------------------------
+# Symbol configuration
+# ---------------------------------------------------------------------------
+symbol = "BTCUSDT"
+ccy = "USDT"
+cryptoccy = "BTC"
+
 # 3. Example: Get account information
-balance = client.get_asset_balance(asset="BNB", recvWindow=5000)
+balance = client.get_asset_balance(asset=cryptoccy, recvWindow=5000)
 
 # 4. Get different bids and asks for a symbol.
 depths_limit = [5, 10, 15, 20, 50]
 best_quotes = []
 
-initial_id = client.get_order_book(symbol="BNBUSDT")["lastUpdateId"]
+initial_id = client.get_order_book(symbol=symbol)["lastUpdateId"]
 
 
 # TODO change the logic to use websockets instead of REST API to avoid the update gap issue and get real-time data.
 for d in depths_limit:
-    order_book = client.get_order_book(symbol="BNBUSDT", limit=d)
+    order_book = client.get_order_book(symbol=symbol, limit=d)
     current_id = order_book["lastUpdateId"]
     gap_id = current_id - initial_id
     while gap_id >= 100:
@@ -54,7 +61,7 @@ for d in depths_limit:
         )
         time.sleep(1)
         current_id = order_book["lastUpdateId"]
-        order_book = client.get_order_book(symbol="BNBUSDT", limit=d)
+        order_book = client.get_order_book(symbol=symbol, limit=d)
         new_id = order_book["lastUpdateId"]
         gap_id = new_id - current_id
 

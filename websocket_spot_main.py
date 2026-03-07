@@ -1,6 +1,7 @@
+from functools import partial
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from binance.spot import Spot as Client
-import json
+from message_handler import handle_depth_message
 import logging
 from dotenv import load_dotenv
 import os
@@ -20,57 +21,60 @@ api_secret = os.getenv("BINANCE_TESTNET_SECRET_KEY")
 if not api_key or not api_secret:
     raise ValueError("API keys not found. Check your .env file.")
 
-rest_client = Client(api_key, api_secret, testnet=True)
+rest_client = Client(
+    api_key,
+    api_secret,
+    base_url="https://testnet.binance.vision",
+)
 
-# 2. Fetch the "Starting Point" (Snapshot)
-print("Fetching snapshot...")
-snapshot = rest_client.depth(symbol="BTCUSDT", limit=100)
+# ---------------------------------------------------------------------------
+# Symbol configuration
+# ---------------------------------------------------------------------------
+symbol = "BTCUSDT"
+ccy = "USDT"
+cryptoccy = "BTC"
+
+# ---------------------------------------------------------------------------
+# 2. Fetch account balance before any trading logic
+# ---------------------------------------------------------------------------
+# noinspection PyArgumentList
+account_info = rest_client.account(recvWindow=5000)
+balances = {
+    item["asset"]: {"free": float(item["free"]), "locked": float(item["locked"])}
+    for item in account_info["balances"]
+    if float(item["free"]) > 0 or float(item["locked"]) > 0
+}
+
+if not balances:
+    logging.warning("No non-zero balances found on this testnet account.")
+else:
+    logging.info("Account balances (non-zero):")
+    for asset, amounts in balances.items():
+        logging.info(f"  {asset}: free={amounts['free']}, locked={amounts['locked']}")
+
+# Check that we have USDT (or the quote asset) available for trading
+usdt_balance = balances.get(ccy, {}).get("free", 0.0)
+btc_balance = balances.get(cryptoccy, {}).get("free", 0.0)
+logging.info(f"Available {ccy}: {usdt_balance} | Available {cryptoccy}: {btc_balance}")
+
+if usdt_balance == 0 and btc_balance == 0:
+    raise ValueError(
+        f"No {ccy} or {cryptoccy} balance available. Fund your testnet account before trading."
+    )
+
+# ---------------------------------------------------------------------------
+# 3. Fetch the "Starting Point" (Snapshot)
+logging.info("Fetching order book snapshot...")
+# noinspection PyArgumentList
+snapshot = rest_client.depth(symbol=symbol, limit=100)
 local_book = {
     "bids": {price: qty for price, qty in snapshot["bids"]},
     "asks": {price: qty for price, qty in snapshot["asks"]},
     "lastUpdateId": snapshot["lastUpdateId"],
 }
 
-
-def handle_depth_message(_, message):
-    data = json.loads(message)
-
-    # Skip the subscription confirmation message (only has 'id' and 'result')
-    if "result" in data and "b" not in data:
-        logging.info("WebSocket subscription confirmed.")
-        return
-    # SYNC LOGIC: Ignore updates that are older than our snapshot
-    if data["u"] <= local_book["lastUpdateId"]:
-        return
-    # 1. Logic to sync with lastUpdateId goes here
-    # 2. Update local_book dictionary — bids ('b') and asks ('a')
-    for price, qty in data.get("b", []):
-        if float(qty) == 0:
-            local_book["bids"].pop(price, None)
-        else:
-            local_book["bids"][price] = qty
-
-    for price, qty in data.get("a", []):
-        if float(qty) == 0:
-            local_book["asks"].pop(price, None)
-        else:
-            local_book["asks"][price] = qty
-
-    # Now your strategy logic can always read from 'local_book'
-    # which is updated in real-time (no 1-second lag!)
-    calculate_best_quote()
-
-
-def calculate_best_quote():
-    # Get top of book without a network call
-    if not local_book["bids"] or not local_book["asks"]:
-        return
-
-        # Get the highest Buy price and lowest Sell price
-    best_bid = max(local_book["bids"].keys(), key=float)
-    best_ask = min(local_book["asks"].keys(), key=float)
-    print(f"Spread: {best_bid} | {best_ask}", end="\r")
-
-
-ws_client = SpotWebsocketStreamClient(on_message=handle_depth_message)
-ws_client.diff_book_depth(symbol="BTCUSDT", speed=100)  # 100ms updates
+ws_client = SpotWebsocketStreamClient(
+    stream_url="wss://testnet.binance.vision/ws",
+    on_message=partial(handle_depth_message, local_book=local_book),
+)
+ws_client.diff_book_depth(symbol=symbol, speed=100)  # 100ms updates

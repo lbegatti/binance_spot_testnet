@@ -1,7 +1,15 @@
 # Binance Spot Testnet — Order Book Analysis
 
-A Python toolkit for real-time order book analysis on the **Binance Spot Testnet**.  
-It fetches multi-depth snapshots, computes microstructure metrics, scores each price level, and surfaces the single best quote for buy and sell strategies.
+A Python toolkit for order book analysis on the **Binance Spot Testnet**.  
+Two execution modes are available:
+
+| Mode | Entry point | Data source | Symbol |
+|------|-------------|-------------|--------|
+| **REST** (polling) | `rest_spot_main.py` | `client.get_order_book()` snapshots | BTCUSDT |
+| **WebSocket** (real-time) | `websocket_spot_main.py` | `diff_book_depth` stream (100 ms) | BTCUSDT |
+
+The REST path is fully wired — metrics → indicators → scores → best quote.  
+The WebSocket path currently maintains a real-time local order book and prints the live spread; the strategy logic from the REST path still needs to be ported over.
 
 ---
 
@@ -9,12 +17,13 @@ It fetches multi-depth snapshots, computes microstructure metrics, scores each p
 
 ```
 binance_spot_testnet/
-├── spot_main.py      # Orchestration — connects to Binance, loops over depths
-├── metrics.py        # Order book metric calculations
-├── indicators.py     # Strategy-specific indicator columns
-├── scores.py         # Weighted opportunity scoring
-├── quotes.py         # Best quote selection logic
-├── plot_helpers.py   # Plotly visualisations (depth, OHLC)
+├── rest_spot_main.py          # REST orchestration — loops over depth limits
+├── websocket_spot_main.py     # WebSocket — real-time local order book
+├── metrics.py                 # Order book metric calculations
+├── indicators.py              # Strategy-specific indicator columns
+├── scores.py                  # Weighted opportunity scoring
+├── quotes.py                  # Best quote selection logic
+├── plot_helpers.py            # Plotly visualisations (depth, OHLC)
 └── README.md
 ```
 
@@ -25,7 +34,7 @@ binance_spot_testnet/
 1. **Install dependencies**
 
    ```bash
-   pip install python-binance python-dotenv pandas numpy plotly
+   pip install binance-connector python-dotenv pandas numpy plotly
    ```
 
 2. **Create a `.env` file** in the project root:
@@ -40,27 +49,48 @@ binance_spot_testnet/
 3. **Run**
 
    ```bash
-   python spot_main.py
+   # REST (static snapshots)
+   python rest_spot_main.py
+
+   # WebSocket (real-time)
+   python websocket_spot_main.py
    ```
 
 ---
 
 ## Pipeline Overview
 
+### REST path (`rest_spot_main.py`)
+
 ```
-Binance API
-    │
+Binance REST API
+    │  get_order_book()
     ▼
-┌────────────────┐     ┌────────────────┐     ┌────────────┐     ┌────────────┐
-│  spot_main.py  │────▶│  metrics.py    │────▶│ indicators │────▶│  scores.py │
-│  (orchestrate) │     │  (enrich df)   │     │    .py     │     │  (score)   │
-└────────────────┘     └────────────────┘     └────────────┘     └────────────┘
-                                                                       │
-                                                                       ▼
-                                                               ┌──────────────┐
-                                                               │  quotes.py   │
-                                                               │ (best quote) │
-                                                               └──────────────┘
+┌──────────────────┐     ┌────────────────┐     ┌──────────────┐     ┌────────────┐
+│ rest_spot_main.py│────▶│  metrics.py    │────▶│ indicators.py│────▶│  scores.py │
+│  (orchestrate)   │     │  (enrich df)   │     │ (strategy)   │     │  (score)   │
+└──────────────────┘     └────────────────┘     └──────────────┘     └────────────┘
+                                                                           │
+                                                                           ▼
+                                                                   ┌──────────────┐
+                                                                   │  quotes.py   │
+                                                                   │ (best quote) │
+                                                                   └──────────────┘
+```
+
+### WebSocket path (`websocket_spot_main.py`)
+
+```
+Binance REST API                  Binance WebSocket
+    │  depth() snapshot               │  diff_book_depth (100 ms)
+    ▼                                 ▼
+┌─────────────┐              ┌─────────────────────┐
+│ local_book  │◀─── init ────│ handle_depth_message │
+│  (dict)     │◀─── update ──│  (callback)          │
+└─────────────┘              └─────────────────────┘
+       │
+       ▼
+ calculate_best_quote()   ← TODO: wire metrics/indicators/scores here
 ```
 
 ---
@@ -183,6 +213,8 @@ A level is considered an **opportunity** when **all** of the following hold:
 
 Among qualifying levels, the one with the **highest Score** is returned.
 
+After iterating over all depth limits, `rest_spot_main.py` collects every best quote into `all_quotes` and selects the **latest buy** and **latest sell** results.
+
 ---
 
 ## Visualisation (`plot_helpers.py`)
@@ -194,13 +226,13 @@ Among qualifying levels, the one with the **highest Score** is returned.
 
 ---
 
-## Execution Flow (`spot_main.py`)
+## REST Execution Flow (`rest_spot_main.py`)
 
 1. Load API keys from `.env`.
 2. Connect to Binance Testnet (`testnet=True`).
 3. Capture the initial `lastUpdateId` from the order book as a baseline.
 4. For each depth limit in `[5, 10, 15, 20, 50]`:
-   - Fetch the order book for **BNBUSDT**.
+   - Fetch the order book for **BTCUSDT**.
    - **Staleness guard** — compute the gap between the current and initial `lastUpdateId`. If the gap exceeds 100, the book has changed too much for the microstructure signals to be reliable; the loop re-fetches every second until conditions calm down.
 
      | Gap | Regime |
@@ -214,3 +246,32 @@ Among qualifying levels, the one with the **highest Score** is returned.
    - For each strategy (`buy`, `sell`):
      - Run `find_best_quote()` → print the best level if found.
    - Plot the depth snapshot.
+5. Select the latest buy and sell quotes from all collected results.
+
+---
+
+## WebSocket Execution Flow (`websocket_spot_main.py`)
+
+1. Load API keys from `.env`.
+2. Connect to Binance Testnet via `binance-connector` REST client.
+3. Fetch a depth snapshot for **BTCUSDT** (100 levels) to initialise `local_book`.
+4. Open a `SpotWebsocketStreamClient` subscribing to `diff_book_depth` at 100 ms intervals.
+5. On each incoming message:
+   - Skip the initial subscription confirmation (`{"id": 1, "result": null}`).
+   - Drop stale updates where `data["u"] <= local_book["lastUpdateId"]`.
+   - Apply bid/ask deltas to `local_book` (remove levels with zero quantity).
+6. `calculate_best_quote()` prints the live best bid / best ask spread.
+
+---
+
+## Current Status & Roadmap
+
+| Status | Item |
+|--------|------|
+| ✅ Done | REST path: metrics → indicators → scores → best quote (buy & sell) |
+| ✅ Done | WebSocket: real-time local order book maintained from snapshot + diff stream |
+| ✅ Done | Staleness guard in REST path (`gap_id` logic) |
+| ✅ Done | Plotly visualisations (depth chart, OHLC with volume) |
+| 🔜 Next | Port strategy logic (metrics, indicators, scores, best quote) into `websocket_spot_main.py` |
+| ✅ Done | Consistent symbol across REST and WebSocket paths (BTCUSDT) |
+| 💡 Idea | Replace callback-based scoring with a periodic evaluation (e.g. every N updates) to avoid running the full pipeline on every 100 ms tick |

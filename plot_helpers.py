@@ -76,7 +76,7 @@ def plot_ohlc_with_volume(client: Client, symbol: str, interval: str, lookback: 
     """Fetch historical klines for a symbol and plot OHLC with volume.
     Args:
         client (Client): Binance API client instance.
-        symbol (str): Trading pair symbol (e.g., "BNBUSDT").
+        symbol (str): Trading pair symbol (e.g., "BTCUSDT").
         interval (str): Kline interval (e.g., Client.KLINE_INTERVAL_1MINUTE).
         lookback (str): Lookback period for historical data (e.g., "5 day ago UTC").
     return:
