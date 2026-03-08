@@ -48,9 +48,63 @@ balances = {
 if not balances:
     logging.warning("No non-zero balances found on this testnet account.")
 else:
+    # Fetch valid USDT pairs so we only attempt sells that can succeed
+    # noinspection PyArgumentList
+    exchange_info = rest_client.exchange_info()
+    tradable_bases = {
+        s["baseAsset"]
+        for s in exchange_info["symbols"]
+        if s["quoteAsset"] == ccy and s["status"] == "TRADING"
+    }
+
+    sold_any = False
+    sold = []
+    failed = []
     logging.info("Account balances (non-zero):")
     for asset, amounts in balances.items():
         logging.info(f"  {asset}: free={amounts['free']}, locked={amounts['locked']}")
+        if (
+            amounts["locked"] == 0
+            and amounts["free"] > 0
+            and asset not in (ccy, cryptoccy)
+            and asset in tradable_bases
+        ):
+            sell_symbol = f"{asset}{ccy}"
+            logging.warning(
+                f"Selling {amounts['free']} {asset} ({sell_symbol}) to consolidate into {ccy}."
+            )
+            try:
+                # noinspection PyArgumentList
+                rest_client.new_order(
+                    symbol=sell_symbol,
+                    side="SELL",
+                    type="MARKET",
+                    quantity=amounts["free"],
+                    recvWindow=5000,
+                )
+                logging.info(f"  Sold {amounts['free']} {asset} via {sell_symbol}.")
+                sold.append(asset)
+                sold_any = True
+            except Exception as e:
+                logging.error(f"  Failed to sell {asset} via {sell_symbol}: {e}")
+                failed.append(asset)
+
+    logging.info(
+        f"Consolidation summary: {len(sold)} sold, {len(failed)} failed "
+        f"(kept in balance)."
+    )
+    if failed:
+        logging.info(f"  Failed assets (kept): {failed}")
+
+    # Re-fetch balances only if we actually sold something
+    if sold_any:
+        # noinspection PyArgumentList
+        account_info = rest_client.account(recvWindow=5000)
+        balances = {
+            item["asset"]: {"free": float(item["free"]), "locked": float(item["locked"])}
+            for item in account_info["balances"]
+            if float(item["free"]) > 0 or float(item["locked"]) > 0
+        }
 
 # Check that we have USDT (or the quote asset) available for trading
 usdt_balance = balances.get(ccy, {}).get("free", 0.0)
@@ -64,7 +118,7 @@ if usdt_balance == 0 and btc_balance == 0:
 
 # ---------------------------------------------------------------------------
 # 3. Fetch the "Starting Point" (Snapshot)
-logging.info("Fetching order book snapshot...")
+logging.info("\nFetching order book snapshot...")
 # noinspection PyArgumentList
 snapshot = rest_client.depth(symbol=symbol, limit=100)
 local_book = {
