@@ -1,0 +1,31 @@
+"""
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY
+--------------------------------------------------------
+1. DATA INGESTION (SpotWebsocketStreamClient):
+   - Listen to 'diff_book_depth' at 100ms/1000ms speed.
+   - Use a threading.Lock() before modifying the 'local_book' dictionary.
+   - Crucial: If qty is "0.000", pop the price key to keep max() and min() accurate.
+
+2. SYNCING & SNAPSHOT:
+   - Initial Start: Use REST Client.depth() to get the first snapshot.
+   - Stitching: Ignore WebSocket updates where 'u' (final update ID) <= lastUpdateId of snapshot.
+   - Maintain 'lastUpdateId' in local_book to ensure no packets are skipped.
+
+3. DATA ISOLATION (The "Lock & Copy" Pattern):
+   - Before running logic, use 'with lock:' to create a .copy() of the book.
+   - This prevents 'RuntimeError' if the dictionary size changes during a calculation.
+
+4. FAST ANALYSIS LOOP (5-Second Pulse):
+   - Runs in a background thread.
+   - Pulls a fresh copy of the local_book.
+   - Logic: Checks immediate spread, price action, or "Best Bid/Ask" for entry/exit.
+
+5. SLOW ANALYSIS LOOP (10-Minute History):
+   - Runs in a separate background thread.
+   - Analyzes a 'history_buffer' (deque) of past Best Bid/Ask snapshots.
+   - Logic: Calculates Volatility, VWAP, or trend confirmation back-in-time.
+
+6. EXECUTION (SpotWebsocketAPIClient):
+   - If logic triggers, fire orders via WebSocket API (lower latency than REST).
+   - Use 'LIMIT_MAKER' (Post-Only) to ensure your 1-second lag doesn't lead to bad fills.
+"""

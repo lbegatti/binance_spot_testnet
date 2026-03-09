@@ -1,10 +1,10 @@
-from functools import partial
-from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
-from binance.spot import Spot as Client
-from message_handler import handle_depth_message
 import logging
-from dotenv import load_dotenv
 import os
+from functools import partial
+from binance.spot import Spot as Client
+from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+from dotenv import load_dotenv
+from message_handler import handle_depth_message
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True
@@ -101,7 +101,10 @@ else:
         # noinspection PyArgumentList
         account_info = rest_client.account(recvWindow=5000)
         balances = {
-            item["asset"]: {"free": float(item["free"]), "locked": float(item["locked"])}
+            item["asset"]: {
+                "free": float(item["free"]),
+                "locked": float(item["locked"]),
+            }
             for item in account_info["balances"]
             if float(item["free"]) > 0 or float(item["locked"]) > 0
         }
@@ -127,8 +130,11 @@ local_book = {
     "lastUpdateId": snapshot["lastUpdateId"],
 }
 
+# NOTE: The Binance Spot Testnet does not support WebSocket market-data streams.
+# We use the production stream endpoint for real-time depth data (read-only, no auth).
+# Trading orders are still routed through the testnet REST client.
 ws_client = SpotWebsocketStreamClient(
-    stream_url="wss://testnet.binance.vision/ws",
     on_message=partial(handle_depth_message, local_book=local_book),
 )
+
 ws_client.diff_book_depth(symbol=symbol, speed=100)  # 100ms updates

@@ -1,6 +1,9 @@
-from best_quote_calculator import calculate_best_quote
 import json
 import logging
+from collections import deque
+from best_quote_calculator import calculate_best_quote
+
+stats_history_order_book = deque(maxlen=1000)
 
 
 def handle_depth_message(_, message, local_book=None):
@@ -27,6 +30,15 @@ def handle_depth_message(_, message, local_book=None):
         else:
             local_book["asks"][price] = qty
 
+    stats_history_order_book.append(
+        {
+            "timestamp": data["E"],
+            "lastUpdateId": data["u"],
+            "best_bids": max(local_book["bids"].keys(), key=float),
+            "best_asks": min(local_book["asks"].keys(), key=float),
+        }
+    )
+
     # Now your strategy logic can always read from 'local_book'
     # which is updated in real-time (no 1-second lag!)
-    calculate_best_quote()
+    calculate_best_quote(local_book)
