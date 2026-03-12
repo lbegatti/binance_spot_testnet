@@ -1,7 +1,7 @@
 from collections import deque
 import threading
 
-from config import HISTORY_MAXLEN
+from config_parameters import HISTORY_MAXLEN
 
 
 class OrderBookState:
@@ -23,7 +23,7 @@ class OrderBookState:
 
     def __init__(self, maxlen=HISTORY_MAXLEN):
         """
-        Initialise the order book state.
+        Initialize the order book state.
 
         Args:
             maxlen (int): Maximum number of snapshots to keep in

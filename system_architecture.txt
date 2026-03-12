@@ -1,31 +1,127 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY
---------------------------------------------------------
-1. DATA INGESTION (SpotWebsocketStreamClient):
-   - Listen to 'diff_book_depth' at 100ms/1000ms speed.
-   - Use a threading.Lock() before modifying the 'local_book' dictionary.
-   - Crucial: If qty is "0.000", pop the price key to keep max() and min() accurate.
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-12)
+-----------------------------------------------------------------------------
+SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
+CURRENCY  : USDT  |  CRYPTO CCY : BTC
 
-2. SYNCING & SNAPSHOT:
-   - Initial Start: Use REST Client.depth() to get the first snapshot.
-   - Stitching: Ignore WebSocket updates where 'u' (final update ID) <= lastUpdateId of snapshot.
-   - Maintain 'lastUpdateId' in local_book to ensure no packets are skipped.
+FILES
+─────
+  config_parameters.py   — All tunable constants (symbol, intervals, depths, timeouts …)
+  order_book_state.py    — OrderBookState: shared state + threading.Lock
+  message_handler.py     — MessageHandler: WebSocket callback, book maintenance
+  analysis.py            — AnalysisEngine: HFT loop + historical loop
+  websocket_spot_main.py — Session driver: startup, threads, shutdown
+  rest_spot_main.py      — REST-only static snapshot (reference / dev tool)
+  quotes.py              — find_best_quote(): best bid/ask selection helpers
+  metrics.py             — Order book depth metrics
+  scores.py              — Normalised opportunity scores
+  indicators.py          — Technical indicators (trend confirmation, etc.)
+  plot_helpers.py        — Charting utilities for the REST snapshot path
 
-3. DATA ISOLATION (The "Lock & Copy" Pattern):
-   - Before running logic, use 'with lock:' to create a .copy() of the book.
-   - This prevents 'RuntimeError' if the dictionary size changes during a calculation.
+─────────────────────────────────────────────────────────────────────────────
+1. CONFIGURATION  (config_parameters.py)
+─────────────────────────────────────────────────────────────────────────────
+  All constants are defined in one place and imported by every other module.
+  Renamed from config.py; symbol constants added this session.
 
-4. FAST ANALYSIS LOOP (5-Second Pulse):
-   - Runs in a background thread.
-   - Pulls a fresh copy of the local_book.
-   - Logic: Checks immediate spread, price action, or "Best Bid/Ask" for entry/exit.
+    SYMBOL               = "BTCUSDT" # trading pair used across all calls
+    CCY                  = "USDT"    # quote currency
+    CRYPTOCCY            = "BTC"     # base / crypto currency
+    HISTORY_MAXLEN       = 6000    # deque cap (~10 min at 100 ms updates)
+    HFT_INTERVAL         = 5       # seconds between HFT evaluations
+    HIST_INTERVAL        = 600     # seconds between historical analyses
+    MIN_SNAPSHOTS        = 100     # warm-up guard for historical loop
+    DEFAULT_SESSION_MINUTES = 30   # default session length (prompt default)
+    HTF_JOIN_TIMEOUT     = 10      # shutdown wait for HFT thread (s)
+    HIST_JOIN_TIMEOUT    = 15      # shutdown wait for historical thread (s)
+    RECV_WINDOW          = 5000    # Binance REST validity window (ms)
+    SNAPSHOT_DEPTH       = 100     # levels in the seed REST snapshot
+    WS_SPEED             = 100     # WebSocket diff-depth update interval (ms)
 
-5. SLOW ANALYSIS LOOP (10-Minute History):
-   - Runs in a separate background thread.
-   - Analyzes a 'history_buffer' (deque) of past Best Bid/Ask snapshots.
-   - Logic: Calculates Volatility, VWAP, or trend confirmation back-in-time.
+─────────────────────────────────────────────────────────────────────────────
+2. SHARED STATE  (order_book_state.py — OrderBookState)
+─────────────────────────────────────────────────────────────────────────────
+  Single source of truth injected into both MessageHandler and AnalysisEngine:
 
-6. EXECUTION (SpotWebsocketAPIClient):
-   - If logic triggers, fire orders via WebSocket API (lower latency than REST).
-   - Use 'LIMIT_MAKER' (Post-Only) to ensure your 1-second lag doesn't lead to bad fills.
+    local_book           : dict   — {"bids": {price: qty}, "asks": {price: qty},
+                                      "lastUpdateId": int}
+    history_order_book   : deque  — rolling window of snapshots (maxlen=6000)
+                                    each entry: {timestamp, lastUpdateId,
+                                                  best_bids, best_asks}
+    thread_lock          : Lock   — mutex shared by all consumers
+
+─────────────────────────────────────────────────────────────────────────────
+3. DATA INGESTION & SYNCING  (message_handler.py — MessageHandler)
+─────────────────────────────────────────────────────────────────────────────
+  handle_depth_message(_, message) is the WebSocket on_message callback:
+
+  a) SUBSCRIPTION CONFIRMATION — if the message has only "id"/"result" (no
+     bid/ask fields) log and return immediately.
+  b) STALE-UPDATE GUARD — discard any update whose "u" (final update ID) is
+     ≤ local_book["lastUpdateId"]; ensures monotonic consistency.
+  c) BID/ASK MERGE (inside thread_lock) —
+       qty == 0 → pop the price level
+       qty  > 0 → upsert the price level
+     local_book["lastUpdateId"] is advanced to data["u"].
+  d) SNAPSHOT APPEND — best bid (max key) and best ask (min key) are recorded
+     with timestamp and update ID into history_order_book.
+  e) QUOTE CALCULATION — calculate_best_quote(local_book) is called so the
+     strategy layer always has a fresh quote after every message.
+
+  NOTE: Production WebSocket stream is used for market data (read-only, no
+  auth) because the Binance Spot Testnet does not expose WS market-data
+  streams.  Order execution is still routed through the testnet REST client.
+
+─────────────────────────────────────────────────────────────────────────────
+4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
+─────────────────────────────────────────────────────────────────────────────
+  Receives the same OrderBookState instance as MessageHandler.
+  Checks stop_event on every iteration; exits gracefully when it is set.
+
+  ▸ htf_analysis()  [HFT thread — every HFT_INTERVAL seconds = 5 s]
+      • Acquires thread_lock → copies bids & asks → releases lock.
+      • Computes best bid / best ask outside the critical section.
+      • TODO: full pipeline → metrics → indicators → scores → quote.
+
+  ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 10 min]
+      • Skips iteration if fewer than MIN_SNAPSHOTS (100) have accumulated.
+      • Reads history_order_book for spread distributions, VWAP, regime
+        detection, and other longer-horizon statistics.
+      • TODO: implement full historical analysis logic.
+
+─────────────────────────────────────────────────────────────────────────────
+5. SESSION DRIVER  (websocket_spot_main.py)
+─────────────────────────────────────────────────────────────────────────────
+  Orchestrates the full lifecycle:
+
+  Step 1 — Load .env (API key / secret), instantiate testnet REST client.
+  Step 2 — Fetch & consolidate account balance:
+              • Sell every non-USDT / non-BTC asset that has a live USDT pair
+                (single pass, each symbol attempted once).
+              • Re-fetch balances if any sale succeeded.
+              • Guard: raise if both USDT and BTC balances are zero.
+  Step 3 — Prompt user for session duration (default: 30 min).
+              • 30 min → ~360 HFT iterations, ~3 historical analyses.
+  Step 4 — Seed local_book from REST snapshot (depth=100).
+  Step 5 — Instantiate OrderBookState, MessageHandler, AnalysisEngine.
+  Step 6 — Open SpotWebsocketStreamClient (production stream endpoint).
+              • Subscribe: ws_client.diff_book_depth(SYMBOL, speed=WS_SPEED)
+              • Sleep 1 s so the first diff-depth messages populate
+                local_book["bids"] before the HFT thread wakes up.
+  Step 7 — Start threads AFTER WebSocket is open and warmed up:
+              • start htf_thread  (daemon=True, name="htf-analysis")
+              • start hist_thread (daemon=True, name="hist-analysis")
+  Step 8 — Main thread blocks for session_seconds (interruptible by Ctrl-C).
+  Step 9 — Shutdown:
+              • stop_event.set()
+              • ws_client.stop()
+              • htf_thread.join(timeout=HTF_JOIN_TIMEOUT)
+              • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+
+─────────────────────────────────────────────────────────────────────────────
+6. EXECUTION  (future)
+─────────────────────────────────────────────────────────────────────────────
+  Planned: SpotWebsocketAPIClient for order submission.
+  Use LIMIT_MAKER (Post-Only) to avoid bad fills caused by latency.
+  Route execution through testnet REST until WS API path is validated.
 """

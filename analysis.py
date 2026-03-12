@@ -2,7 +2,7 @@ from order_book_state import OrderBookState
 import threading
 import logging
 
-from config import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS
+from config_parameters import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS
 
 
 class AnalysisEngine:
@@ -87,7 +87,7 @@ class AnalysisEngine:
 
     def historical_analysis(self):
         """
-        Periodically analyse the rolling window of order book snapshots stored
+        Periodically analyze the rolling window of order book snapshots stored
         in ``state.history_order_book`` to identify longer-term patterns.
 
         Runs every 10 minutes until ``stop_event`` is set.  If fewer than 100

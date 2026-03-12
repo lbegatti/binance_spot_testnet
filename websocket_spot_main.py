@@ -1,19 +1,24 @@
 import logging
 import os
+import sys
 import threading
+import time
 from binance.spot import Spot as Client
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from dotenv import load_dotenv
 from analysis import AnalysisEngine
 from message_handler import MessageHandler
 from order_book_state import OrderBookState
-from config import (
+from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     RECV_WINDOW,
     SNAPSHOT_DEPTH,
     WS_SPEED,
     HTF_JOIN_TIMEOUT,
     HIST_JOIN_TIMEOUT,
+    SYMBOL,
+    CCY,
+    CRYPTOCCY,
 )
 
 logging.basicConfig(
@@ -37,12 +42,6 @@ rest_client = Client(
     base_url="https://testnet.binance.vision",
 )
 
-# ---------------------------------------------------------------------------
-# Symbol configuration
-# ---------------------------------------------------------------------------
-symbol = "BTCUSDT"
-ccy = "USDT"
-cryptoccy = "BTC"
 
 # ---------------------------------------------------------------------------
 # 2. Fetch account balance before any trading logic
@@ -64,7 +63,7 @@ else:
     tradable_bases = {
         s["baseAsset"]
         for s in exchange_info["symbols"]
-        if s["quoteAsset"] == ccy and s["status"] == "TRADING"
+        if s["quoteAsset"] == CCY and s["status"] == "TRADING"
     }
 
     sold_any = False
@@ -76,12 +75,12 @@ else:
         if (
             amounts["locked"] == 0
             and amounts["free"] > 0
-            and asset not in (ccy, cryptoccy)
+            and asset not in (CCY, CRYPTOCCY)
             and asset in tradable_bases
         ):
-            sell_symbol = f"{asset}{ccy}"
+            sell_symbol = f"{asset}{CCY}"
             logging.warning(
-                f"Selling {amounts['free']} {asset} ({sell_symbol}) to consolidate into {ccy}."
+                f"Selling {amounts['free']} {asset} ({sell_symbol}) to consolidate into {CCY}."
             )
             try:
                 # noinspection PyArgumentList
@@ -120,13 +119,13 @@ else:
         }
 
 # Check that we have USDT (or the quote asset) available for trading
-usdt_balance = balances.get(ccy, {}).get("free", 0.0)
-btc_balance = balances.get(cryptoccy, {}).get("free", 0.0)
-logging.info(f"Available {ccy}: {usdt_balance} | Available {cryptoccy}: {btc_balance}")
+usdt_balance = balances.get(CCY, {}).get("free", 0.0)
+btc_balance = balances.get(CRYPTOCCY, {}).get("free", 0.0)
+logging.info(f"Available {CCY}: {usdt_balance} | Available {CRYPTOCCY}: {btc_balance}")
 
 if usdt_balance == 0 and btc_balance == 0:
     raise ValueError(
-        f"No {ccy} or {cryptoccy} balance available. Fund your testnet account before trading."
+        f"No {CCY} or {CRYPTOCCY} balance available. Fund your testnet account before trading."
     )
 
 # ---------------------------------------------------------------------------
@@ -136,6 +135,7 @@ if usdt_balance == 0 and btc_balance == 0:
 #   • htf_analysis        → 30 × 60 / 5  =  360 iterations  (every 5 s)
 #   • historical_analysis → 30 / 10      =    3 iterations  (every 10 min)
 
+sys.stdout.flush()
 raw = input(
     f"\nHow long do you want to run the WebSocket session? "
     f"[default: {DEFAULT_SESSION_MINUTES} minutes] > "
@@ -165,7 +165,7 @@ logging.info(
 # ---------------------------------------------------------------------------
 logging.info("\nFetching order book snapshot...")
 # noinspection PyArgumentList
-snapshot = rest_client.depth(symbol=symbol, limit=SNAPSHOT_DEPTH)
+snapshot = rest_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
 
 # OrderBookState is the single source of truth shared by MessageHandler and
 # AnalysisEngine.  Both classes receive the same instance so they operate on
@@ -178,11 +178,11 @@ state.local_book = {
 }
 
 # stop_event is set by this file when the session duration elapses; both
-# analysis loops check it on every iteration and exit gracefully.
+# analysis loops check it on every iteration and exit if stop_event is reached.
 stop_event = threading.Event()
 
 # ---------------------------------------------------------------------------
-# 5. Instantiate engine and handler, start background threads
+# 5. Instantiate engine and handler
 # ---------------------------------------------------------------------------
 handler = MessageHandler(state=state)
 engine = AnalysisEngine(state=state, stop_event=stop_event)
@@ -193,9 +193,6 @@ htf_thread = threading.Thread(
 hist_thread = threading.Thread(
     target=engine.historical_analysis, daemon=True, name="hist-analysis"
 )
-htf_thread.start()
-hist_thread.start()
-logging.info("Analysis threads started.")
 
 # ---------------------------------------------------------------------------
 # 6. Open WebSocket stream
@@ -207,8 +204,18 @@ ws_client = SpotWebsocketStreamClient(
     on_message=handler.handle_depth_message,
 )
 
-ws_client.diff_book_depth(symbol=symbol, speed=WS_SPEED)
-logging.info("WebSocket stream opened. Running for %d minute(s)...", session_minutes)
+ws_client.diff_book_depth(symbol=SYMBOL, speed=WS_SPEED)
+logging.info("WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100)
+
+# Give the WebSocket a moment to deliver the first diff-depth messages so that
+# local_book["bids"] is populated before the HFT loop runs its first iteration.
+time.sleep(1)
+
+htf_thread.start()
+hist_thread.start()
+logging.info(
+    "Analysis threads started. Running for %d minute(s)...", session_minutes
+)
 
 # ---------------------------------------------------------------------------
 # 7. Block the main thread for the session duration, then shut down cleanly

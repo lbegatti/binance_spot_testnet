@@ -1,8 +1,15 @@
 # =============================================================================
-# config.py — central configuration file
+# config_parameters.py — central configuration file
 # All tunable constants live here. Edit this file to adjust behaviour across
 # the entire project without touching any logic files.
 # =============================================================================
+
+# ---------------------------------------------------------------------------
+# Symbol configuration
+# ---------------------------------------------------------------------------
+SYMBOL = "BTCUSDT"   # trading pair
+CCY = "USDT"         # quote currency
+CRYPTOCCY = "BTC"    # base / cryptocurrency
 
 # ---------------------------------------------------------------------------
 # Order book state
