@@ -1,8 +1,9 @@
 from order_book_state import OrderBookState
 import threading
 import logging
+import numpy as np
 
-from config_parameters import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS
+from config_parameters import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS, N_LEVELS
 
 
 class AnalysisEngine:
@@ -39,6 +40,111 @@ class AnalysisEngine:
         self.state = state
         self.stop_event = stop_event
 
+    @staticmethod
+    def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
+        """
+        Helper method to construct order book levels for HFT analysis.
+        Sorting must happen before any metric is computed.
+
+        :param snaps_bids: dictionary of bids streamed via websocket.
+        :param snaps_asks: dictionary of asks streamed via websocket.
+        :param n: integer signaling the depth of the order book levels to be used in the HFT strategy.
+                  Defaults to N_LEVELS (20).
+        :return: levels -> list of (total_depth, mid_price, micro_price).
+                 median_depth -> median total depth across the levels.
+                 level_0_depth -> total depth at the best bid/ask level.
+        """
+        sorted_bids = sorted(
+            snaps_bids.items(), key=lambda x: float(x[0]), reverse=True
+        )[:n]
+        sorted_asks = sorted(
+            snaps_asks.items(), key=lambda x: float(x[0]), reverse=False
+        )[:n]
+        levels = []
+        for (bp, bq), (ap, aq) in zip(sorted_bids, sorted_asks):
+            bp, bq, ap, aq = float(bp), float(bq), float(ap), float(aq)
+            total_depth = bq + aq
+            mid_price = (bp + ap) / 2
+            micro_price = (bp * aq + ap * bq) / total_depth
+            levels.append((total_depth, mid_price, micro_price))
+
+        all_depths = [lv[0] for lv in levels]
+        median_depth = float(
+            np.median(all_depths)
+        )  # mirrors np.median() in indicators.py
+        level_0_depth = all_depths[0]
+
+        return levels, median_depth, level_0_depth
+
+    @staticmethod
+    def _collect_candidates(
+        levels: list, median_depth: float, level_0_depth: float
+    ) -> tuple:
+        """
+        Helper method to identify potential HFT opportunities based on the
+        computed order book levels and depth metrics.
+
+        :param levels: list of tuples (total_depth, mid_price, micro_price) for the top N levels.
+        :param median_depth: median total depth across the levels, used to identify thin order book conditions.
+        :param level_0_depth: total depth at the best bid/ask level, used to assess liquidity.
+        :return: candidates -> list of dictionaries with opportunity indicators for each level.
+        """
+        buy_candidates = []
+        sell_candidates = []
+
+        for i, (total_depth, mid_price, micro_price) in enumerate(levels):
+            if i == 0:
+                continue
+            is_thin = total_depth < median_depth
+            depth_ok = total_depth >= 0.5 * level_0_depth
+            if not is_thin and depth_ok:
+                if micro_price > mid_price:  # buy signal
+                    delta = micro_price - mid_price
+                    buy_candidates.append((i, delta, total_depth))
+                elif micro_price < mid_price:  # sell signal
+                    delta = mid_price - micro_price
+                    sell_candidates.append((i, delta, total_depth))
+
+        return buy_candidates, sell_candidates
+
+    @staticmethod
+    def _select_best_opportunity(
+        candidates: list, strategy_name: str, iteration: int
+    ) -> tuple | None:
+        """
+        Helper method to score the identified candidates based on a weighted combination of depth and micro-mid delta,
+        and pick the best one for potential execution.
+
+        :param candidates:
+        :param strategy_name:
+        :param iteration:
+        :return:
+        """
+        if not candidates:
+            logging.info(
+                "HFT #%d [%s] — no opportunities found.", iteration, strategy_name
+            )
+            return None
+        max_depth = max(c[2] for c in candidates)
+        max_delta = max(c[1] for c in candidates)
+        scored = []
+        for level_idx, delta, depth in candidates:
+            norm_depth = depth / max_depth
+            norm_delta = delta / max_delta
+            score = (norm_depth * 0.70) + (norm_delta * 0.30)
+            scored.append((level_idx, score, delta, depth))
+        best = max(scored, key=lambda x: x[1])
+        logging.info(
+            "HFT #%d [%s] — level %d | score=%.4f | delta=%.6f | depth=%.4f",
+            iteration,
+            strategy_name,
+            best[0],
+            best[1],
+            best[2],
+            best[3],
+        )
+        return best
+
     def htf_analysis(self):
         """
         Periodically inspect the live order book and apply a high-frequency
@@ -56,32 +162,26 @@ class AnalysisEngine:
         were completed.
         """
         iteration = 0
-
         logging.info("HFT analysis loop started (interval: %ds).", HFT_INTERVAL)
-        while not self.stop_event.is_set():
-            self.stop_event.wait(HFT_INTERVAL)  # interruptible sleep
-            if self.stop_event.is_set():
-                break
 
+        while not self.stop_event.is_set():
             with self.state.thread_lock:
                 if not self.state.local_book["bids"]:
                     logging.info("HFT: no bids available yet, skipping iteration.")
+                    self.stop_event.wait(HFT_INTERVAL)
                     continue
                 snaps_bids = self.state.local_book["bids"].copy()
                 snaps_asks = self.state.local_book["asks"].copy()
-
-            # Lock is released — do heavier work outside the critical section.
-            best_bid = max(snaps_bids.keys(), key=float)
-            best_ask = min(snaps_asks.keys(), key=float)
             iteration += 1
-
-            # TODO: implement full strategy logic (metrics → indicators → scores → quote)
-            logging.info(
-                "HFT Analysis #%d — Best Bid: %s | Best Ask: %s",
-                iteration,
-                best_bid,
-                best_ask,
+            levels, median_depth, level_0_depth = self._build_levels(
+                snaps_bids, snaps_asks
             )
+            buy_candidates, sell_candidates = self._collect_candidates(
+                levels, median_depth, level_0_depth
+            )
+            self._select_best_opportunity(buy_candidates, "buy", iteration)
+            self._select_best_opportunity(sell_candidates, "sell", iteration)
+            self.stop_event.wait(HFT_INTERVAL)  # sleep AFTER work, not before
 
         logging.info("HFT analysis loop stopped after %d iteration(s).", iteration)
 

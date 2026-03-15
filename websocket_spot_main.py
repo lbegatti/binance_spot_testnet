@@ -163,7 +163,7 @@ logging.info(
 # ---------------------------------------------------------------------------
 # 4. Fetch the starting snapshot and initialise shared state
 # ---------------------------------------------------------------------------
-logging.info("\nFetching order book snapshot...")
+logging.info("Fetching order book snapshot...")
 # noinspection PyArgumentList
 snapshot = rest_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
 
@@ -203,9 +203,10 @@ hist_thread = threading.Thread(
 ws_client = SpotWebsocketStreamClient(
     on_message=handler.handle_depth_message,
 )
-
+logging.info(
+    "WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100
+)
 ws_client.diff_book_depth(symbol=SYMBOL, speed=WS_SPEED)
-logging.info("WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100)
 
 # Give the WebSocket a moment to deliver the first diff-depth messages so that
 # local_book["bids"] is populated before the HFT loop runs its first iteration.
@@ -213,9 +214,7 @@ time.sleep(1)
 
 htf_thread.start()
 hist_thread.start()
-logging.info(
-    "Analysis threads started. Running for %d minute(s)...", session_minutes
-)
+logging.info("Analysis threads started. Running for %d minute(s)...", session_minutes)
 
 # ---------------------------------------------------------------------------
 # 7. Block the main thread for the session duration, then shut down cleanly

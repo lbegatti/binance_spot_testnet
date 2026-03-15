@@ -7,20 +7,20 @@
 # ---------------------------------------------------------------------------
 # Symbol configuration
 # ---------------------------------------------------------------------------
-SYMBOL = "BTCUSDT"   # trading pair
-CCY = "USDT"         # quote currency
-CRYPTOCCY = "BTC"    # base / cryptocurrency
+SYMBOL = "BTCUSDT"  # trading pair
+CCY = "USDT"  # quote currency
+CRYPTOCCY = "BTC"  # base / cryptocurrency
 
 # ---------------------------------------------------------------------------
 # Order book state
 # ---------------------------------------------------------------------------
 HISTORY_MAXLEN = 6000  # max snapshots in history_order_book
 # at 100 ms update intervals this covers ~10 minutes
-
+N_LEVELS = 20  # number of order book levels used in htf_analysis()
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
-HFT_INTERVAL = 5  # seconds between HFT evaluations
+HFT_INTERVAL = 1  # seconds between HFT evaluations
 HIST_INTERVAL = 600  # seconds between historical analyses (10 min)
 MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis runs
 
