@@ -49,7 +49,7 @@ class AnalysisEngine:
         :param snaps_bids: dictionary of bids streamed via websocket.
         :param snaps_asks: dictionary of asks streamed via websocket.
         :param n: integer signaling the depth of the order book levels to be used in the HFT strategy.
-                  Defaults to N_LEVELS (20).
+                  Defaults to N_LEVELS (50).
         :return: levels -> list of (total_depth, mid_price, micro_price).
                  median_depth -> median total depth across the levels.
                  level_0_depth -> total depth at the best bid/ask level.
@@ -66,7 +66,8 @@ class AnalysisEngine:
             total_depth = bq + aq
             mid_price = (bp + ap) / 2
             micro_price = (bp * aq + ap * bq) / total_depth
-            levels.append((total_depth, mid_price, micro_price))
+            obi = (bq - aq) / (bq + aq)
+            levels.append((total_depth, mid_price, micro_price, obi))
 
         all_depths = [lv[0] for lv in levels]
         median_depth = float(
@@ -92,18 +93,21 @@ class AnalysisEngine:
         buy_candidates = []
         sell_candidates = []
 
-        for i, (total_depth, mid_price, micro_price) in enumerate(levels):
+        for i, (total_depth, mid_price, micro_price, obi) in enumerate(levels):
             if i == 0:
                 continue
             is_thin = total_depth < median_depth
             depth_ok = total_depth >= 0.5 * level_0_depth
+            # obi > 0.0  # "Buy Wall" is heavier than the sell side, so the price might be pushed up.
+            # obi < 0.0  # Indicates that sellers are crowding the book, suggesting a downward move.
+            # obi = 0    # balance.
             if not is_thin and depth_ok:
                 if micro_price > mid_price:  # buy signal
                     delta = micro_price - mid_price
-                    buy_candidates.append((i, delta, total_depth))
+                    buy_candidates.append((i, delta, total_depth, obi))
                 elif micro_price < mid_price:  # sell signal
                     delta = mid_price - micro_price
-                    sell_candidates.append((i, delta, total_depth))
+                    sell_candidates.append((i, delta, total_depth, obi))
 
         return buy_candidates, sell_candidates
 
@@ -115,37 +119,51 @@ class AnalysisEngine:
         Helper method to score the identified candidates based on a weighted combination of depth and micro-mid delta,
         and pick the best one for potential execution.
 
-        :param candidates:
-        :param strategy_name:
-        :param iteration:
-        :return:
+        :param candidates: list of tuples (level_idx, delta, total_depth, obi) for the identified opportunities.
+        :param strategy_name: string indicating the strategy type ("buy" or "sell") for logging purposes.
+        :param iteration: integer indicating the current iteration of the HFT loop for logging purposes.
+        :return: tuple of (level_idx, score, delta, total_depth, obi) for the best candidate or None if no
+                 candidates are available.
         """
         if not candidates:
             logging.info(
                 "HFT #%d [%s] — no opportunities found.", iteration, strategy_name
             )
             return None
+        if len(candidates) == 1:
+            level_idx, delta, depth, obi = candidates[0]
+            logging.info(
+                "HFT #%d [%s] — single candidate at level %d | delta=%.6f | depth=%.4f | order_imbalance=%.3f",
+                iteration,
+                strategy_name,
+                level_idx,
+                delta,
+                depth,
+                obi,
+            )
+            return level_idx, None, delta, depth, obi
         max_depth = max(c[2] for c in candidates)
         max_delta = max(c[1] for c in candidates)
         scored = []
-        for level_idx, delta, depth in candidates:
+        for level_idx, delta, depth, obi in candidates:
             norm_depth = depth / max_depth
             norm_delta = delta / max_delta
             score = (norm_depth * 0.70) + (norm_delta * 0.30)
-            scored.append((level_idx, score, delta, depth))
-        best = max(scored, key=lambda x: x[1])
+            scored.append((level_idx, score, delta, depth, obi))
+        trade_opportunity = max(scored, key=lambda x: x[1])
         logging.info(
-            "HFT #%d [%s] — level %d | score=%.4f | delta=%.6f | depth=%.4f",
+            "HFT #%d [%s] — level %d | score=%.4f | delta=%.6f | depth=%.4f | order_imbalance = %.3f",
             iteration,
             strategy_name,
-            best[0],
-            best[1],
-            best[2],
-            best[3],
+            trade_opportunity[0],
+            trade_opportunity[1],
+            trade_opportunity[2],
+            trade_opportunity[3],
+            trade_opportunity[4],
         )
-        return best
+        return trade_opportunity
 
-    def htf_analysis(self):
+    def low_latency_analysis(self):
         """
         Periodically inspect the live order book and apply a high-frequency
         trading strategy.

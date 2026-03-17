@@ -16,20 +16,20 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 HISTORY_MAXLEN = 6000  # max snapshots in history_order_book
 # at 100 ms update intervals this covers ~10 minutes
-N_LEVELS = 20  # number of order book levels used in htf_analysis()
+N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
-HFT_INTERVAL = 1  # seconds between HFT evaluations
-HIST_INTERVAL = 600  # seconds between historical analyses (10 min)
+HFT_INTERVAL = 5  # seconds between HFT evaluations
+HIST_INTERVAL = 300  # seconds between historical analyses (5 min)
 MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis runs
 
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 30  # default session length shown in the startup prompt
-# at 30 min: ~360 HFT iterations, ~3 historical runs
-HTF_JOIN_TIMEOUT = 10  # s — max wait for htf_analysis thread on shutdown
+DEFAULT_SESSION_MINUTES = 15  # default session length
+# at 15 min: ~180 HFT iterations, ~3 historical runs
+HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 
 # ---------------------------------------------------------------------------

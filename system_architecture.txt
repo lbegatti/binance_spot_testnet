@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-12)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-17)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -26,12 +26,12 @@ FILES
 
     SYMBOL               = "BTCUSDT" # trading pair used across all calls
     CCY                  = "USDT"    # quote currency
-    CRYPTOCCY            = "BTC"     # base / crypto currency
+    CRYPTOCCY            = "BTC"     # base / cryptocurrency
     HISTORY_MAXLEN       = 6000    # deque cap (~10 min at 100 ms updates)
     HFT_INTERVAL         = 5       # seconds between HFT evaluations
-    HIST_INTERVAL        = 600     # seconds between historical analyses
+    HIST_INTERVAL        = 300     # seconds between historical analyses
     MIN_SNAPSHOTS        = 100     # warm-up guard for historical loop
-    DEFAULT_SESSION_MINUTES = 30   # default session length (prompt default)
+    DEFAULT_SESSION_MINUTES = 15   # default session length (fixed, no prompt)
     HTF_JOIN_TIMEOUT     = 10      # shutdown wait for HFT thread (s)
     HIST_JOIN_TIMEOUT    = 15      # shutdown wait for historical thread (s)
     RECV_WINDOW          = 5000    # Binance REST validity window (ms)
@@ -78,12 +78,14 @@ FILES
   Receives the same OrderBookState instance as MessageHandler.
   Checks stop_event on every iteration; exits gracefully when it is set.
 
-  ▸ htf_analysis()  [HFT thread — every HFT_INTERVAL seconds = 5 s]
+  ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 5 s]
       • Acquires thread_lock → copies bids & asks → releases lock.
-      • Computes best bid / best ask outside the critical section.
-      • TODO: full pipeline → metrics → indicators → scores → quote.
+      • Builds order book levels and computes metrics (depth, mid, micro, OBI).
+      • Identifies candidates using strategy logic (thin book check, micro-mid delta).
+      • Scores candidates (70% depth / 30% delta) and picks the best opportunity.
+      • Logs the selected best buy and sell quotes for the iteration.
 
-  ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 10 min]
+  ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 5 min]
       • Skips iteration if fewer than MIN_SNAPSHOTS (100) have accumulated.
       • Reads history_order_book for spread distributions, VWAP, regime
         detection, and other longer-horizon statistics.
@@ -100,8 +102,8 @@ FILES
                 (single pass, each symbol attempted once).
               • Re-fetch balances if any sale succeeded.
               • Guard: raise if both USDT and BTC balances are zero.
-  Step 3 — Prompt user for session duration (default: 30 min).
-              • 30 min → ~360 HFT iterations, ~3 historical analyses.
+  Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (15 min).
+              • 15 min → ~180 HFT iterations, ~3 historical analyses.
   Step 4 — Seed local_book from REST snapshot (depth=100).
   Step 5 — Instantiate OrderBookState, MessageHandler, AnalysisEngine.
   Step 6 — Open SpotWebsocketStreamClient (production stream endpoint).
@@ -109,7 +111,7 @@ FILES
               • Sleep 1 s so the first diff-depth messages populate
                 local_book["bids"] before the HFT thread wakes up.
   Step 7 — Start threads AFTER WebSocket is open and warmed up:
-              • start htf_thread  (daemon=True, name="htf-analysis")
+              • start low_latency_thread  (daemon=True, name="low-latency-analysis")
               • start hist_thread (daemon=True, name="hist-analysis")
   Step 8 — Main thread blocks for session_seconds (interruptible by Ctrl-C).
   Step 9 — Shutdown:

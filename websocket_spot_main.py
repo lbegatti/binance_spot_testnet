@@ -1,6 +1,5 @@
 import logging
 import os
-import sys
 import threading
 import time
 from binance.spot import Spot as Client
@@ -131,33 +130,17 @@ if usdt_balance == 0 and btc_balance == 0:
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
-# At the default of 30 min the engine runs:
-#   • htf_analysis        → 30 × 60 / 5  =  360 iterations  (every 5 s)
-#   • historical_analysis → 30 / 10      =    3 iterations  (every 10 min)
+# At the default of 15 min the engine runs:
+#   • low_latency_analysis → 15 × 60 / 5  =  180 iterations  (every 5 s)
+#   • historical_analysis  → 15 / 5       =    3 iterations  (every 5 min)
 
-sys.stdout.flush()
-raw = input(
-    f"\nHow long do you want to run the WebSocket session? "
-    f"[default: {DEFAULT_SESSION_MINUTES} minutes] > "
-).strip()
-
-try:
-    session_minutes = int(raw) if raw else DEFAULT_SESSION_MINUTES
-    if session_minutes <= 0:
-        raise ValueError
-except ValueError:
-    logging.warning(
-        "Invalid input — falling back to default (%d minutes).",
-        DEFAULT_SESSION_MINUTES,
-    )
-    session_minutes = DEFAULT_SESSION_MINUTES
-
+session_minutes = DEFAULT_SESSION_MINUTES
 session_seconds = session_minutes * 60
 logging.info(
-    "Session configured: %d minute(s) → ~%d HFT iterations, ~%d historical iterations.",
+    "Session configured: %d minute(s) → ~%d HFT iterations, ~%d historical iterations.\n",
     session_minutes,
     session_seconds // 5,
-    session_minutes // 10,
+    session_minutes // 5,
 )
 
 # ---------------------------------------------------------------------------
@@ -187,8 +170,8 @@ stop_event = threading.Event()
 handler = MessageHandler(state=state)
 engine = AnalysisEngine(state=state, stop_event=stop_event)
 
-htf_thread = threading.Thread(
-    target=engine.htf_analysis, daemon=True, name="htf-analysis"
+low_latency_thread = threading.Thread(
+    target=engine.low_latency_analysis, daemon=True, name="low-latency-analysis"
 )
 hist_thread = threading.Thread(
     target=engine.historical_analysis, daemon=True, name="hist-analysis"
@@ -209,12 +192,12 @@ logging.info(
 ws_client.diff_book_depth(symbol=SYMBOL, speed=WS_SPEED)
 
 # Give the WebSocket a moment to deliver the first diff-depth messages so that
-# local_book["bids"] is populated before the HFT loop runs its first iteration.
+# local_book["bids"] is populated before the low-latency loop runs its first iteration.
 time.sleep(1)
 
-htf_thread.start()
+low_latency_thread.start()
 hist_thread.start()
-logging.info("Analysis threads started. Running for %d minute(s)...", session_minutes)
+logging.info("Analysis threads started. Running for %d minute(s)...\n", session_minutes)
 
 # ---------------------------------------------------------------------------
 # 7. Block the main thread for the session duration, then shut down cleanly
@@ -226,9 +209,10 @@ try:
 except KeyboardInterrupt:
     logging.info("KeyboardInterrupt received — shutting down early.")
 finally:
-    logging.info("Session complete. Stopping WebSocket and analysis threads...")
+    time.sleep(1)
+    logging.info("Session complete. Stopping WebSocket and analysis threads...\n")
     stop_event.set()  # signal both analysis loops to exit
     ws_client.stop()  # close the WebSocket connection
-    htf_thread.join(timeout=HTF_JOIN_TIMEOUT)
+    low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
     logging.info("All threads stopped. Exiting.")

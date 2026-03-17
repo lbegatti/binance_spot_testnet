@@ -9,7 +9,7 @@ Two execution modes are available:
 | **WebSocket** (real-time) | `websocket_spot_main.py` | `diff_book_depth` stream (100 ms) | BTCUSDT |
 
 The REST path is fully wired — metrics → indicators → scores → best quote.  
-The WebSocket path currently maintains a real-time local order book and prints the live spread; the strategy logic from the REST path still needs to be ported over.
+The WebSocket path runs the full strategy pipeline (metrics → indicators → scores) in near real-time via the `AnalysisEngine`.
 
 ---
 
@@ -22,7 +22,7 @@ binance_spot_testnet/
 ├── websocket_spot_main.py     # WebSocket — real-time local order book + session driver
 ├── order_book_state.py        # Shared state container (local book + history + lock)
 ├── message_handler.py         # WebSocket callback — maintains local book in real time
-├── analysis.py                # AnalysisEngine — HFT (5 s) and historical (10 min) loops
+├── analysis.py                # AnalysisEngine — HFT (5 s) and historical (5 min) loops
 ├── best_quote_calculator.py   # Live spread printer — prints best_bid | best_ask to stdout on every tick
 ├── metrics.py                 # Order book metric calculations
 ├── indicators.py              # Strategy-specific indicator columns
@@ -45,10 +45,10 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Symbol** | `CRYPTOCCY` | `"BTC"` | Base / crypto currency |
 | **Order book state** | `HISTORY_MAXLEN` | `6000` | Max snapshots in `history_order_book` — at 100 ms intervals this covers ~10 min |
 | **Analysis cadence** | `HFT_INTERVAL` | `5` s | Time between HFT evaluations |
-| **Analysis cadence** | `HIST_INTERVAL` | `600` s | Time between historical analyses (10 min) |
+| **Analysis cadence** | `HIST_INTERVAL` | `300` s | Time between historical analyses (5 min) |
 | **Analysis cadence** | `MIN_SNAPSHOTS` | `100` | Minimum snapshots required before historical analysis runs |
-| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `30` min | Default session length shown at the startup prompt |
-| **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `htf_analysis` thread on shutdown |
+| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `15` min | Default session length (fixed — no startup prompt) |
+| **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `low_latency_analysis` thread on shutdown |
 | **WebSocket session** | `HIST_JOIN_TIMEOUT` | `15` s | Max wait for `historical_analysis` thread on shutdown |
 | **Binance connection** | `RECV_WINDOW` | `5000` ms | Binance REST request validity window |
 | **Binance connection** | `SNAPSHOT_DEPTH` | `100` | Order book levels in the seed snapshot |
@@ -123,8 +123,9 @@ Binance REST API                   Binance WebSocket
 │  • local_book    │
 │  • history_book  │       ┌──────────────────────┐
 │  • thread_lock   │◀──────│   AnalysisEngine      │
-└──────────────────┘       │   .htf_analysis()     │
-                           │   .historical_anal..()│
+└──────────────────┘       │   .low_latency_analysis() │
+                           │    (runs strategy)        │
+                           │   .historical_anal..()    │
                            └──────────────────────┘
                                       ▲
                            ┌──────────────────────┐
@@ -146,7 +147,7 @@ Binance REST API                   Binance WebSocket
 **How the components interact:**
 
 1. `websocket_spot_main.py` creates a single `OrderBookState` instance and injects it into both `MessageHandler` and `AnalysisEngine`.
-2. All concurrent access to `local_book` and `history_order_book` is serialised through `state.thread_lock` — the single `threading.Lock` that lives on `OrderBookState` and is shared by every consumer.  `MessageHandler.handle_depth_message` acquires it to write; `AnalysisEngine.htf_analysis` acquires it to take a read-only copy, then releases it before any heavy computation.
+2. All concurrent access to `local_book` and `history_order_book` is serialised through `state.thread_lock` — the single `threading.Lock` that lives on `OrderBookState` and is shared by every consumer.  `MessageHandler.handle_depth_message` acquires it to write; `AnalysisEngine.low_latency_analysis` acquires it to take a read-only copy, then releases it before any heavy computation.
 3. `MessageHandler` is the **only writer** to `OrderBookState`; `AnalysisEngine` is **read-only** — it copies the data under the lock and immediately releases it before doing heavier computation.
 
 ---
@@ -159,22 +160,18 @@ Both analysis loops in `AnalysisEngine` are designed to run indefinitely:
 
 | Loop | Cadence | Purpose |
 |------|---------|---------|
-| `htf_analysis` | every **5 s** | Near-real-time best bid/ask evaluation |
-| `historical_analysis` | every **10 min** | Pattern detection over the rolling snapshot window |
+| `low_latency_analysis` | every **5 s** | Near-real-time best bid/ask evaluation |
+| `historical_analysis` | every **5 min** | Pattern detection over the rolling snapshot window |
 
-Rather than running forever, `websocket_spot_main.py` will prompt the user for a session duration at startup:
+Rather than running forever, `websocket_spot_main.py` uses a fixed session duration set by `DEFAULT_SESSION_MINUTES` (no startup prompt).
 
-```
-How long do you want to run the WebSocket session? [default: 30 minutes]
-```
+The **default of 15 minutes** is chosen deliberately:
 
-The **default of 30 minutes** is chosen deliberately:
-
-| Metric | Value at 30 min |
+| Metric | Value at 15 min |
 |--------|----------------|
-| HFT iterations (`htf_analysis`) | $30 \times 60 / 5 = \mathbf{360}$ |
-| Historical iterations (`historical_analysis`) | $30 / 10 = \mathbf{3}$ |
-| Order book snapshots in history | up to $30 \times 60 \times 10 = \mathbf{18{,}000}$ ticks (capped at `maxlen=6000` ≈ last 10 min) |
+| Low-latency iterations (`low_latency_analysis`) | $15 \times 60 / 5 = \mathbf{180}$ |
+| Historical iterations (`historical_analysis`) | $15 / 5 = \mathbf{3}$ |
+| Order book snapshots in history | up to $15 \times 60 \times 10 = \mathbf{9{,}000}$ ticks (capped at `maxlen=6000` ≈ last 10 min) |
 
 When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
@@ -185,12 +182,12 @@ When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, c
 1. Load API keys from `.env`.
 2. Connect to Binance Testnet via `binance-connector` REST client.
 3. Consolidate non-BTC/USDT balances into USDT via market sell orders.
-4. Prompt the user for a session duration (default: 30 minutes).
+4. Session duration fixed at `DEFAULT_SESSION_MINUTES` (15 min) — no user prompt.
 5. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
 6. Instantiate `OrderBookState`, `MessageHandler`, and `AnalysisEngine`, injecting the shared state into the latter two.  Set `stop_event = threading.Event()`.
 7. Open a `SpotWebsocketStreamClient` subscribing to `diff_book_depth` at 100 ms intervals.
 8. Wait 1 second for the first diff-depth messages to arrive and populate `local_book["bids"]`.
-9. Start `AnalysisEngine.htf_analysis` and `AnalysisEngine.historical_analysis` as named daemon threads — **after** the WebSocket is open so bids are available on the first HFT wake-up.
+9. Start `AnalysisEngine.low_latency_analysis` and `AnalysisEngine.historical_analysis` as named daemon threads — **after** the WebSocket is open so bids are available on the first low-latency wake-up.
 10. On each incoming message (`MessageHandler.handle_depth_message`):
     - Skip the initial subscription confirmation (`{"id": 1, "result": null}`).
     - Drop stale updates where `data["u"] <= state.local_book["lastUpdateId"]`.
@@ -366,8 +363,8 @@ After iterating over all depth limits, `rest_spot_main.py` collects every best q
 | ✅ Done | `config_parameters.py` — central constants file; `config.py` renamed; `SYMBOL`, `CCY`, `CRYPTOCCY` added and used project-wide |
 | ✅ Done | `OrderBookState` — shared state container (local book, history, lock) |
 | ✅ Done | `MessageHandler` class — WebSocket callback decoupled from analysis logic |
-| ✅ Done | `AnalysisEngine` class — HFT (5 s) and historical (10 min) background loops |
-| ✅ Done | Session duration prompt in `websocket_spot_main.py` (default: 30 min) with `stop_event` wiring |
+| ✅ Done | `AnalysisEngine` class — HFT (5 s) and historical (5 min) background loops |
+| ✅ Done | Session duration fixed at `DEFAULT_SESSION_MINUTES = 15 min` (no user prompt); historical every 5 min → 3 iterations per session |
 | ✅ Done | Thread startup order fixed — WebSocket opens first, 1 s warm-up, then threads start so `local_book["bids"]` is populated on the first HFT iteration |
-| 🔜 Next | Port strategy logic (metrics → indicators → scores → best quote) into the WebSocket path |
+| ✅ Done | Port strategy logic (metrics → indicators → scores → best quote) into the WebSocket path |
 | 💡 Idea | Replace per-tick `calculate_best_quote()` calls with a periodic evaluation (every N updates) to avoid running the full pipeline on every 100 ms tick |
