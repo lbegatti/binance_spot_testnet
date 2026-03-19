@@ -3,7 +3,7 @@ import threading
 import logging
 import numpy as np
 
-from config_parameters import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS, N_LEVELS
+from config_parameters import HFT_INTERVAL, HIST_INTERVAL, MIN_SNAPSHOTS, N_LEVELS, CCY, CRYPTOCCY
 
 
 class AnalysisEngine:
@@ -183,6 +183,14 @@ class AnalysisEngine:
         logging.info("HFT analysis loop started (interval: %ds).", HFT_INTERVAL)
 
         while not self.stop_event.is_set():
+            with self.state.thread_balance_lock:
+                usdt_balance = self.state.balance_status.get(CCY, 0.0)
+                btc_balance = self.state.balance_status.get(CRYPTOCCY, 0.0)
+            if usdt_balance < 10.0 and btc_balance < 0.0001:
+                # logic is that if we do not have funds either in USD or BTC to buy/sell we just exit.
+                self.stop_event.wait(HFT_INTERVAL)
+                continue
+
             with self.state.thread_lock:
                 if not self.state.local_book["bids"]:
                     logging.info("HFT: no bids available yet, skipping iteration.")

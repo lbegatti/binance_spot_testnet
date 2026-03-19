@@ -40,7 +40,8 @@ rest_client = Client(
     api_secret,
     base_url="https://testnet.binance.vision",
 )
-
+# get a listenKey from the testnet REST endpoint
+listen_key = rest_client.new_listen_key()["listenKey"]
 
 # ---------------------------------------------------------------------------
 # 2. Fetch account balance before any trading logic
@@ -72,10 +73,10 @@ else:
     for asset, amounts in balances.items():
         logging.info(f"  {asset}: free={amounts['free']}, locked={amounts['locked']}")
         if (
-            amounts["locked"] == 0
-            and amounts["free"] > 0
-            and asset not in (CCY, CRYPTOCCY)
-            and asset in tradable_bases
+                amounts["locked"] == 0
+                and amounts["free"] > 0
+                and asset not in (CCY, CRYPTOCCY)
+                and asset in tradable_bases
         ):
             sell_symbol = f"{asset}{CCY}"
             logging.warning(
@@ -154,6 +155,8 @@ snapshot = rest_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
 # AnalysisEngine.  Both classes receive the same instance so they operate on
 # the same data and the same lock.
 state = OrderBookState()
+state.balance_status[CCY] = usdt_balance
+state.balance_status[CRYPTOCCY] = btc_balance
 state.local_book = {
     "bids": {price: qty for price, qty in snapshot["bids"]},
     "asks": {price: qty for price, qty in snapshot["asks"]},
@@ -189,6 +192,26 @@ ws_client = SpotWebsocketStreamClient(
 logging.info(
     "WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100
 )
+ws_user_client = SpotWebsocketStreamClient(
+    stream_url="wss://testnet.binance.vision",
+    on_message=handler.handle_balance_message
+)
+logging.info(
+    "Websocket stream for user data opened. Waiting %ds for initial balance data...", WS_SPEED // 100
+)
+ws_user_client.user_data(listen_key=listen_key)
+
+
+# Keep the listenKey alive — Binance expires it after 60 min without a ping
+def _keepalive_listen_key():
+    while not stop_event.wait(timeout=1800):  # ping every 30 min
+        rest_client.renew_listen_key(listenKey=listen_key)
+        logging.info("listenKey renewed.")
+
+
+keepalive_thread = threading.Thread(
+    target=_keepalive_listen_key, daemon=True, name="listenkey-keepalive"
+)
 ws_client.diff_book_depth(symbol=SYMBOL, speed=WS_SPEED)
 
 # Give the WebSocket a moment to deliver the first diff-depth messages so that
@@ -197,6 +220,7 @@ time.sleep(1)
 
 low_latency_thread.start()
 hist_thread.start()
+keepalive_thread.start()
 logging.info("Analysis threads started. Running for %d minute(s)...\n", session_minutes)
 
 # ---------------------------------------------------------------------------
@@ -213,6 +237,8 @@ finally:
     logging.info("Session complete. Stopping WebSocket and analysis threads...\n")
     stop_event.set()  # signal both analysis loops to exit
     ws_client.stop()  # close the WebSocket connection
+    ws_user_client.stop()  # close the user data WebSocket connection
     low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+    keepalive_thread.join(timeout=5)  # short, it exits almost instantly
     logging.info("All threads stopped. Exiting.")

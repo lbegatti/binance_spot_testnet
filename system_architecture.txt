@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-17)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-20)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -7,9 +7,9 @@ CURRENCY  : USDT  |  CRYPTO CCY : BTC
 FILES
 ─────
   config_parameters.py   — All tunable constants (symbol, intervals, depths, timeouts …)
-  order_book_state.py    — OrderBookState: shared state + threading.Lock
-  message_handler.py     — MessageHandler: WebSocket callback, book maintenance
-  analysis.py            — AnalysisEngine: HFT loop + historical loop
+  order_book_state.py    — OrderBookState: shared state + two threading.Locks
+  message_handler.py     — MessageHandler: two WebSocket callbacks (depth + balance)
+  analysis.py            — AnalysisEngine: low-latency loop + historical loop
   websocket_spot_main.py — Session driver: startup, threads, shutdown
   rest_spot_main.py      — REST-only static snapshot (reference / dev tool)
   quotes.py              — find_best_quote(): best bid/ask selection helpers
@@ -22,17 +22,17 @@ FILES
 1. CONFIGURATION  (config_parameters.py)
 ─────────────────────────────────────────────────────────────────────────────
   All constants are defined in one place and imported by every other module.
-  Renamed from config.py; symbol constants added this session.
 
     SYMBOL               = "BTCUSDT" # trading pair used across all calls
     CCY                  = "USDT"    # quote currency
     CRYPTOCCY            = "BTC"     # base / cryptocurrency
     HISTORY_MAXLEN       = 6000    # deque cap (~10 min at 100 ms updates)
-    HFT_INTERVAL         = 5       # seconds between HFT evaluations
+    N_LEVELS             = 50      # order book levels used in low_latency_analysis
+    HFT_INTERVAL         = 5       # seconds between low-latency evaluations
     HIST_INTERVAL        = 300     # seconds between historical analyses
     MIN_SNAPSHOTS        = 100     # warm-up guard for historical loop
     DEFAULT_SESSION_MINUTES = 15   # default session length (fixed, no prompt)
-    HTF_JOIN_TIMEOUT     = 10      # shutdown wait for HFT thread (s)
+    HTF_JOIN_TIMEOUT     = 10      # shutdown wait for low-latency thread (s)
     HIST_JOIN_TIMEOUT    = 15      # shutdown wait for historical thread (s)
     RECV_WINDOW          = 5000    # Binance REST validity window (ms)
     SNAPSHOT_DEPTH       = 100     # levels in the seed REST snapshot
@@ -41,19 +41,32 @@ FILES
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
 ─────────────────────────────────────────────────────────────────────────────
-  Single source of truth injected into both MessageHandler and AnalysisEngine:
+  Single source of truth injected into both MessageHandler and AnalysisEngine.
+  Two dedicated locks prevent contention between the high-frequency order-book
+  path (100 ms ticks) and the lower-frequency balance-update path:
 
     local_book           : dict   — {"bids": {price: qty}, "asks": {price: qty},
                                       "lastUpdateId": int}
     history_order_book   : deque  — rolling window of snapshots (maxlen=6000)
                                     each entry: {timestamp, lastUpdateId,
                                                   best_bids, best_asks}
-    thread_lock          : Lock   — mutex shared by all consumers
+    balance_status       : dict   — {"BTC": float, "USDT": float}
+                                    free balances for the traded pair.
+                                    Seeded from REST on startup; updated in
+                                    real time by handle_balance_message via
+                                    outboundAccountPosition events.
+                                    Only the free (non-locked) quantity is stored.
+    thread_lock          : Lock   — serialises local_book and history_order_book
+                                    (MessageHandler writes; AnalysisEngine reads)
+    thread_balance_lock  : Lock   — serialises balance_status independently of
+                                    thread_lock to avoid unnecessary contention
 
 ─────────────────────────────────────────────────────────────────────────────
 3. DATA INGESTION & SYNCING  (message_handler.py — MessageHandler)
 ─────────────────────────────────────────────────────────────────────────────
-  handle_depth_message(_, message) is the WebSocket on_message callback:
+  Exposes two WebSocket callbacks, each on a separate stream:
+
+  ── handle_depth_message(_, message)  [ws_client — production diff-depth] ──
 
   a) SUBSCRIPTION CONFIRMATION — if the message has only "id"/"result" (no
      bid/ask fields) log and return immediately.
@@ -68,9 +81,22 @@ FILES
   e) QUOTE CALCULATION — calculate_best_quote(local_book) is called so the
      strategy layer always has a fresh quote after every message.
 
+  ── handle_balance_message(_, message)  [ws_user_client — testnet User Data] ──
+
+  a) EVENT FILTER — silently ignores any event whose "e" field is not
+     "outboundAccountPosition" (e.g. executionReport, confirmations).
+  b) BALANCE UPDATE (inside thread_balance_lock) —
+       iterates over the "B" (balances) array;
+       for each asset already tracked (CRYPTOCCY, CCY):
+         balance_status[asset] = float(asset_data["f"])   # free only
+  c) LOGGING — logs the refreshed free balances for both assets while still
+     holding thread_balance_lock, so logged values are consistent with the write.
+
   NOTE: Production WebSocket stream is used for market data (read-only, no
   auth) because the Binance Spot Testnet does not expose WS market-data
-  streams.  Order execution is still routed through the testnet REST client.
+  streams.  The testnet User Data Stream (wss://testnet.binance.vision) IS
+  supported and is used for balance events.  Order execution is still routed
+  through the testnet REST client.
 
 ─────────────────────────────────────────────────────────────────────────────
 4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
@@ -79,10 +105,16 @@ FILES
   Checks stop_event on every iteration; exits gracefully when it is set.
 
   ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 5 s]
+      • Reads balance_status under thread_balance_lock at the top of every
+        iteration.  If both usdt_balance < 10.0 AND btc_balance < 0.0001,
+        sleeps HFT_INTERVAL and continues (no spin; cadence is preserved).
       • Acquires thread_lock → copies bids & asks → releases lock.
-      • Builds order book levels and computes metrics (depth, mid, micro, OBI).
-      • Identifies candidates using strategy logic (thin book check, micro-mid delta).
-      • Scores candidates (70% depth / 30% delta) and picks the best opportunity.
+      • Builds order book levels (top N_LEVELS = 50) and computes per-level
+        metrics: total_depth, mid_price, micro_price, OBI.
+      • Identifies candidates using strategy logic (thin book check, micro-mid
+        delta direction).
+      • Scores candidates (70 % depth / 30 % delta) and picks the best
+        opportunity for buy and sell sides.
       • Logs the selected best buy and sell quotes for the iteration.
 
   ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 5 min]
@@ -97,28 +129,41 @@ FILES
   Orchestrates the full lifecycle:
 
   Step 1 — Load .env (API key / secret), instantiate testnet REST client.
+            Obtain a listenKey from the testnet REST endpoint for the User
+            Data Stream: rest_client.new_listen_key()["listenKey"].
   Step 2 — Fetch & consolidate account balance:
               • Sell every non-USDT / non-BTC asset that has a live USDT pair
                 (single pass, each symbol attempted once).
               • Re-fetch balances if any sale succeeded.
               • Guard: raise if both USDT and BTC balances are zero.
   Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (15 min).
-              • 15 min → ~180 HFT iterations, ~3 historical analyses.
+              • 15 min → ~180 low-latency iterations, ~3 historical analyses.
   Step 4 — Seed local_book from REST snapshot (depth=100).
+            Seed state.balance_status from the REST-fetched balances before
+            any thread starts (single-threaded at this point; no lock needed).
   Step 5 — Instantiate OrderBookState, MessageHandler, AnalysisEngine.
-  Step 6 — Open SpotWebsocketStreamClient (production stream endpoint).
-              • Subscribe: ws_client.diff_book_depth(SYMBOL, speed=WS_SPEED)
-              • Sleep 1 s so the first diff-depth messages populate
-                local_book["bids"] before the HFT thread wakes up.
+  Step 6 — Open two SpotWebsocketStreamClient instances:
+              • ws_client (production) — diff_book_depth(SYMBOL, speed=WS_SPEED)
+                callback: handle_depth_message
+              • ws_user_client (testnet: wss://testnet.binance.vision) —
+                user_data(listen_key=listen_key)
+                callback: handle_balance_message
+            Sleep 1 s so the first diff-depth messages populate
+            local_book["bids"] before the low-latency thread wakes up.
   Step 7 — Start threads AFTER WebSocket is open and warmed up:
               • start low_latency_thread  (daemon=True, name="low-latency-analysis")
-              • start hist_thread (daemon=True, name="hist-analysis")
+              • start hist_thread         (daemon=True, name="hist-analysis")
+              • start keepalive_thread    (daemon=True, name="listenkey-keepalive")
+                  — calls rest_client.renew_listen_key() every 1800 s (30 min)
+                  — exits when stop_event is set (stop_event.wait(1800) → True)
   Step 8 — Main thread blocks for session_seconds (interruptible by Ctrl-C).
   Step 9 — Shutdown:
               • stop_event.set()
               • ws_client.stop()
-              • htf_thread.join(timeout=HTF_JOIN_TIMEOUT)
+              • ws_user_client.stop()
+              • low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
               • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+              • keepalive_thread.join(timeout=5)
 
 ─────────────────────────────────────────────────────────────────────────────
 6. EXECUTION  (future)
@@ -127,3 +172,4 @@ FILES
   Use LIMIT_MAKER (Post-Only) to avoid bad fills caused by latency.
   Route execution through testnet REST until WS API path is validated.
 """
+

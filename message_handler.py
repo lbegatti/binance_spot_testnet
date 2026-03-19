@@ -3,29 +3,42 @@ import logging
 
 from best_quote_calculator import calculate_best_quote
 from order_book_state import OrderBookState
+from config_parameters import CRYPTOCCY, CCY
 
 
 class MessageHandler:
     """
     WebSocket callback handler responsible for maintaining the local order book
-    in real time.
+    and live account balances in real time.
 
-    Every diff-depth message received from the Binance stream is processed here:
-    stale updates are discarded, live bids/asks are merged into
-    ``state.local_book``, and each valid update produces a new snapshot that is
-    appended to ``state.history_order_book`` for downstream analysis.
+    Exposes two WebSocket callbacks, each registered on a separate stream:
+
+    * ``handle_depth_message`` — registered on the production diff-depth stream
+      (``ws_client``).  Applies every bid/ask delta to ``state.local_book``,
+      appends best-bid/ask snapshots to ``state.history_order_book``, and
+      triggers a live best-quote calculation after every tick.
+    * ``handle_balance_message`` — registered on the Binance Testnet User Data
+      Stream (``ws_user_client``).  Processes ``outboundAccountPosition`` events
+      and keeps ``state.balance_status`` up to date so that ``AnalysisEngine``
+      always operates with accurate free balances.
+
+    Both callbacks communicate exclusively through the injected
+    ``OrderBookState`` instance and their respective threading locks
+    (``thread_lock`` for order-book data, ``thread_balance_lock`` for balance
+    data), keeping the two data paths fully independent.
 
     Attributes:
-        state (OrderBookState): Shared order book state, injected at
+        state (OrderBookState): Shared order book and balance state, injected at
             construction and also consumed by ``AnalysisEngine``.
     """
 
     def __init__(self, state: OrderBookState):
         """
         Args:
-            state (OrderBookState): The shared order book state instance that
-                provides ``local_book``, ``history_order_book``, and
-                ``thread_lock``.
+            state (OrderBookState): The shared order book and balance state
+                instance that provides ``local_book``, ``history_order_book``,
+                ``thread_lock``, ``balance_status``, and
+                ``thread_balance_lock``.
         """
         self.state = state
 
@@ -99,3 +112,44 @@ class MessageHandler:
             # Now your strategy logic can always read from 'local_book'
             # which is updated in real-time (no 1-second lag!)
             calculate_best_quote(self.state.local_book)
+
+    def handle_balance_message(self, _, message):
+        """
+        Parse and apply an ``outboundAccountPosition`` event to the live balance state.
+
+        Called by the Binance Testnet User Data Stream (``ws_user_client``)
+        whenever an account balance changes — for example, after an order fill.
+
+        Processing steps:
+
+        1. **Event filter** — silently ignores any User Data Stream event whose
+           ``"e"`` field is not ``"outboundAccountPosition"`` (e.g.
+           ``"executionReport"``, subscription confirmations).  This allows the
+           same callback to receive the full User Data Stream without needing a
+           separate dispatcher.
+        2. **Balance update** — under ``state.thread_balance_lock``, iterates
+           over the ``"B"`` (balances) array in the event and updates
+           ``state.balance_status[asset]`` for each asset already tracked
+           (i.e. ``CRYPTOCCY`` and ``CCY``).  Only the ``"f"`` (free) field is
+           stored; locked quantities are intentionally ignored.
+        3. **Logging** — logs the refreshed free balances for both tracked
+           assets while still holding the lock, so the logged values are always
+           consistent with the update that just occurred.
+
+        Args:
+            _: The WebSocket client instance (unused).
+            message (str): Raw JSON string received from the Binance Testnet
+                User Data Stream (``wss://testnet.binance.vision``).
+        """
+        data = json.loads(message)
+        if "e" in data and data["e"] == "outboundAccountPosition":
+            with self.state.thread_balance_lock:
+                for asset_data in data.get("B", []):
+                    asset = asset_data["a"]
+                    if asset in self.state.balance_status:
+                        self.state.balance_status[asset] = float(asset_data["f"])
+                logging.info(
+                    "Balance status - %s: %s | %s: %s",
+                    CRYPTOCCY, self.state.balance_status[CRYPTOCCY],
+                    CCY, self.state.balance_status[CCY]
+                )
