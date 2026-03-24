@@ -4,9 +4,9 @@ import pandas as pd
 from dotenv import load_dotenv
 import logging
 
-from metrics import get_order_book_metrics
-from quotes import find_best_quote
-from plot_helpers import plot_depth_bid_ask
+from strategy.metrics import get_order_book_metrics
+from strategy.quotes import find_best_quote
+from visualization.plot_helpers import plot_depth_bid_ask
 
 from binance.client import Client
 

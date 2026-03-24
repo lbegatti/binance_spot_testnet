@@ -1,7 +1,7 @@
 import pandas as pd
 
-from indicators import add_strategy_indicators
-from scores import get_weighted_volume_micro_spread_score
+from strategy.indicators import add_strategy_indicators
+from strategy.scores import get_weighted_volume_micro_spread_score
 
 
 def find_best_quote(order_book_df: pd.DataFrame, position: str) -> pd.DataFrame:

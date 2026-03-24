@@ -1,22 +1,32 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-20)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-25)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
 
 FILES
 ─────
-  config_parameters.py   — All tunable constants (symbol, intervals, depths, timeouts …)
-  order_book_state.py    — OrderBookState: shared state + two threading.Locks
-  message_handler.py     — MessageHandler: two WebSocket callbacks (depth + balance)
-  analysis.py            — AnalysisEngine: low-latency loop + historical loop
-  websocket_spot_main.py — Session driver: startup, threads, shutdown
-  rest_spot_main.py      — REST-only static snapshot (reference / dev tool)
-  quotes.py              — find_best_quote(): best bid/ask selection helpers
-  metrics.py             — Order book depth metrics
-  scores.py              — Normalised opportunity scores
-  indicators.py          — Technical indicators (trend confirmation, etc.)
-  plot_helpers.py        — Charting utilities for the REST snapshot path
+  config_parameters.py                — All tunable constants (symbol, intervals, depths, timeouts …)
+  websocket_spot_main.py              — Session driver: startup, threads, shutdown
+  rest_spot_main.py                   — REST-only static snapshot (reference / dev tool)
+
+  core/
+    order_book_state.py               — OrderBookState: shared state + two threading.Locks
+    message_handler.py                — MessageHandler: two WebSocket callbacks (depth + balance)
+
+  strategy/
+    analysis.py                       — AnalysisEngine: low-latency loop + historical loop
+    best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
+    metrics.py                        — Order book depth metrics
+    indicators.py                     — Technical indicators (trend confirmation, etc.)
+    scores.py                         — Normalised opportunity scores
+    quotes.py                         — find_best_quote(): best bid/ask selection helpers
+
+  execution/
+    order_executor.py                 — OrderExecutor: LIMIT GTC orders via WebSocket API + balance guards
+
+  visualization/
+    plot_helpers.py                   — Charting utilities for the REST snapshot path
 
 ─────────────────────────────────────────────────────────────────────────────
 1. CONFIGURATION  (config_parameters.py)
@@ -95,8 +105,9 @@ FILES
   NOTE: Production WebSocket stream is used for market data (read-only, no
   auth) because the Binance Spot Testnet does not expose WS market-data
   streams.  The testnet User Data Stream (wss://testnet.binance.vision) IS
-  supported and is used for balance events.  Order execution is still routed
-  through the testnet REST client.
+  supported and is used for balance events.  Order execution is routed
+  through the testnet WebSocket API (wss://testnet.binance.vision/ws-api/v3)
+  via OrderExecutor.
 
 ─────────────────────────────────────────────────────────────────────────────
 4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
@@ -110,12 +121,18 @@ FILES
         sleeps HFT_INTERVAL and continues (no spin; cadence is preserved).
       • Acquires thread_lock → copies bids & asks → releases lock.
       • Builds order book levels (top N_LEVELS = 50) and computes per-level
-        metrics: total_depth, mid_price, micro_price, OBI.
+        metrics: total_depth, mid_price, micro_price, OBI, bq, aq.
+        Level tuple: (total_depth, mid_price, micro_price, obi, bq, aq).
       • Identifies candidates using strategy logic (thin book check, micro-mid
         delta direction).
+        Candidate tuple: (level_idx, delta, total_depth, obi, micro_price, bq, aq).
       • Scores candidates (70 % depth / 30 % delta) and picks the best
         opportunity for buy and sell sides.
-      • Logs the selected best buy and sell quotes for the iteration.
+        Opportunity tuple: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq).
+      • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
+        The executor validates strategy, checks balances, computes quantity
+        (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
+        SpotWebsocketAPIClient.  Response handled async in handle_order_response.
 
   ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 5 min]
       • Skips iteration if fewer than MIN_SNAPSHOTS (100) have accumulated.
@@ -141,7 +158,10 @@ FILES
   Step 4 — Seed local_book from REST snapshot (depth=100).
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
-  Step 5 — Instantiate OrderBookState, MessageHandler, AnalysisEngine.
+  Step 5 — Instantiate OrderBookState, MessageHandler, OrderExecutor, AnalysisEngine.
+            OrderExecutor creates its own SpotWebsocketAPIClient internally
+            (wss://testnet.binance.vision/ws-api/v3) so self.handle_order_response
+            can be passed directly as the on_message callback.
   Step 6 — Open two SpotWebsocketStreamClient instances:
               • ws_client (production) — diff_book_depth(SYMBOL, speed=WS_SPEED)
                 callback: handle_depth_message
@@ -161,15 +181,42 @@ FILES
               • stop_event.set()
               • ws_client.stop()
               • ws_user_client.stop()
+              • executor.stop()   — closes the WebSocket API order connection
               • low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
               • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
               • keepalive_thread.join(timeout=5)
 
 ─────────────────────────────────────────────────────────────────────────────
-6. EXECUTION  (future)
+6. EXECUTION  (execution/order_executor.py — OrderExecutor)
 ─────────────────────────────────────────────────────────────────────────────
-  Planned: SpotWebsocketAPIClient for order submission.
-  Use LIMIT_MAKER (Post-Only) to avoid bad fills caused by latency.
-  Route execution through testnet REST until WS API path is validated.
+  Places LIMIT GTC orders via the Binance WebSocket API, avoiding the
+  per-request HTTP overhead of the REST API.  Owns its own
+  SpotWebsocketAPIClient connection (created in __init__).
+
+  ▸ __init__(state, stream_url, api_key, api_secret)
+      • Creates SpotWebsocketAPIClient internally with
+        on_message=self.handle_order_response.
+      • No circular dependency — self already exists at construction time.
+
+  ▸ execute(strategy, opportunity) → None  [fire-and-forget]
+      1) STRATEGY VALIDATION — rejects anything other than "BUY" or "SELL".
+      2) TUPLE UNPACKING — 8-element opportunity tuple:
+           (level_idx, score|None, delta, total_depth, obi, micro_price, bq, aq)
+      3) BALANCE READ — acquires thread_balance_lock, reads usdt and btc.
+      4) QUANTITY — aq for BUY (ask-side liquidity), bq for SELL (bid-side).
+      5) BALANCE GUARD —
+           BUY:  quantity × micro_price > usdt → skip with warning.
+           SELL: quantity > btc                → skip with warning.
+      6) ORDER SUBMISSION — ws_api_client.new_order(
+           symbol=SYMBOL, side=strategy, type="LIMIT", timeInForce="GTC",
+           quantity (6 dp), price (2 dp), recvWindow=RECV_WINDOW).
+
+  ▸ handle_order_response(_, message)  [async callback]
+      • Parses JSON response from Binance WS API.
+      • On error: logs code + message.
+      • On success: stores result in self.last_order, logs side/symbol/orderId/status.
+
+  ▸ stop()
+      • Delegates to ws_api_client.stop() for clean shutdown.
 """
 

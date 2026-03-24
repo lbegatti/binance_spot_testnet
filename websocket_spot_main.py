@@ -5,9 +5,10 @@ import time
 from binance.spot import Spot as Client
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from dotenv import load_dotenv
-from analysis import AnalysisEngine
-from message_handler import MessageHandler
-from order_book_state import OrderBookState
+from strategy.analysis import AnalysisEngine
+from core.message_handler import MessageHandler
+from core.order_book_state import OrderBookState
+from execution.order_executor import OrderExecutor
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     RECV_WINDOW,
@@ -73,10 +74,10 @@ else:
     for asset, amounts in balances.items():
         logging.info(f"  {asset}: free={amounts['free']}, locked={amounts['locked']}")
         if (
-                amounts["locked"] == 0
-                and amounts["free"] > 0
-                and asset not in (CCY, CRYPTOCCY)
-                and asset in tradable_bases
+            amounts["locked"] == 0
+            and amounts["free"] > 0
+            and asset not in (CCY, CRYPTOCCY)
+            and asset in tradable_bases
         ):
             sell_symbol = f"{asset}{CCY}"
             logging.warning(
@@ -171,7 +172,19 @@ stop_event = threading.Event()
 # 5. Instantiate engine and handler
 # ---------------------------------------------------------------------------
 handler = MessageHandler(state=state)
-engine = AnalysisEngine(state=state, stop_event=stop_event)
+
+# OrderExecutor owns its own WebSocket API connection for lower-latency
+# order placement.  The WS client is created inside __init__ so there is
+# no circular-dependency between the client and the callback.
+executor = OrderExecutor(
+    state=state,
+    stream_url="wss://testnet.binance.vision/ws-api/v3",
+    api_key=api_key,
+    api_secret=api_secret,
+)
+logging.info("WebSocket API client for order execution opened.")
+
+engine = AnalysisEngine(state=state, stop_event=stop_event, executor=executor)
 
 low_latency_thread = threading.Thread(
     target=engine.low_latency_analysis, daemon=True, name="low-latency-analysis"
@@ -185,7 +198,7 @@ hist_thread = threading.Thread(
 # ---------------------------------------------------------------------------
 # NOTE: The Binance Spot Testnet does not support WebSocket market-data streams.
 # We use the production stream endpoint for real-time depth data (read-only, no auth).
-# Trading orders are still routed through the testnet REST client.
+# Trading orders are routed through the testnet WebSocket API (ws_order_client).
 ws_client = SpotWebsocketStreamClient(
     on_message=handler.handle_depth_message,
 )
@@ -193,11 +206,11 @@ logging.info(
     "WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100
 )
 ws_user_client = SpotWebsocketStreamClient(
-    stream_url="wss://testnet.binance.vision",
-    on_message=handler.handle_balance_message
+    stream_url="wss://testnet.binance.vision", on_message=handler.handle_balance_message
 )
 logging.info(
-    "Websocket stream for user data opened. Waiting %ds for initial balance data...", WS_SPEED // 100
+    "Websocket stream for user data opened. Waiting %ds for initial balance data...",
+    WS_SPEED // 100,
 )
 ws_user_client.user_data(listen_key=listen_key)
 
@@ -238,6 +251,7 @@ finally:
     stop_event.set()  # signal both analysis loops to exit
     ws_client.stop()  # close the WebSocket connection
     ws_user_client.stop()  # close the user data WebSocket connection
+    executor.stop()  # close the WebSocket API order connection
     low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
     keepalive_thread.join(timeout=5)  # short, it exits almost instantly

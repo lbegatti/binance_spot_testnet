@@ -1,8 +1,8 @@
 import json
 import logging
 
-from best_quote_calculator import calculate_best_quote
-from order_book_state import OrderBookState
+from strategy.best_quote_calculator import calculate_best_quote
+from core.order_book_state import OrderBookState
 from config_parameters import CRYPTOCCY, CCY
 
 
@@ -150,6 +150,8 @@ class MessageHandler:
                         self.state.balance_status[asset] = float(asset_data["f"])
                 logging.info(
                     "Balance status - %s: %s | %s: %s",
-                    CRYPTOCCY, self.state.balance_status[CRYPTOCCY],
-                    CCY, self.state.balance_status[CCY]
+                    CRYPTOCCY,
+                    self.state.balance_status[CRYPTOCCY],
+                    CCY,
+                    self.state.balance_status[CCY],
                 )

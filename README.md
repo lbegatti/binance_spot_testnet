@@ -41,19 +41,33 @@ The WebSocket path runs the full strategy pipeline (metrics → indicators → s
 
 ```
 binance_spot_testnet/
-├── config_parameters.py       # Central configuration — all tunable constants in one place
-├── rest_spot_main.py          # REST orchestration — loops over depth limits
-├── websocket_spot_main.py     # WebSocket — real-time local order book + session driver
-├── order_book_state.py        # Shared state container (local book + history + lock)
-├── message_handler.py         # WebSocket callback — maintains local book in real time
-├── analysis.py                # AnalysisEngine — HFT (5 s) and historical (5 min) loops
-├── best_quote_calculator.py   # Live spread printer — prints best_bid | best_ask to stdout on every tick
-├── metrics.py                 # Order book metric calculations
-├── indicators.py              # Strategy-specific indicator columns
-├── scores.py                  # Weighted opportunity scoring
-├── quotes.py                  # Best quote selection logic
-├── plot_helpers.py            # Plotly visualisations (depth, OHLC)
-└── README.md
+├── config_parameters.py               # Central configuration — all tunable constants in one place
+├── rest_spot_main.py                  # REST orchestration — loops over depth limits
+├── websocket_spot_main.py             # WebSocket — real-time local order book + session driver
+├── README.md
+├── system_architecture.txt
+│
+├── core/                              # Shared state and data ingestion
+│   ├── __init__.py
+│   ├── order_book_state.py            # Shared state container (local book + history + balances + locks)
+│   └── message_handler.py             # WebSocket callbacks — maintains local book and balances in real time
+│
+├── strategy/                          # Analysis and scoring pipeline
+│   ├── __init__.py
+│   ├── analysis.py                    # AnalysisEngine — low-latency (5 s) and historical (5 min) loops
+│   ├── best_quote_calculator.py       # Live spread printer — prints best_bid | best_ask on every tick
+│   ├── metrics.py                     # Order book metric calculations
+│   ├── indicators.py                  # Strategy-specific indicator columns
+│   ├── scores.py                      # Weighted opportunity scoring
+│   └── quotes.py                      # Best quote selection logic
+│
+├── execution/                         # Order placement
+│   ├── __init__.py
+│   └── order_executor.py             # OrderExecutor — LIMIT GTC orders via WebSocket API
+│
+└── visualization/                     # Plotting utilities
+    ├── __init__.py
+    └── plot_helpers.py                # Plotly visualisations (depth, OHLC)
 ```
 
 ---
@@ -80,8 +94,9 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Binance connection** | `WS_SPEED` | `100` ms | WebSocket diff-depth update interval |
 
 **Imported by:**
-- `order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
-- `analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`
+- `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
+- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`
+- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`
 - `websocket_spot_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
 
 ---
@@ -151,10 +166,18 @@ Binance REST API                   Binance WebSocket (production)      Binance W
 │  • thread_lock   │
 │  • thread_       │       ┌──────────────────────┐
 │    balance_lock  │◀──────│   AnalysisEngine      │
-└──────────────────┘       │  .low_latency_analysis() │
+└──────────────────┘       │  .low_latency_analysis()  │
                            │   (balance check +        │
                            │    order book strategy)   │
                            │  .historical_analysis()   │
+                           └──────────┬───────────┘
+                                      │  opportunity tuple
+                                      ▼
+                           ┌──────────────────────┐     Binance WebSocket API (testnet)
+                           │   OrderExecutor       │────▶  wss://testnet.binance.vision
+                           │  .execute()           │       /ws-api/v3
+                           │   (balance guard +    │◀──── handle_order_response()
+                           │    LIMIT GTC order)   │       (async response callback)
                            └──────────────────────┘
                                       ▲
                            ┌──────────────────────┐
@@ -168,11 +191,12 @@ Binance REST API                   Binance WebSocket (production)      Binance W
 
 | Class / Module | File | Role |
 |---|---|---|
-| *(constants)* | `config_parameters.py` | Single source of truth for all tunable constants (`SYMBOL`, `CCY`, `CRYPTOCCY`, intervals, depths, timeouts) — imported by `order_book_state`, `analysis`, and `websocket_spot_main` |
-| `OrderBookState` | `order_book_state.py` | Single source of truth — owns `local_book`, `history_order_book`, `balance_status`, `thread_lock`, and `thread_balance_lock` |
-| `MessageHandler` | `message_handler.py` | Two WebSocket callbacks: `handle_depth_message` (merges diff-depth ticks into `local_book`, appends snapshots, calls `calculate_best_quote`) and `handle_balance_message` (processes `outboundAccountPosition` events to keep `balance_status` current) |
-| `AnalysisEngine` | `analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks |
-| `websocket_spot_main` | `websocket_spot_main.py` | Session driver — instantiates all classes, seeds initial balances into `state`, opens two WebSocket clients, starts all threads, manages session lifetime and shutdown |
+| *(constants)* | `config_parameters.py` | Single source of truth for all tunable constants (`SYMBOL`, `CCY`, `CRYPTOCCY`, intervals, depths, timeouts) — imported by every package |
+| `OrderBookState` | `core/order_book_state.py` | Single source of truth — owns `local_book`, `history_order_book`, `balance_status`, `thread_lock`, and `thread_balance_lock` |
+| `MessageHandler` | `core/message_handler.py` | Two WebSocket callbacks: `handle_depth_message` (merges diff-depth ticks into `local_book`, appends snapshots, calls `calculate_best_quote`) and `handle_balance_message` (processes `outboundAccountPosition` events to keep `balance_status` current) |
+| `AnalysisEngine` | `strategy/analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks; delegates order placement to `OrderExecutor` |
+| `OrderExecutor` | `execution/order_executor.py` | Places LIMIT GTC orders via the Binance WebSocket API (`SpotWebsocketAPIClient`); owns its own WS connection; validates strategy, checks balances, uses `aq` (BUY) or `bq` (SELL) as quantity and `micro_price` as limit price; handles responses asynchronously |
+| `websocket_spot_main` | `websocket_spot_main.py` | Session driver — instantiates all classes, seeds initial balances into `state`, opens WebSocket streams, starts all threads, manages session lifetime and shutdown |
 
 **How the components interact:**
 
@@ -180,7 +204,8 @@ Binance REST API                   Binance WebSocket (production)      Binance W
 2. Order-book data (`local_book`, `history_order_book`) is serialised through `state.thread_lock`.  `MessageHandler.handle_depth_message` acquires it to write; `AnalysisEngine.low_latency_analysis` acquires it to take a read-only copy and releases it before any heavy computation.
 3. Balance data (`balance_status`) is serialised through the dedicated `state.thread_balance_lock`, completely independent of `thread_lock`.  This prevents the high-frequency WebSocket order-book path (every 100 ms) from blocking on the lower-frequency balance path.
 4. `MessageHandler` is the **only writer** to `OrderBookState`; `AnalysisEngine` is **read-only** — it copies data under the appropriate lock and immediately releases it.
-5. A second `SpotWebsocketStreamClient` (`ws_user_client`) connects to the Binance Testnet User Data Stream (`wss://testnet.binance.vision`) and routes all messages to `handle_balance_message`.  A dedicated `listenKey` is obtained from the testnet REST API before the streams are opened and renewed every 30 minutes by a lightweight `keepalive_thread`.
+5. `AnalysisEngine` delegates order placement to `OrderExecutor`.  When `_select_best_opportunity()` returns a non-`None` 8-element tuple `(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)`, the engine calls `executor.execute("BUY", best_buy)` or `executor.execute("SELL", best_sell)`.  `OrderExecutor` validates the strategy, checks balances under `thread_balance_lock`, computes quantity (`aq` for BUY, `bq` for SELL), and sends a LIMIT GTC order via its own `SpotWebsocketAPIClient`.  The response arrives asynchronously in `handle_order_response`.
+6. A second `SpotWebsocketStreamClient` (`ws_user_client`) connects to the Binance Testnet User Data Stream (`wss://testnet.binance.vision`) and routes all messages to `handle_balance_message`.  A dedicated `listenKey` is obtained from the testnet REST API before the streams are opened and renewed every 30 minutes by a lightweight `keepalive_thread`.
 
 ---
 
@@ -217,7 +242,7 @@ When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, c
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
 5. Session duration fixed at `DEFAULT_SESSION_MINUTES` (15 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
-7. Instantiate `OrderBookState`, `MessageHandler`, and `AnalysisEngine`, injecting the shared state into the latter two.  Set `stop_event = threading.Event()`.
+7. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine`, injecting the shared state into the latter three.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://testnet.binance.vision/ws-api/v3`) so that `self.handle_order_response` can be passed directly as the callback.  Set `stop_event = threading.Event()`.
 8. Open two `SpotWebsocketStreamClient` instances:
    - `ws_client` — production stream endpoint, subscribes to `diff_book_depth` at 100 ms intervals; callback: `handle_depth_message`.
    - `ws_user_client` — testnet endpoint (`wss://testnet.binance.vision`), subscribes to `user_data(listen_key=...)`; callback: `handle_balance_message`.
@@ -234,7 +259,7 @@ When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, c
 12. On each incoming User Data Stream message (`MessageHandler.handle_balance_message`):
     - Ignore any event that is not `outboundAccountPosition`.
     - Under `state.thread_balance_lock`, update `state.balance_status` for each tracked asset (`CRYPTOCCY`, `CCY`) using the `"f"` (free) field.
-13. After `session_seconds`, set `stop_event`, stop both WebSocket clients (`ws_client.stop()`, `ws_user_client.stop()`), and join all threads (10 s HFT, 15 s historical, 5 s keepalive).  A `KeyboardInterrupt` triggers the same shutdown path early.
+13. After `session_seconds`, set `stop_event`, stop both WebSocket stream clients (`ws_client.stop()`, `ws_user_client.stop()`), stop the order executor (`executor.stop()`), and join all threads (10 s HFT, 15 s historical, 5 s keepalive).  A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
 ## Notation
 
@@ -242,6 +267,8 @@ When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, c
 |--------|-------------|-------------|
 | $P_b$, $Q_b$ | `bid_price`, `bid_quantity` | Best bid price and quantity at a level |
 | $P_a$, $Q_a$ | `ask_price`, `ask_quantity` | Best ask price and quantity at a level |
+| $bq$ | `bq` | Individual bid quantity at a level (carried through the opportunity pipeline for order sizing — SELL uses this) |
+| $aq$ | `aq` | Individual ask quantity at a level (carried through the opportunity pipeline for order sizing — BUY uses this) |
 | $D$ | `total_depth` | Sum of bid and ask quantities |
 | $P_{\text{mid}}$ | `mid_price` | Arithmetic mid-price |
 | $P_{\mu}$ | `micro_price` | Volume-weighted micro-price |
@@ -410,5 +437,7 @@ After iterating over all depth limits, `rest_spot_main.py` collects every best q
 | ✅ Done | Port strategy logic (metrics → indicators → scores → best quote) into the WebSocket path via `low_latency_analysis` |
 | ✅ Done | Balance check — `balance_status` seeded from REST on startup, kept live via `outboundAccountPosition` User Data Stream events; `low_latency_analysis` skips iterations when both balances are below threshold |
 | ✅ Done | User Data Stream — dedicated `ws_user_client` on testnet endpoint; `listenKey` keepalive thread renews every 30 min |
+| ✅ Done | `OrderExecutor` — LIMIT GTC orders via Binance WebSocket API (`SpotWebsocketAPIClient`); quantity = `aq` for BUY / `bq` for SELL; `micro_price` as limit price; balance guards; strategy validation; async response handling via `handle_order_response` callback |
+| ✅ Done | Project reorganised into packages: `core/` (state + data ingestion), `strategy/` (analysis + scoring), `execution/` (order placement), `visualization/` (plotting) |
 | 💡 Idea | Replace per-tick `calculate_best_quote()` calls with a periodic evaluation (every N updates) to avoid running the full pipeline on every 100 ms tick |
 | 🔜 Todo | `historical_analysis` — implement full historical logic using `history_order_book` |

@@ -60,9 +60,14 @@ class OrderBookState:
                 ``HISTORY_MAXLEN`` (6000).
         """
         self.local_book = {"bids": {}, "asks": {}, "lastUpdateId": 0}
-        self.balance_status = {CRYPTOCCY: 0.0, CCY: 0.0}  # seeded by websocket_spot_main.py before threads start
+        self.balance_status = {
+            CRYPTOCCY: 0.0,
+            CCY: 0.0,
+        }  # seeded by websocket_spot_main.py before threads start
         self.history_order_book = deque(
             maxlen=maxlen
         )  # Store recent order book snapshots
-        self.thread_lock = threading.Lock()           # Serializes local_book and history_order_book
-        self.thread_balance_lock = threading.Lock()   # Serializes balance_status
+        self.thread_lock = (
+            threading.Lock()
+        )  # Serializes local_book and history_order_book
+        self.thread_balance_lock = threading.Lock()  # Serializes balance_status
