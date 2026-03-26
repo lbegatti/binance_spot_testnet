@@ -27,7 +27,10 @@ class OrderBookState:
         local_book (dict): Live order book with keys ``"bids"``, ``"asks"``, and
             ``"lastUpdateId"``.  Bids and asks are stored as ``{price: qty}`` dicts.
         history_order_book (deque): Rolling window of snapshots, each containing
-            ``timestamp``, ``lastUpdateId``, ``best_bids``, and ``best_asks``.
+            ``timestamp`` (int, Unix ms), ``lastUpdateId`` (int),
+            ``best_bid`` (float, highest bid price), ``best_ask`` (float, lowest ask price),
+            ``volume_best_bid`` (float, quantity at best bid), and
+            ``volume_best_ask`` (float, quantity at best ask).
         balance_status (dict): Live free balances keyed by ``CRYPTOCCY`` and
             ``CCY`` (e.g. ``{"BTC": 0.0, "USDT": 0.0}``).  Seeded from the
             initial REST balance fetch in ``websocket_spot_main.py`` and kept

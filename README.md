@@ -16,6 +16,8 @@
 >
 > - 🏢 **No employer affiliation.** This is an independent personal project. It does not represent, involve, or reflect the views, work, products, or interests of my current or any previous employer in any way.
 >
+> - 🤖 **AI-assisted development.** Parts of this codebase, including implementation, documentation, and code review, were produced with the assistance of AI language models (e.g. GitHub Copilot / GPT-4 class models) to speed up development and act as a four-eyes check. AI models can be wrong, produce misleading output, introduce subtle bugs, or generate plausible-sounding but incorrect logic. **All AI-generated content should be treated as unverified until independently reviewed.** The author takes no responsibility for errors or omissions that originate from, or were not caught by, AI-assisted tooling.
+>
 > - ⚡ **Use at your own risk.** If you choose to adapt or extend this code to interact with a real Binance account or any live trading environment, you do so entirely **at your own risk**. The author accepts no liability for any financial loss, legal consequence, or damage arising from such use.
 >
 > **By cloning, forking, or using this repository you acknowledge that you have read and understood this disclaimer.**
@@ -81,7 +83,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Symbol** | `SYMBOL` | `"BTCUSDT"` | Trading pair used across all REST and WebSocket calls |
 | **Symbol** | `CCY` | `"USDT"` | Quote currency |
 | **Symbol** | `CRYPTOCCY` | `"BTC"` | Base / crypto currency |
-| **Order book state** | `HISTORY_MAXLEN` | `6000` | Max snapshots in `history_order_book` — at 100 ms intervals this covers ~10 min |
+| **Order book state** | `HISTORY_MAXLEN` | `6000` | Max snapshots in `history_order_book` — at 100 ms intervals this covers ~10 min.  Each entry: `{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}` (all numeric) |
 | **Order book state** | `N_LEVELS` | `50` | Number of order book levels used in `low_latency_analysis` |
 | **Analysis cadence** | `HFT_INTERVAL` | `5` s | Time between low-latency evaluations |
 | **Analysis cadence** | `HIST_INTERVAL` | `300` s | Time between historical analyses (5 min) |
@@ -205,7 +207,10 @@ Binance REST API                   Binance WebSocket (production)      Binance W
 3. Balance data (`balance_status`) is serialised through the dedicated `state.thread_balance_lock`, completely independent of `thread_lock`.  This prevents the high-frequency WebSocket order-book path (every 100 ms) from blocking on the lower-frequency balance path.
 4. `MessageHandler` is the **only writer** to `OrderBookState`; `AnalysisEngine` is **read-only** — it copies data under the appropriate lock and immediately releases it.
 5. `AnalysisEngine` delegates order placement to `OrderExecutor`.  When `_select_best_opportunity()` returns a non-`None` 8-element tuple `(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)`, the engine calls `executor.execute("BUY", best_buy)` or `executor.execute("SELL", best_sell)`.  `OrderExecutor` validates the strategy, checks balances under `thread_balance_lock`, computes quantity (`aq` for BUY, `bq` for SELL), and sends a LIMIT GTC order via its own `SpotWebsocketAPIClient`.  The response arrives asynchronously in `handle_order_response`.
-6. A second `SpotWebsocketStreamClient` (`ws_user_client`) connects to the Binance Testnet User Data Stream (`wss://testnet.binance.vision`) and routes all messages to `handle_balance_message`.  A dedicated `listenKey` is obtained from the testnet REST API before the streams are opened and renewed every 30 minutes by a lightweight `keepalive_thread`.
+6. **VWAP cross-thread integration** — `AnalysisEngine` owns a private `_vwap_lock` plus two attributes `_bid_vwap` and `_ask_vwap` (initially `None`).  `historical_analysis` computes both VWAPs from `history_order_book` every 5 min and publishes them under `_vwap_lock`.  `low_latency_analysis` reads them under the same lock on every iteration and gates order execution:
+   - **BUY**: execute only if `_ask_vwap is None` (first ~5 min) **or** `micro_price > ask_vwap`.
+   - **SELL**: execute only if `_bid_vwap is None` (first ~5 min) **or** `micro_price < bid_vwap`.
+7. A second `SpotWebsocketStreamClient` (`ws_user_client`) connects to the Binance Testnet User Data Stream (`wss://testnet.binance.vision`) and routes all messages to `handle_balance_message`.  A dedicated `listenKey` is obtained from the testnet REST API before the streams are opened and renewed every 30 minutes by a lightweight `keepalive_thread`.
 
 ---
 
@@ -232,6 +237,42 @@ The **default of 15 minutes** is chosen deliberately:
 
 When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
+### Thread Timeline (default 15-min session)
+
+```
+t=0s      Both threads start
+          ├── low_latency: runs immediately, then every 5 s
+          └── historical:  sleeps 5 min first (stop_event.wait(HIST_INTERVAL))
+
+t=5s      low_latency iteration #1
+t=10s     low_latency iteration #2
+...
+t=5min    low_latency iteration #60
+          historical iteration #1 → computes bid_vwap / ask_vwap,
+            publishes under _vwap_lock
+          ↓ from this point, low_latency reads the VWAP and applies the filter
+
+t=10min   low_latency iteration #120
+          historical iteration #2 → refreshes VWAP with the latest ~10 min of data
+
+t=15min   low_latency iteration #180
+          historical iteration #3 → refreshes VWAP again
+          stop_event set → both threads exit
+```
+
+### Deque Fill-Up (`history_order_book`)
+
+The deque size is driven by the **WebSocket tick rate** (~10 entries/sec at 100 ms), not by the historical analysis interval.  `historical_analysis` only *reads* the deque — it never clears it.
+
+| Time elapsed | WebSocket ticks | Deque size | Historical iterations |
+|---|---|---|---|
+| 1 min | ~600 | 600 | 0 |
+| 5 min | ~3 000 | 3 000 | 1st runs (reads 3 000 entries) |
+| 10 min | ~6 000 | **6 000 (full)** | 2nd runs (reads 6 000 entries) |
+| 15 min | ~9 000 sent | **6 000 (capped — oldest evicted)** | 3rd runs (reads 6 000 entries) |
+
+After ~10 minutes the deque hits `maxlen=6000` and becomes a true **rolling window** of the last ~10 minutes. Each `historical_analysis` iteration operates on whatever is currently in the window — not a fixed block.
+
 ---
 
 ## WebSocket Execution Flow (`websocket_spot_main.py`)
@@ -254,7 +295,7 @@ When the session duration elapses, `websocket_spot_main.py` sets `stop_event`, c
 11. On each incoming depth message (`MessageHandler.handle_depth_message`):
     - Skip the initial subscription confirmation (`{"id": 1, "result": null}`).
     - Drop stale updates where `data["u"] <= state.local_book["lastUpdateId"]`.
-    - Acquire `state.thread_lock`, apply bid/ask deltas, update `lastUpdateId`, append snapshot to `state.history_order_book`, release lock.
+    - Acquire `state.thread_lock`, apply bid/ask deltas, update `lastUpdateId`, append snapshot (`{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}`) to `state.history_order_book`, release lock.
     - Call `calculate_best_quote()` with the updated book (prints live spread to stdout).
 12. On each incoming User Data Stream message (`MessageHandler.handle_balance_message`):
     - Ignore any event that is not `outboundAccountPosition`.
@@ -439,5 +480,8 @@ After iterating over all depth limits, `rest_spot_main.py` collects every best q
 | ✅ Done | User Data Stream — dedicated `ws_user_client` on testnet endpoint; `listenKey` keepalive thread renews every 30 min |
 | ✅ Done | `OrderExecutor` — LIMIT GTC orders via Binance WebSocket API (`SpotWebsocketAPIClient`); quantity = `aq` for BUY / `bq` for SELL; `micro_price` as limit price; balance guards; strategy validation; async response handling via `handle_order_response` callback |
 | ✅ Done | Project reorganised into packages: `core/` (state + data ingestion), `strategy/` (analysis + scoring), `execution/` (order placement), `visualization/` (plotting) |
+| ✅ Done | `history_order_book` snapshot enriched — now stores `best_bid`, `best_ask` (float), `volume_best_bid`, `volume_best_ask` (float) per tick; string→float conversion at append time |
+| ✅ Done | `historical_analysis` — acquires `thread_lock`, copies deque to plain list, computes `bid_vwap` and `ask_vwap` via `volume_weighted_average_price()` (numpy), publishes under `_vwap_lock` |
+| ✅ Done | VWAP cross-thread integration — `low_latency_analysis` reads `_bid_vwap` / `_ask_vwap` under `_vwap_lock` and gates execution: BUY only if `micro_price > ask_vwap` (or VWAP not yet available); SELL only if `micro_price < bid_vwap` (or VWAP not yet available) |
 | 💡 Idea | Replace per-tick `calculate_best_quote()` calls with a periodic evaluation (every N updates) to avoid running the full pipeline on every 100 ms tick |
-| 🔜 Todo | `historical_analysis` — implement full historical logic using `history_order_book` |
+| 🔜 Todo | `historical_analysis` — implement further historical logic (spread distributions, regime detection, etc.) using `history_order_book` snapshots |

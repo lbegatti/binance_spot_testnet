@@ -58,8 +58,13 @@ FILES
     local_book           : dict   — {"bids": {price: qty}, "asks": {price: qty},
                                       "lastUpdateId": int}
     history_order_book   : deque  — rolling window of snapshots (maxlen=6000)
-                                    each entry: {timestamp, lastUpdateId,
-                                                  best_bids, best_asks}
+                                    each entry (all numeric, no strings):
+                                      {timestamp        : int   — Binance event time (Unix ms),
+                                       lastUpdateId     : int   — monotonic update ID,
+                                       best_bid         : float — highest bid price,
+                                       best_ask         : float — lowest ask price,
+                                       volume_best_bid  : float — quantity at best bid,
+                                       volume_best_ask  : float — quantity at best ask}
     balance_status       : dict   — {"BTC": float, "USDT": float}
                                     free balances for the traded pair.
                                     Seeded from REST on startup; updated in
@@ -86,8 +91,11 @@ FILES
        qty == 0 → pop the price level
        qty  > 0 → upsert the price level
      local_book["lastUpdateId"] is advanced to data["u"].
-  d) SNAPSHOT APPEND — best bid (max key) and best ask (min key) are recorded
-     with timestamp and update ID into history_order_book.
+  d) SNAPSHOT APPEND — best bid price and best ask price (converted from
+     string dict key to float), together with their respective quantities
+     (float), event timestamp, and update ID are recorded into
+     history_order_book as {timestamp, lastUpdateId, best_bid, best_ask,
+     volume_best_bid, volume_best_ask}.
   e) QUOTE CALCULATION — calculate_best_quote(local_book) is called so the
      strategy layer always has a fresh quote after every message.
 
@@ -115,6 +123,13 @@ FILES
   Receives the same OrderBookState instance as MessageHandler.
   Checks stop_event on every iteration; exits gracefully when it is set.
 
+  Owns three private attributes for cross-thread VWAP sharing:
+    _vwap_lock   : Lock          — serialises _bid_vwap and _ask_vwap
+    _bid_vwap    : float | None  — latest bid VWAP from historical_analysis
+    _ask_vwap    : float | None  — latest ask VWAP from historical_analysis
+  Both start as None (no historical data yet).  The low-latency thread
+  treats None as "no VWAP filter" and executes orders without gating.
+
   ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 5 s]
       • Reads balance_status under thread_balance_lock at the top of every
         iteration.  If both usdt_balance < 10.0 AND btc_balance < 0.0001,
@@ -129,16 +144,63 @@ FILES
       • Scores candidates (70 % depth / 30 % delta) and picks the best
         opportunity for buy and sell sides.
         Opportunity tuple: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq).
+      • VWAP FILTER — reads _bid_vwap / _ask_vwap under _vwap_lock:
+          BUY:  execute only if _ask_vwap is None OR micro_price > ask_vwap.
+                Skip with log if micro_price ≤ ask_vwap.
+          SELL: execute only if _bid_vwap is None OR micro_price < bid_vwap.
+                Skip with log if micro_price ≥ bid_vwap.
+        During the first ~5 min (before historical_analysis runs) both VWAPs
+        are None, so the filter is transparent and orders execute as before.
       • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
         The executor validates strategy, checks balances, computes quantity
         (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
         SpotWebsocketAPIClient.  Response handled async in handle_order_response.
 
   ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 5 min]
+      • Sleeps HIST_INTERVAL first (self.stop_event.wait(HIST_INTERVAL)).
+      • Acquires thread_lock → copies history_order_book to a plain list →
+        releases lock.  All computation happens outside the critical section.
       • Skips iteration if fewer than MIN_SNAPSHOTS (100) have accumulated.
-      • Reads history_order_book for spread distributions, VWAP, regime
-        detection, and other longer-horizon statistics.
-      • TODO: implement full historical analysis logic.
+      • Converts the snapshot list to numpy arrays and computes:
+          bid_vwap = volume_weighted_average_price(bids, vols_bids)
+          ask_vwap = volume_weighted_average_price(asks, vols_asks)
+        using the helper from indicators.py.
+      • Publishes bid_vwap and ask_vwap under _vwap_lock so that the
+        low_latency thread can read them on the next iteration.
+      • TODO: implement further historical analysis logic (spread
+        distributions, regime detection, etc.).
+
+  ▸ Deque fill-up math (at WS_SPEED = 100 ms → ~10 entries/sec):
+
+      │ Time elapsed │ WS ticks  │ Deque size          │ Historical iterations │
+      │──────────────│───────────│─────────────────────│───────────────────────│
+      │ 1 min        │ ~600      │ 600                 │ 0                     │
+      │ 5 min        │ ~3 000    │ 3 000               │ 1st runs              │
+      │ 10 min       │ ~6 000    │ 6 000 (full)        │ 2nd runs              │
+      │ 15 min       │ ~9 000    │ 6 000 (capped)      │ 3rd runs              │
+
+      After ~10 min the deque is full and becomes a true rolling window.
+
+  ▸ Thread timeline (default 15-min session):
+
+      t=0s      Both threads start
+                ├── low_latency: runs immediately, then every 5 s
+                └── historical:  sleeps 5 min first (stop_event.wait(HIST_INTERVAL))
+
+      t=5s      low_latency iteration #1
+      t=10s     low_latency iteration #2
+      ...
+      t=5min    low_latency iteration #60
+                historical iteration #1 → computes bid_vwap / ask_vwap,
+                  publishes under _vwap_lock
+                ↓ from this point, low_latency reads the VWAP and applies the filter
+
+      t=10min   low_latency iteration #120
+                historical iteration #2 → refreshes VWAP with the latest ~10 min of data
+
+      t=15min   low_latency iteration #180
+                historical iteration #3 → refreshes VWAP again
+                stop_event set → both threads exit
 
 ─────────────────────────────────────────────────────────────────────────────
 5. SESSION DRIVER  (websocket_spot_main.py)

@@ -46,3 +46,19 @@ def add_strategy_indicators(order_book_df: pd.DataFrame, strategy: str = "buy"):
     ).astype(bool)
 
     return order_book_df
+
+
+def volume_weighted_average_price(
+    price: pd.Series | int | float | list | np.ndarray,
+    volume: pd.Series | int | float | list | np.ndarray,
+) -> float:
+    """Calculate the weighted average price for volume weighted average price.
+    VWAP is calculated as the sum of (price * volume) divided by the sum of volume.
+    Args:
+        price (pd.Series | int | float): The price(s) to be weighted.
+        volume (pd.Series | int | float): The corresponding volume(s) for the price(s).
+    Returns:
+        pd.Series: The calculated volume weighted average price.
+    """
+
+    return float(np.sum(price * volume) / np.sum(volume))

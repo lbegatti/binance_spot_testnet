@@ -12,6 +12,7 @@ from config_parameters import (
     CRYPTOCCY,
 )
 from execution.order_executor import OrderExecutor
+from strategy.indicators import volume_weighted_average_price
 
 
 class AnalysisEngine:
@@ -53,6 +54,9 @@ class AnalysisEngine:
         self.state = state
         self.stop_event = stop_event
         self.order_executor = executor
+        self._vwap_lock = threading.Lock()
+        self._bid_vwap: float | None = None
+        self._ask_vwap: float | None = None
 
     @staticmethod
     def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
@@ -231,10 +235,41 @@ class AnalysisEngine:
             best_sell = self._select_best_opportunity(
                 sell_candidates, "sell", iteration
             )
+            with self._vwap_lock:
+                bid_vwap = self._bid_vwap
+                ask_vwap = self._ask_vwap
+
+            # TODO: review momentum-check logic below.
+            # After the first historical_analysis iteration (~5 min), _bid_vwap
+            # and _ask_vwap are populated.  They act as a confirmation filter:
+            #   BUY  → execute only if micro_price > ask_vwap (upward momentum:
+            #          current price exceeds the historical avg cost to buy).
+            #   SELL → execute only if micro_price < bid_vwap (downward momentum:
+            #          current price is below the historical avg bid).
+            # While VWAPs are still None (first ~5 min) the filter is transparent
+            # and orders execute based on the score alone.
             if best_buy:
-                self.order_executor.execute("BUY", best_buy)
+                micro_price = best_buy[5]  # index 5 of the tuple
+                if ask_vwap is not None and micro_price <= ask_vwap:
+                    logging.info(
+                        "HFT #%d [buy] — skipped: micro_price %.2f ≤ ask_vwap %.2f",
+                        iteration,
+                        micro_price,
+                        ask_vwap,
+                    )
+                else:
+                    self.order_executor.execute("BUY", best_buy)
             if best_sell:
-                self.order_executor.execute("SELL", best_sell)
+                micro_price = best_sell[5]
+                if bid_vwap is not None and micro_price >= bid_vwap:
+                    logging.info(
+                        "HFT #%d [sell] — skipped: micro_price %.2f ≥ bid_vwap %.2f",
+                        iteration,
+                        micro_price,
+                        bid_vwap,
+                    )
+                else:
+                    self.order_executor.execute("SELL", best_sell)
 
             self.stop_event.wait(HFT_INTERVAL)  # sleep AFTER work, not before
 
@@ -268,7 +303,12 @@ class AnalysisEngine:
             if self.stop_event.is_set():
                 break
 
-            snap_count = len(self.state.history_order_book)
+            with self.state.thread_lock:
+                snap_count = len(self.state.history_order_book)
+                snaps = list(
+                    self.state.history_order_book
+                )  # copy under lock, release before heavy work
+
             if snap_count < MIN_SNAPSHOTS:
                 logging.info(
                     "Historical: only %d snapshots available, need ≥%d — skipping.",
@@ -278,11 +318,25 @@ class AnalysisEngine:
                 continue
 
             iteration += 1
-            # TODO: implement historical analysis logic using history_order_book.
+            # snaps is a plain list — lock is already released, safe to convert to numpy arrays or a pandas DataFrame.
+            # Bid-VWAP
+            bids = np.array([s["best_bid"] for s in snaps])
+            vols_bids = np.array([s["volume_best_bid"] for s in snaps])
+            bid_vwap = volume_weighted_average_price(bids, vols_bids)
+            # Ask-VWAP
+            asks = np.array([s["best_ask"] for s in snaps])
+            vols_asks = np.array([s["volume_best_ask"] for s in snaps])
+            ask_vwap = volume_weighted_average_price(asks, vols_asks)
+            with self._vwap_lock:
+                self._bid_vwap = bid_vwap
+                self._ask_vwap = ask_vwap
+
             logging.info(
-                "Historical Analysis #%d — %d snapshots in window.",
+                "Historical Analysis #%d — %d snapshots | bid_vwap=%.2f | ask_vwap=%.2f",
                 iteration,
                 snap_count,
+                bid_vwap,
+                ask_vwap,
             )
 
         logging.info(

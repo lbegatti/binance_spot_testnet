@@ -57,9 +57,10 @@ class MessageHandler:
         3. **Bid/ask merge** — for every price level in ``"b"`` (bids) and
            ``"a"`` (asks): remove the level if quantity is 0, otherwise
            insert/update it in ``state.local_book``.
-        4. **Snapshot append** — record the current best bid and ask together
-           with the event timestamp and update ID into
-           ``state.history_order_book``.
+        4. **Snapshot append** — record the current best bid price and ask price
+           (float), their respective quantities (float), together with the event
+           timestamp and update ID into ``state.history_order_book`` as
+           ``{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}``.
         5. **Quote calculation** — call ``calculate_best_quote`` so the
            strategy layer always has an up-to-date quote after every message.
 
@@ -96,15 +97,23 @@ class MessageHandler:
             self.state.local_book["lastUpdateId"] = data["u"]
             # 3. Append the best [bid/ask] to history_order_book for strategy evaluation
             if self.state.local_book["bids"] and self.state.local_book["asks"]:
+                best_bid_key = max(
+                    self.state.local_book["bids"].keys(), key=float
+                )  # str key for dict lookup
+                best_ask_key = min(
+                    self.state.local_book["asks"].keys(), key=float
+                )  # str key for dict lookup
                 self.state.history_order_book.append(
                     {
                         "timestamp": data["E"],
                         "lastUpdateId": data["u"],
-                        "best_bids": max(
-                            self.state.local_book["bids"].keys(), key=float
+                        "best_bid": float(best_bid_key),
+                        "best_ask": float(best_ask_key),
+                        "volume_best_bid": float(
+                            self.state.local_book["bids"][best_bid_key]
                         ),
-                        "best_asks": min(
-                            self.state.local_book["asks"].keys(), key=float
+                        "volume_best_ask": float(
+                            self.state.local_book["asks"][best_ask_key]
                         ),
                     }
                 )
