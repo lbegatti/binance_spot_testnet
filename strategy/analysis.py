@@ -26,7 +26,7 @@ class AnalysisEngine:
     the same lock.
 
     Both loops respect a shared ``threading.Event`` (``stop_event``) so that
-    ``websocket_spot_main.py`` can terminate the session cleanly after the
+    ``websocket_main.py`` can terminate the session cleanly after the
     user-defined duration has elapsed.
 
     Attributes:
@@ -47,7 +47,7 @@ class AnalysisEngine:
                 provides ``local_book``, ``history_order_book``, and
                 ``thread_lock``.
             stop_event (threading.Event): Set by the session driver
-                (``websocket_spot_main.py``) when the session duration has
+                (``websocket_main.py``) when the session duration has
                 elapsed.  Both analysis loops check this event on every
                 iteration and exit gracefully when it is set.
         """
@@ -194,7 +194,8 @@ class AnalysisEngine:
         Periodically inspect the live order book and apply a high-frequency
         trading strategy.
 
-        Runs every 5 seconds until ``stop_event`` is set.  On each wake-up it
+        Runs every ``HFT_INTERVAL`` seconds (default 1 s) until ``stop_event``
+        is set.  On each wake-up it
         acquires ``state.thread_lock``, takes a local copy of the current bids
         and asks, then releases the lock before executing any heavier strategy
         logic — keeping the critical section as short as possible.
@@ -240,13 +241,13 @@ class AnalysisEngine:
                 ask_vwap = self._ask_vwap
 
             # TODO: review momentum-check logic below.
-            # After the first historical_analysis iteration (~5 min), _bid_vwap
+            # After the first historical_analysis iteration (~1 min), _bid_vwap
             # and _ask_vwap are populated.  They act as a confirmation filter:
             #   BUY  → execute only if micro_price > ask_vwap (upward momentum:
             #          current price exceeds the historical avg cost to buy).
             #   SELL → execute only if micro_price < bid_vwap (downward momentum:
             #          current price is below the historical avg bid).
-            # While VWAPs are still None (first ~5 min) the filter is transparent
+            # While VWAPs are still None (first ~1 min) the filter is transparent
             # and orders execute based on the score alone.
             if best_buy:
                 micro_price = best_buy[5]  # index 5 of the tuple
@@ -278,15 +279,16 @@ class AnalysisEngine:
     def historical_analysis(self):
         """
         Periodically analyze the rolling window of order book snapshots stored
-        in ``state.history_order_book`` to identify longer-term patterns.
+        in ``state.history_order_book`` to compute VWAPs for momentum filtering.
 
-        Runs every 10 minutes until ``stop_event`` is set.  If fewer than 100
-        snapshots have accumulated the iteration is skipped and a log message
-        is emitted so the operator knows the engine is still warming up.
+        Runs every ``HIST_INTERVAL`` seconds (default 60 s / 1 min) until
+        ``stop_event`` is set.  If fewer than ``MIN_SNAPSHOTS`` (100) have
+        accumulated the iteration is skipped and a log message is emitted so
+        the operator knows the engine is still warming up.
 
-        Intended use-cases include backtesting sub-strategies, computing
-        spread distributions, or detecting regime changes over the last 10
-        minutes of data.
+        Computes ``bid_vwap`` and ``ask_vwap`` from the rolling deque and
+        publishes them under ``_vwap_lock`` so that ``low_latency_analysis``
+        can use them as a momentum-confirmation gate.
 
         Exits cleanly when ``stop_event`` is set, logging how many iterations
         were completed.

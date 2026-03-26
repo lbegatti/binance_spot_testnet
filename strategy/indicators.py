@@ -12,7 +12,7 @@ def add_strategy_indicators(order_book_df: pd.DataFrame, strategy: str = "buy"):
     - w_volume_micro_spread_score: A weighted score with total depth and micro-mid delta to get potential opportunities.
     Args:
         order_book_df (pd.DataFrame): DataFrame containing order book data with calculated metrics.
-        strategy (str): The trading strategy to apply. Currently, supports "b" for buy-side opportunities.
+        strategy (str): The trading strategy to apply. Supports "buy" for buy-side and "sell" for sell-side opportunities.
     Returns:
         pd.DataFrame: The input DataFrame with additional columns for the opportunity indicators.
     """
@@ -52,13 +52,13 @@ def volume_weighted_average_price(
     price: pd.Series | int | float | list | np.ndarray,
     volume: pd.Series | int | float | list | np.ndarray,
 ) -> float:
-    """Calculate the weighted average price for volume weighted average price.
+    """Calculate the volume-weighted average price (VWAP).
     VWAP is calculated as the sum of (price * volume) divided by the sum of volume.
     Args:
-        price (pd.Series | int | float): The price(s) to be weighted.
-        volume (pd.Series | int | float): The corresponding volume(s) for the price(s).
+        price (pd.Series | int | float | list | np.ndarray): The price(s) to be weighted.
+        volume (pd.Series | int | float | list | np.ndarray): The corresponding volume(s) for the price(s).
     Returns:
-        pd.Series: The calculated volume weighted average price.
+        float: The calculated volume-weighted average price.
     """
 
     return float(np.sum(price * volume) / np.sum(volume))

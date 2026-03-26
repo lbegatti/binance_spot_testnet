@@ -11,6 +11,8 @@ from core.order_book_state import OrderBookState
 from execution.order_executor import OrderExecutor
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
+    HFT_INTERVAL,
+    HIST_INTERVAL,
     RECV_WINDOW,
     SNAPSHOT_DEPTH,
     WS_SPEED,
@@ -41,8 +43,14 @@ rest_client = Client(
     api_secret,
     base_url="https://testnet.binance.vision",
 )
-# get a listenKey from the testnet REST endpoint
-listen_key = rest_client.new_listen_key()["listenKey"]
+# ---------------------------------------------------------------------------
+# NOTE on balance tracking:
+# The old listenKey / User Data Stream mechanism was discontinued by Binance
+# for the Spot API (Feb 2026 — REST returns 410 Gone, WS returns 404).
+# Real-time balance updates now flow through the OrderExecutor's WebSocket
+# API connection:  session.logon → userDataStream.subscribe →
+# outboundAccountPosition push events.  No listenKey is needed.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 2. Fetch account balance before any trading logic
@@ -132,17 +140,17 @@ if usdt_balance == 0 and btc_balance == 0:
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
-# At the default of 15 min the engine runs:
-#   • low_latency_analysis → 15 × 60 / 5  =  180 iterations  (every 5 s)
-#   • historical_analysis  → 15 / 5       =    3 iterations  (every 5 min)
+# At the default of 20 min the engine runs:
+#   • low_latency_analysis → 20 × 60 / 1  = 1200 iterations  (every 1 s)
+#   • historical_analysis  → 20 × 60 / 60 =   20 iterations  (every 60 s / 1 min)
 
 session_minutes = DEFAULT_SESSION_MINUTES
 session_seconds = session_minutes * 60
 logging.info(
-    "Session configured: %d minute(s) → ~%d HFT iterations, ~%d historical iterations.\n",
+    "Session configured: %d minute(s) → ~%d low-latency iterations, ~%d historical iterations.\n",
     session_minutes,
-    session_seconds // 5,
-    session_minutes // 5,
+    session_seconds // HFT_INTERVAL,
+    session_seconds // HIST_INTERVAL,
 )
 
 # ---------------------------------------------------------------------------
@@ -174,15 +182,24 @@ stop_event = threading.Event()
 handler = MessageHandler(state=state)
 
 # OrderExecutor owns its own WebSocket API connection for lower-latency
-# order placement.  The WS client is created inside __init__ so there is
-# no circular-dependency between the client and the callback.
+# order placement.  On connection open it sends session.logon (HMAC-signed)
+# followed by userDataStream.subscribe, so that outboundAccountPosition
+# push events keep state.balance_status current in real time — no listenKey
+# needed.  If the testnet WS API is unreachable, execution falls back to REST
+# and balances rely on the startup REST snapshot.
 executor = OrderExecutor(
     state=state,
     stream_url="wss://testnet.binance.vision/ws-api/v3",
     api_key=api_key,
     api_secret=api_secret,
+    rest_client=rest_client,
 )
-logging.info("WebSocket API client for order execution opened.")
+logging.info(
+    "OrderExecutor initialised (WS=%s, REST fallback=%s, user-data=%s).",
+    "yes" if executor.ws_api_client is not None else "unavailable",
+    "yes" if executor.rest_client is not None else "no",
+    "pending" if executor.ws_api_client is not None else "REST-only",
+)
 
 engine = AnalysisEngine(state=state, stop_event=stop_event, executor=executor)
 
@@ -198,32 +215,13 @@ hist_thread = threading.Thread(
 # ---------------------------------------------------------------------------
 # NOTE: The Binance Spot Testnet does not support WebSocket market-data streams.
 # We use the production stream endpoint for real-time depth data (read-only, no auth).
-# Trading orders are routed through the testnet WebSocket API (ws_order_client).
+# Trading orders and balance updates are routed through the testnet WebSocket API
+# connection owned by OrderExecutor.
 ws_client = SpotWebsocketStreamClient(
     on_message=handler.handle_depth_message,
 )
 logging.info(
     "WebSocket stream opened. Waiting %ds for initial depth data...", WS_SPEED // 100
-)
-ws_user_client = SpotWebsocketStreamClient(
-    stream_url="wss://testnet.binance.vision", on_message=handler.handle_balance_message
-)
-logging.info(
-    "Websocket stream for user data opened. Waiting %ds for initial balance data...",
-    WS_SPEED // 100,
-)
-ws_user_client.user_data(listen_key=listen_key)
-
-
-# Keep the listenKey alive — Binance expires it after 60 min without a ping
-def _keepalive_listen_key():
-    while not stop_event.wait(timeout=1800):  # ping every 30 min
-        rest_client.renew_listen_key(listenKey=listen_key)
-        logging.info("listenKey renewed.")
-
-
-keepalive_thread = threading.Thread(
-    target=_keepalive_listen_key, daemon=True, name="listenkey-keepalive"
 )
 ws_client.diff_book_depth(symbol=SYMBOL, speed=WS_SPEED)
 
@@ -233,7 +231,6 @@ time.sleep(1)
 
 low_latency_thread.start()
 hist_thread.start()
-keepalive_thread.start()
 logging.info("Analysis threads started. Running for %d minute(s)...\n", session_minutes)
 
 # ---------------------------------------------------------------------------
@@ -249,10 +246,45 @@ finally:
     time.sleep(1)
     logging.info("Session complete. Stopping WebSocket and analysis threads...\n")
     stop_event.set()  # signal both analysis loops to exit
-    ws_client.stop()  # close the WebSocket connection
-    ws_user_client.stop()  # close the user data WebSocket connection
-    executor.stop()  # close the WebSocket API order connection
+    ws_client.stop()  # close the market-data WebSocket stream
+    executor.stop()  # close the WebSocket API order + user-data connection
     low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
-    keepalive_thread.join(timeout=5)  # short, it exits almost instantly
     logging.info("All threads stopped. Exiting.")
+
+    # -----------------------------------------------------------------------
+    # End-of-session order report
+    # -----------------------------------------------------------------------
+    executor.order_status_report()
+
+    # -----------------------------------------------------------------------
+    # End-of-session balance report
+    # -----------------------------------------------------------------------
+    try:
+        final_info = rest_client.account(recvWindow=RECV_WINDOW)
+        final_balances = {
+            item["asset"]: float(item["free"])
+            for item in final_info["balances"]
+            if item["asset"] in (CCY, CRYPTOCCY)
+        }
+        final_usdt = final_balances.get(CCY, 0.0)
+        final_btc = final_balances.get(CRYPTOCCY, 0.0)
+        pnl_usdt = final_usdt - usdt_balance
+        pnl_btc = final_btc - btc_balance
+        logging.info(
+            "\n"
+            "========== END-OF-SESSION BALANCE REPORT ==========\n"
+            "  %-10s  start: %14.2f   end: %14.2f   Δ %+.2f\n"
+            "  %-10s  start: %14.8f   end: %14.8f   Δ %+.8f\n"
+            "====================================================",
+            CCY,
+            usdt_balance,
+            final_usdt,
+            pnl_usdt,
+            CRYPTOCCY,
+            btc_balance,
+            final_btc,
+            pnl_btc,
+        )
+    except Exception as e:
+        logging.error("Could not fetch final balance: %s", e)

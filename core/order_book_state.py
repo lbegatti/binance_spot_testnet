@@ -33,16 +33,17 @@ class OrderBookState:
             ``volume_best_ask`` (float, quantity at best ask).
         balance_status (dict): Live free balances keyed by ``CRYPTOCCY`` and
             ``CCY`` (e.g. ``{"BTC": 0.0, "USDT": 0.0}``).  Seeded from the
-            initial REST balance fetch in ``websocket_spot_main.py`` and kept
-            up to date by ``MessageHandler.handle_balance_message`` via
-            ``outboundAccountPosition`` events from the Binance User Data Stream.
+            initial REST balance fetch in ``websocket_main.py`` and kept
+            up to date by ``OrderExecutor._handle_balance_update`` via
+            ``outboundAccountPosition`` push events on the WebSocket API
+            connection (``session.logon`` → ``userDataStream.subscribe``).
             Only the *free* (non-locked) quantity is stored.
         thread_lock (threading.Lock): Mutex that serializes access to
             ``local_book`` and ``history_order_book``.  ``MessageHandler``
             acquires it to write; ``AnalysisEngine`` acquires it to take a
             read-only snapshot before any heavy computation.
         thread_balance_lock (threading.Lock): Mutex that serializes access to
-            ``balance_status``.  ``MessageHandler.handle_balance_message``
+            ``balance_status``.  ``OrderExecutor._handle_balance_update``
             acquires it to write; ``AnalysisEngine.low_latency_analysis``
             acquires it to read before each iteration.
     """
@@ -52,21 +53,21 @@ class OrderBookState:
         Initialize the order book state with empty books and zero balances.
 
         ``balance_status`` is initialized to zero for both assets and must be
-        seeded by the caller (``websocket_spot_main.py``) immediately after
+        seeded by the caller (``websocket_main.py``) immediately after
         construction using the balances returned by the Binance REST API,
         before any analysis threads are started.
 
         Args:
             maxlen (int): Maximum number of snapshots to keep in
-                ``history_order_book``.  At 100 ms update intervals, 6000 entries
-                correspond to roughly 10 minutes of history.  Defaults to
-                ``HISTORY_MAXLEN`` (6000).
+                ``history_order_book``.  At 100 ms update intervals, 3000 entries
+                correspond to roughly 5 minutes of history.  Defaults to
+                ``HISTORY_MAXLEN`` (3000).
         """
         self.local_book = {"bids": {}, "asks": {}, "lastUpdateId": 0}
         self.balance_status = {
             CRYPTOCCY: 0.0,
             CCY: 0.0,
-        }  # seeded by websocket_spot_main.py before threads start
+        }  # seeded by websocket_main.py before threads start
         self.history_order_book = deque(
             maxlen=maxlen
         )  # Store recent order book snapshots

@@ -3,24 +3,29 @@ import logging
 
 from strategy.best_quote_calculator import calculate_best_quote
 from core.order_book_state import OrderBookState
-from config_parameters import CRYPTOCCY, CCY
+from config_parameters import CRYPTOCCY, CCY, QUOTE_EVERY_N_TICKS
 
 
 class MessageHandler:
     """
     WebSocket callback handler responsible for maintaining the local order book
-    and live account balances in real time.
+    in real time.
 
-    Exposes two WebSocket callbacks, each registered on a separate stream:
+    Exposes one active WebSocket callback:
 
     * ``handle_depth_message`` — registered on the production diff-depth stream
       (``ws_client``).  Applies every bid/ask delta to ``state.local_book``,
       appends best-bid/ask snapshots to ``state.history_order_book``, and
-      triggers a live best-quote calculation after every tick.
-    * ``handle_balance_message`` — registered on the Binance Testnet User Data
-      Stream (``ws_user_client``).  Processes ``outboundAccountPosition`` events
-      and keeps ``state.balance_status`` up to date so that ``AnalysisEngine``
-      always operates with accurate free balances.
+      triggers a throttled best-quote calculation every
+      ``QUOTE_EVERY_N_TICKS`` ticks (~1 s at 100 ms tick rate).
+
+    A second callback, ``handle_balance_message``, is preserved but **no longer
+    wired** to any stream.  Real-time balance updates now flow through
+    ``OrderExecutor._handle_balance_update`` on the same WebSocket API
+    connection used for order placement (via ``session.logon`` →
+    ``userDataStream.subscribe`` → ``outboundAccountPosition`` push events).
+    The old listenKey / User Data Stream was discontinued by Binance in
+    February 2026.
 
     Both callbacks communicate exclusively through the injected
     ``OrderBookState`` instance and their respective threading locks
@@ -41,6 +46,7 @@ class MessageHandler:
                 ``thread_balance_lock``.
         """
         self.state = state
+        self._tick_count: int = 0
 
     def handle_depth_message(self, _, message):
         """
@@ -61,8 +67,10 @@ class MessageHandler:
            (float), their respective quantities (float), together with the event
            timestamp and update ID into ``state.history_order_book`` as
            ``{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}``.
-        5. **Quote calculation** — call ``calculate_best_quote`` so the
-           strategy layer always has an up-to-date quote after every message.
+        5. **Quote calculation (throttled)** — call ``calculate_best_quote``
+           every ``QUOTE_EVERY_N_TICKS`` ticks (default 10 ≈ once per second)
+           rather than on every 100 ms tick, reducing CPU work and console
+           noise.  The local book itself is still updated on every tick.
 
         Args:
             _: The WebSocket client instance (unused).
@@ -120,35 +128,37 @@ class MessageHandler:
 
             # Now your strategy logic can always read from 'local_book'
             # which is updated in real-time (no 1-second lag!)
-            calculate_best_quote(self.state.local_book)
+            self._tick_count += 1
+            if self._tick_count % QUOTE_EVERY_N_TICKS == 0:
+                calculate_best_quote(self.state.local_book)
 
     def handle_balance_message(self, _, message):
         """
         Parse and apply an ``outboundAccountPosition`` event to the live balance state.
 
-        Called by the Binance Testnet User Data Stream (``ws_user_client``)
-        whenever an account balance changes — for example, after an order fill.
+        .. deprecated::
+            **Superseded by** ``OrderExecutor._handle_balance_update``.
 
-        Processing steps:
+            Real-time balance updates now arrive on the same WebSocket API
+            connection used for order placement (``session.logon`` →
+            ``userDataStream.subscribe`` → ``outboundAccountPosition`` push).
+            This method is preserved for reference but is **not wired** to any
+            stream in the current architecture.
 
-        1. **Event filter** — silently ignores any User Data Stream event whose
-           ``"e"`` field is not ``"outboundAccountPosition"`` (e.g.
-           ``"executionReport"``, subscription confirmations).  This allows the
-           same callback to receive the full User Data Stream without needing a
-           separate dispatcher.
+        Processing steps (when active):
+
+        1. **Event filter** — silently ignores any event whose ``"e"`` field
+           is not ``"outboundAccountPosition"``.
         2. **Balance update** — under ``state.thread_balance_lock``, iterates
-           over the ``"B"`` (balances) array in the event and updates
-           ``state.balance_status[asset]`` for each asset already tracked
-           (i.e. ``CRYPTOCCY`` and ``CCY``).  Only the ``"f"`` (free) field is
-           stored; locked quantities are intentionally ignored.
-        3. **Logging** — logs the refreshed free balances for both tracked
-           assets while still holding the lock, so the logged values are always
-           consistent with the update that just occurred.
+           over the ``"B"`` (balances) array and updates
+           ``state.balance_status[asset]`` for ``CRYPTOCCY`` and ``CCY``.
+           Only the ``"f"`` (free) field is stored.
+        3. **Logging** — logs the refreshed free balances while holding the
+           lock.
 
         Args:
             _: The WebSocket client instance (unused).
-            message (str): Raw JSON string received from the Binance Testnet
-                User Data Stream (``wss://testnet.binance.vision``).
+            message (str): Raw JSON string from a Binance User Data Stream.
         """
         data = json.loads(message)
         if "e" in data and data["e"] == "outboundAccountPosition":

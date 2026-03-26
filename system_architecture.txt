@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-25)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-26)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -7,12 +7,12 @@ CURRENCY  : USDT  |  CRYPTO CCY : BTC
 FILES
 ─────
   config_parameters.py                — All tunable constants (symbol, intervals, depths, timeouts …)
-  websocket_spot_main.py              — Session driver: startup, threads, shutdown
-  rest_spot_main.py                   — REST-only static snapshot (reference / dev tool)
+  websocket_main.py                   — Session driver: startup, threads, shutdown
+  restapi_main.py                     — REST-only static snapshot (reference / dev tool)
 
   core/
     order_book_state.py               — OrderBookState: shared state + two threading.Locks
-    message_handler.py                — MessageHandler: two WebSocket callbacks (depth + balance)
+    message_handler.py                — MessageHandler: one active callback (depth) + one superseded (balance)
 
   strategy/
     analysis.py                       — AnalysisEngine: low-latency loop + historical loop
@@ -36,12 +36,12 @@ FILES
     SYMBOL               = "BTCUSDT" # trading pair used across all calls
     CCY                  = "USDT"    # quote currency
     CRYPTOCCY            = "BTC"     # base / cryptocurrency
-    HISTORY_MAXLEN       = 6000    # deque cap (~10 min at 100 ms updates)
+    HISTORY_MAXLEN       = 3000    # deque cap (~5 min at 100 ms updates)
     N_LEVELS             = 50      # order book levels used in low_latency_analysis
-    HFT_INTERVAL         = 5       # seconds between low-latency evaluations
-    HIST_INTERVAL        = 300     # seconds between historical analyses
+    HFT_INTERVAL         = 1       # seconds between low-latency evaluations
+    HIST_INTERVAL        = 60      # seconds between historical analyses (1 min)
     MIN_SNAPSHOTS        = 100     # warm-up guard for historical loop
-    DEFAULT_SESSION_MINUTES = 15   # default session length (fixed, no prompt)
+    DEFAULT_SESSION_MINUTES = 20   # default session length (fixed, no prompt)
     HTF_JOIN_TIMEOUT     = 10      # shutdown wait for low-latency thread (s)
     HIST_JOIN_TIMEOUT    = 15      # shutdown wait for historical thread (s)
     RECV_WINDOW          = 5000    # Binance REST validity window (ms)
@@ -57,7 +57,7 @@ FILES
 
     local_book           : dict   — {"bids": {price: qty}, "asks": {price: qty},
                                       "lastUpdateId": int}
-    history_order_book   : deque  — rolling window of snapshots (maxlen=6000)
+    history_order_book   : deque  — rolling window of snapshots (maxlen=3000)
                                     each entry (all numeric, no strings):
                                       {timestamp        : int   — Binance event time (Unix ms),
                                        lastUpdateId     : int   — monotonic update ID,
@@ -68,8 +68,12 @@ FILES
     balance_status       : dict   — {"BTC": float, "USDT": float}
                                     free balances for the traded pair.
                                     Seeded from REST on startup; updated in
-                                    real time by handle_balance_message via
-                                    outboundAccountPosition events.
+                                    real time by OrderExecutor._handle_balance_update
+                                    via outboundAccountPosition push events on
+                                    the WS API connection (session.logon →
+                                    userDataStream.subscribe — no listenKey).
+                                    Falls back to REST snapshot if the testnet
+                                    WS does not support session.logon.
                                     Only the free (non-locked) quantity is stored.
     thread_lock          : Lock   — serialises local_book and history_order_book
                                     (MessageHandler writes; AnalysisEngine reads)
@@ -79,7 +83,7 @@ FILES
 ─────────────────────────────────────────────────────────────────────────────
 3. DATA INGESTION & SYNCING  (message_handler.py — MessageHandler)
 ─────────────────────────────────────────────────────────────────────────────
-  Exposes two WebSocket callbacks, each on a separate stream:
+  Exposes one active WebSocket callback:
 
   ── handle_depth_message(_, message)  [ws_client — production diff-depth] ──
 
@@ -96,24 +100,22 @@ FILES
      (float), event timestamp, and update ID are recorded into
      history_order_book as {timestamp, lastUpdateId, best_bid, best_ask,
      volume_best_bid, volume_best_ask}.
-  e) QUOTE CALCULATION — calculate_best_quote(local_book) is called so the
-     strategy layer always has a fresh quote after every message.
+  e) QUOTE CALCULATION (throttled) — calculate_best_quote(local_book) is
+     called every QUOTE_EVERY_N_TICKS ticks (default 10 ≈ once per second)
+     rather than on every 100 ms tick.  Reduces CPU work and console noise
+     while keeping the local book updated in real time.
 
-  ── handle_balance_message(_, message)  [ws_user_client — testnet User Data] ──
+  ── handle_balance_message(_, message)  [SUPERSEDED — preserved for ref.] ──
 
-  a) EVENT FILTER — silently ignores any event whose "e" field is not
-     "outboundAccountPosition" (e.g. executionReport, confirmations).
-  b) BALANCE UPDATE (inside thread_balance_lock) —
-       iterates over the "B" (balances) array;
-       for each asset already tracked (CRYPTOCCY, CCY):
-         balance_status[asset] = float(asset_data["f"])   # free only
-  c) LOGGING — logs the refreshed free balances for both assets while still
-     holding thread_balance_lock, so logged values are consistent with the write.
+  Balance updates now flow through OrderExecutor._handle_balance_update on
+  the same WebSocket API connection used for order placement (session.logon →
+  userDataStream.subscribe → outboundAccountPosition push events).  The old
+  listenKey / User Data Stream was discontinued by Binance in Feb 2026.
+  This method is preserved for reference but is not wired to any stream.
 
   NOTE: Production WebSocket stream is used for market data (read-only, no
   auth) because the Binance Spot Testnet does not expose WS market-data
-  streams.  The testnet User Data Stream (wss://testnet.binance.vision) IS
-  supported and is used for balance events.  Order execution is routed
+  streams.  Order execution and real-time balance events are both routed
   through the testnet WebSocket API (wss://testnet.binance.vision/ws-api/v3)
   via OrderExecutor.
 
@@ -130,7 +132,7 @@ FILES
   Both start as None (no historical data yet).  The low-latency thread
   treats None as "no VWAP filter" and executes orders without gating.
 
-  ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 5 s]
+  ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 1 s]
       • Reads balance_status under thread_balance_lock at the top of every
         iteration.  If both usdt_balance < 10.0 AND btc_balance < 0.0001,
         sleeps HFT_INTERVAL and continues (no spin; cadence is preserved).
@@ -144,19 +146,25 @@ FILES
       • Scores candidates (70 % depth / 30 % delta) and picks the best
         opportunity for buy and sell sides.
         Opportunity tuple: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq).
-      • VWAP FILTER — reads _bid_vwap / _ask_vwap under _vwap_lock:
+      • VWAP FILTER (momentum confirmation) — reads _bid_vwap / _ask_vwap under _vwap_lock:
           BUY:  execute only if _ask_vwap is None OR micro_price > ask_vwap.
+                Interpretation: upward momentum — current price exceeds
+                the historical avg cost to buy.
                 Skip with log if micro_price ≤ ask_vwap.
           SELL: execute only if _bid_vwap is None OR micro_price < bid_vwap.
+                Interpretation: downward momentum — current price is below
+                the historical avg bid.
                 Skip with log if micro_price ≥ bid_vwap.
-        During the first ~5 min (before historical_analysis runs) both VWAPs
+        During the first ~1 min (before historical_analysis runs) both VWAPs
         are None, so the filter is transparent and orders execute as before.
+        NOTE: This logic may be inverted in the future to implement a
+        buy-the-dip / mean-reversion strategy instead.
       • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
         The executor validates strategy, checks balances, computes quantity
         (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
         SpotWebsocketAPIClient.  Response handled async in handle_order_response.
 
-  ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 5 min]
+  ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 60 s / 1 min]
       • Sleeps HIST_INTERVAL first (self.stop_event.wait(HIST_INTERVAL)).
       • Acquires thread_lock → copies history_order_book to a plain list →
         releases lock.  All computation happens outside the critical section.
@@ -174,91 +182,126 @@ FILES
 
       │ Time elapsed │ WS ticks  │ Deque size          │ Historical iterations │
       │──────────────│───────────│─────────────────────│───────────────────────│
-      │ 1 min        │ ~600      │ 600                 │ 0                     │
-      │ 5 min        │ ~3 000    │ 3 000               │ 1st runs              │
-      │ 10 min       │ ~6 000    │ 6 000 (full)        │ 2nd runs              │
-      │ 15 min       │ ~9 000    │ 6 000 (capped)      │ 3rd runs              │
+      │ 1 min        │ ~600      │ 600                 │ 1st runs              │
+      │ 3 min        │ ~1 800    │ 1 800               │ 3rd runs              │
+      │ 5 min        │ ~3 000    │ 3 000 (full)        │ 5th runs              │
+      │ 10 min       │ ~6 000    │ 3 000 (capped)      │ 10th runs             │
+      │ 20 min       │ ~12 000   │ 3 000 (capped)      │ 20th runs             │
 
-      After ~10 min the deque is full and becomes a true rolling window.
+      After ~5 min the deque is full and becomes a true rolling window.
 
-  ▸ Thread timeline (default 15-min session):
+  ▸ Thread timeline (default 20-min session):
 
       t=0s      Both threads start
-                ├── low_latency: runs immediately, then every 5 s
-                └── historical:  sleeps 5 min first (stop_event.wait(HIST_INTERVAL))
+                ├── low_latency: runs immediately, then every 1 s
+                └── historical:  sleeps 1 min first (stop_event.wait(HIST_INTERVAL))
 
-      t=5s      low_latency iteration #1
-      t=10s     low_latency iteration #2
+      t=1s      low_latency iteration #1
+      t=2s      low_latency iteration #2
       ...
-      t=5min    low_latency iteration #60
+      t=1min    low_latency iteration #60
                 historical iteration #1 → computes bid_vwap / ask_vwap,
                   publishes under _vwap_lock
                 ↓ from this point, low_latency reads the VWAP and applies the filter
 
-      t=10min   low_latency iteration #120
-                historical iteration #2 → refreshes VWAP with the latest ~10 min of data
+      t=2min    low_latency iteration #120
+                historical iteration #2 → refreshes VWAP
 
-      t=15min   low_latency iteration #180
-                historical iteration #3 → refreshes VWAP again
+      t=5min    low_latency iteration #300
+                historical iteration #5 → deque now full, true rolling window
+      ...
+      t=20min   low_latency iteration #1200
+                historical iteration #20 → refreshes VWAP one last time
                 stop_event set → both threads exit
 
 ─────────────────────────────────────────────────────────────────────────────
-5. SESSION DRIVER  (websocket_spot_main.py)
+5. SESSION DRIVER  (websocket_main.py)
 ─────────────────────────────────────────────────────────────────────────────
   Orchestrates the full lifecycle:
 
   Step 1 — Load .env (API key / secret), instantiate testnet REST client.
-            Obtain a listenKey from the testnet REST endpoint for the User
-            Data Stream: rest_client.new_listen_key()["listenKey"].
+            NOTE: No listenKey is requested.  Balance tracking uses the
+            session.logon + userDataStream.subscribe flow on the OrderExecutor
+            WS API connection instead.
   Step 2 — Fetch & consolidate account balance:
               • Sell every non-USDT / non-BTC asset that has a live USDT pair
                 (single pass, each symbol attempted once).
               • Re-fetch balances if any sale succeeded.
               • Guard: raise if both USDT and BTC balances are zero.
-  Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (15 min).
-              • 15 min → ~180 low-latency iterations, ~3 historical analyses.
+  Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (20 min).
+              • 20 min → ~1200 low-latency iterations, ~20 historical analyses.
   Step 4 — Seed local_book from REST snapshot (depth=100).
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
   Step 5 — Instantiate OrderBookState, MessageHandler, OrderExecutor, AnalysisEngine.
             OrderExecutor creates its own SpotWebsocketAPIClient internally
-            (wss://testnet.binance.vision/ws-api/v3) so self.handle_order_response
-            can be passed directly as the on_message callback.
-  Step 6 — Open two SpotWebsocketStreamClient instances:
-              • ws_client (production) — diff_book_depth(SYMBOL, speed=WS_SPEED)
-                callback: handle_depth_message
-              • ws_user_client (testnet: wss://testnet.binance.vision) —
-                user_data(listen_key=listen_key)
-                callback: handle_balance_message
+            (wss://testnet.binance.vision/ws-api/v3) with:
+              on_message = self.handle_order_response
+              on_open    = self._on_ws_open
+            On socket open: _on_ws_open sends session.logon (HMAC-signed).
+            On logon success: sends userDataStream.subscribe.
+            On subscribe success: outboundAccountPosition push events arrive
+            on the same connection → _handle_balance_update keeps
+            state.balance_status current.
+  Step 6 — Open one SpotWebsocketStreamClient (ws_client, production endpoint)
+            and subscribe: diff_book_depth(SYMBOL, speed=WS_SPEED).
+            Callback: handle_depth_message.
             Sleep 1 s so the first diff-depth messages populate
             local_book["bids"] before the low-latency thread wakes up.
   Step 7 — Start threads AFTER WebSocket is open and warmed up:
               • start low_latency_thread  (daemon=True, name="low-latency-analysis")
               • start hist_thread         (daemon=True, name="hist-analysis")
-              • start keepalive_thread    (daemon=True, name="listenkey-keepalive")
-                  — calls rest_client.renew_listen_key() every 1800 s (30 min)
-                  — exits when stop_event is set (stop_event.wait(1800) → True)
   Step 8 — Main thread blocks for session_seconds (interruptible by Ctrl-C).
   Step 9 — Shutdown:
               • stop_event.set()
               • ws_client.stop()
-              • ws_user_client.stop()
-              • executor.stop()   — closes the WebSocket API order connection
+              • executor.stop()  — closes WS API connection (orders + user data)
               • low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
               • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
-              • keepalive_thread.join(timeout=5)
 
 ─────────────────────────────────────────────────────────────────────────────
 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
 ─────────────────────────────────────────────────────────────────────────────
-  Places LIMIT GTC orders via the Binance WebSocket API, avoiding the
-  per-request HTTP overhead of the REST API.  Owns its own
-  SpotWebsocketAPIClient connection (created in __init__).
+  Places LIMIT GTC orders AND maintains real-time balance updates via a
+  single Binance WebSocket API connection, avoiding the per-request HTTP
+  overhead of the REST API and eliminating the need for a listenKey.
 
-  ▸ __init__(state, stream_url, api_key, api_secret)
-      • Creates SpotWebsocketAPIClient internally with
-        on_message=self.handle_order_response.
-      • No circular dependency — self already exists at construction time.
+  ▸ __init__(state, stream_url, api_key, api_secret, rest_client=None)
+      • Creates SpotWebsocketAPIClient internally with:
+          on_message = self.handle_order_response
+          on_open    = self._on_ws_open
+      • If the WS handshake fails, degrades to REST-only mode silently.
+      • Tracks _logon_id and _subscribe_id for response routing.
+
+  ▸ _on_ws_open(_ws)  [on_open callback]
+      • Fires when socket connects → calls _send_session_logon().
+
+  ▸ _send_session_logon()
+      • Builds a signed session.logon frame using websocket_api_signature
+        (HMAC-SHA256 on empty params + timestamp + apiKey).
+      • Stores id in _logon_id for response matching.
+
+  ▸ _send_user_data_subscribe()
+      • Dispatches userDataStream.subscribe after successful logon.
+      • Stores id in _subscribe_id for response matching.
+
+  ▸ _handle_balance_update(data)
+      • Called when a push event with "e" == "outboundAccountPosition"
+        arrives (no "id" field — not a request/response pair).
+      • Under thread_balance_lock, updates balance_status for tracked
+        assets (CRYPTOCCY, CCY) using the "f" (free) field.
+
+  ▸ handle_order_response(_, message)  [single on_message callback]
+      Routes ALL incoming WS frames:
+        • No "id"             → push event → _handle_balance_update
+                                (or log debug for other event types)
+        • id == _logon_id     → session.logon response → on success,
+                                call _send_user_data_subscribe()
+        • id == _subscribe_id → userDataStream.subscribe response →
+                                set _user_data_active = True
+        • any other id        → order placement response:
+                                error → log; success → store in last_order
+                                and append to placed_orders.
 
   ▸ execute(strategy, opportunity) → None  [fire-and-forget]
       1) STRATEGY VALIDATION — rejects anything other than "BUY" or "SELL".
@@ -269,16 +312,15 @@ FILES
       5) BALANCE GUARD —
            BUY:  quantity × micro_price > usdt → skip with warning.
            SELL: quantity > btc                → skip with warning.
-      6) ORDER SUBMISSION — ws_api_client.new_order(
-           symbol=SYMBOL, side=strategy, type="LIMIT", timeInForce="GTC",
-           quantity (6 dp), price (2 dp), recvWindow=RECV_WINDOW).
-
-  ▸ handle_order_response(_, message)  [async callback]
-      • Parses JSON response from Binance WS API.
-      • On error: logs code + message.
-      • On success: stores result in self.last_order, logs side/symbol/orderId/status.
+      6) ORDER SUBMISSION —
+           WS path (preferred): ws_api_client.new_order(...)
+           REST path (fallback): rest_client.new_order(...)
 
   ▸ stop()
-      • Delegates to ws_api_client.stop() for clean shutdown.
-"""
+      • Delegates to ws_api_client.stop(); server auto-unsubscribes
+        userDataStream on disconnect.
 
+  ▸ order_status_report()
+      • Queries final status of all placed_orders via REST.
+      • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
+"""

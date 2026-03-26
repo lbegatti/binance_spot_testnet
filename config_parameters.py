@@ -14,21 +14,21 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 # Order book state
 # ---------------------------------------------------------------------------
-HISTORY_MAXLEN = 6000  # max snapshots in history_order_book
-# at 100 ms update intervals this covers ~10 minutes
+HISTORY_MAXLEN = 3000  # max snapshots in history_order_book
+# at 100 ms update intervals this covers ~5 minutes
 N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
-HFT_INTERVAL = 5  # seconds between HFT evaluations
-HIST_INTERVAL = 300  # seconds between historical analyses (5 min)
+HFT_INTERVAL = 1  # seconds between HFT evaluations
+HIST_INTERVAL = 60  # seconds between historical analyses (1 min)
 MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis runs
 
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 15  # default session length
-# at 15 min: ~180 HFT iterations, ~3 historical runs
+DEFAULT_SESSION_MINUTES = 20  # default session length
+# at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 
@@ -38,3 +38,11 @@ HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutd
 RECV_WINDOW = 5000  # ms — Binance REST request validity window
 SNAPSHOT_DEPTH = 100  # number of order book levels in the seed snapshot
 WS_SPEED = 100  # ms — WebSocket diff-depth update interval
+
+# ---------------------------------------------------------------------------
+# Quote calculation throttle
+# ---------------------------------------------------------------------------
+# Number of ticks between calculate_best_quote() calls.
+# At WS_SPEED=100 ms, 10 ticks ≈ 1 second — enough to keep the console
+# readable without missing meaningful spread changes.
+QUOTE_EVERY_N_TICKS = 10
