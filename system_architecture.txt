@@ -1,13 +1,13 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-26)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-28)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
 
 FILES
 ─────
-  config_parameters.py                — All tunable constants (symbol, intervals, depths, timeouts …)
-  websocket_main.py                   — Session driver: startup, threads, shutdown
+  config_parameters.py                — All tunable constants (symbol, intervals, depths, timeouts, HMM params …)
+  websocket_main.py                   — Session driver: startup, pre-session regime detection, threads, shutdown
   restapi_main.py                     — REST-only static snapshot (reference / dev tool)
 
   core/
@@ -15,10 +15,11 @@ FILES
     message_handler.py                — MessageHandler: one active callback (depth) + one superseded (balance)
 
   strategy/
-    analysis.py                       — AnalysisEngine: low-latency loop + historical loop
+    analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter)
+    regime_director.py                — RegimeDirector: GaussianHMM regime detection on 1-min klines
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
     metrics.py                        — Order book depth metrics
-    indicators.py                     — Technical indicators (trend confirmation, etc.)
+    indicators.py                     — Technical indicators (trend confirmation, VWAP helper, etc.)
     scores.py                         — Normalised opportunity scores
     quotes.py                         — find_best_quote(): best bid/ask selection helpers
 
@@ -47,6 +48,13 @@ FILES
     RECV_WINDOW          = 5000    # Binance REST validity window (ms)
     SNAPSHOT_DEPTH       = 100     # levels in the seed REST snapshot
     WS_SPEED             = 100     # WebSocket diff-depth update interval (ms)
+    # HMM regime detection
+    HMM_FEATURE_COLS     = ["return","volatility","obi_proxy","trade_density"]
+    HMM_N_ITERATIONS     = 1000   # max EM iterations per model fit
+    HMM_MAX_REGIMES      = 5      # upper bound on hidden states (BIC search: 2…5)
+    HMM_RANDOM_STATE     = 46     # seed for reproducible HMM initialisation
+    HMM_INTERVAL         = KLINE_INTERVAL_1MINUTE  # kline granularity (1 m)
+    HMM_LOOKBACK         = "4 hours ago UTC"        # ~240 rows at 1 m
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -125,12 +133,17 @@ FILES
   Receives the same OrderBookState instance as MessageHandler.
   Checks stop_event on every iteration; exits gracefully when it is set.
 
-  Owns three private attributes for cross-thread VWAP sharing:
-    _vwap_lock   : Lock          — serialises _bid_vwap and _ask_vwap
-    _bid_vwap    : float | None  — latest bid VWAP from historical_analysis
-    _ask_vwap    : float | None  — latest ask VWAP from historical_analysis
-  Both start as None (no historical data yet).  The low-latency thread
-  treats None as "no VWAP filter" and executes orders without gating.
+  Owns five private attributes for cross-thread sharing:
+    _vwap_lock      : Lock          — serialises _bid_vwap and _ask_vwap
+    _bid_vwap       : float | None  — latest bid VWAP from historical_analysis
+    _ask_vwap       : float | None  — latest ask VWAP from historical_analysis
+    _regime_lock    : Lock          — serialises regime_director.regime_label
+    regime_director : RegimeDirector — injected pre-fitted HMM detector;
+                                       re-fitted every HIST_INTERVAL seconds.
+  _bid_vwap and _ask_vwap start as None (no historical data yet).
+  regime_director.regime_label is set BEFORE threads start (initial fit in
+  websocket_main.py step 4b) so the very first low_latency iteration has a
+  valid regime to read.
 
   ▸ low_latency_analysis()  [Low-latency thread — every HFT_INTERVAL seconds = 1 s]
       • Reads balance_status under thread_balance_lock at the top of every
@@ -159,6 +172,13 @@ FILES
         are None, so the filter is transparent and orders execute as before.
         NOTE: This logic may be inverted in the future to implement a
         buy-the-dip / mean-reversion strategy instead.
+      • REGIME FILTER (HMM gate) — reads regime_director.regime_label under
+        _regime_lock:
+          BUY:  suppressed if regime == "trending_down" or "high_volatility".
+          SELL: suppressed if regime == "trending_up"   or "high_volatility".
+          None (before first historical run) → transparent, all orders allowed.
+        Regime is applied BEFORE VWAP check; if regime blocks the trade, VWAP
+        is not evaluated.
       • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
         The executor validates strategy, checks balances, computes quantity
         (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
@@ -169,14 +189,21 @@ FILES
       • Acquires thread_lock → copies history_order_book to a plain list →
         releases lock.  All computation happens outside the critical section.
       • Skips iteration if fewer than MIN_SNAPSHOTS (100) have accumulated.
-      • Converts the snapshot list to numpy arrays and computes:
+      • VWAP computation — converts snapshot list to numpy arrays and computes:
           bid_vwap = volume_weighted_average_price(bids, vols_bids)
           ask_vwap = volume_weighted_average_price(asks, vols_asks)
         using the helper from indicators.py.
-      • Publishes bid_vwap and ask_vwap under _vwap_lock so that the
-        low_latency thread can read them on the next iteration.
-      • TODO: implement further historical analysis logic (spread
-        distributions, regime detection, etc.).
+        Publishes bid_vwap and ask_vwap under _vwap_lock.
+      • HMM REGIME RE-FIT (outside _regime_lock — slow network + CPU work):
+          regime_director.get_klines_data()    — fetches last 4 h of 1-min klines,
+                                                 computes return, volatility,
+                                                 obi_proxy, trade_density.
+          regime_director.select_hmm_model()   — fits GaussianHMM for n=2..5,
+                                                 selects best BIC model, predicts
+                                                 state sequence, sets current_regime.
+        (inside _regime_lock — fast label assignment only):
+          regime_director.assign_regime_labels() — maps state int → label string,
+                                                    writes regime_label.
 
   ▸ Deque fill-up math (at WS_SPEED = 100 ms → ~10 entries/sec):
 
@@ -215,6 +242,56 @@ FILES
                 stop_event set → both threads exit
 
 ─────────────────────────────────────────────────────────────────────────────
+4b. REGIME DETECTION  (strategy/regime_director.py — RegimeDirector)
+─────────────────────────────────────────────────────────────────────────────
+  Trains a Gaussian Hidden Markov Model on recent Binance 1-minute klines
+  to classify the current market into a hidden regime.  The result is exposed
+  as a plain string label consumed by AnalysisEngine.low_latency_analysis.
+
+  FEATURES (computed from OHLCV kline data):
+    return        = close.pct_change()
+    volatility    = (high - low) / close
+    obi_proxy     = (taker_buy_base_vol / volume) × 2 - 1   ∈ [-1, +1]
+                    approximates live OBI from kline taker flow
+    trade_density = num_trades / volume
+                    high → many small trades (retail / HFT fragmentation)
+                    low  → few large trades  (institutional blocks)
+
+  MODEL SELECTION (BIC):
+    GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (5) states.
+    Best model selected by lowest BIC = -2 ln L̂ + k ln N.
+    current_regime set to state index of the last candle.
+
+  LABEL ASSIGNMENT (assign_regime_labels — all thresholds data-driven):
+    Cross-state mean and std computed per feature from model.means_.
+    Boolean flags per state (0.5 × std threshold unless noted):
+      high_return   : return  > mean_r   + 0.5 × std_r
+      low_return    : return  < mean_r   - 0.5 × std_r
+      buy_pressure  : obi     > mean_obi + 0.5 × std_obi
+      sell_pressure : obi     < mean_obi - 0.5 × std_obi
+      high_vol      : vol     > mean_vol + 1.0 × std_vol   (1 std)
+      high_td       : td      > mean_td  + 0.5 × std_td
+      low_td        : td      < mean_td  - 0.5 × std_td
+
+    Label priority (first match wins):
+      high_return + buy_pressure + low_td  → "trending_up"
+      low_return + sell_pressure + low_td  → "trending_down"
+      high_vol + high_td                   → "high_volatility"
+      high_td + not high_vol               → "active_neutral"
+      (default)                            → "neutral"
+
+  REGIME GATE in low_latency_analysis:
+    BUY  suppressed if regime ∈ {"trending_down", "high_volatility"}
+    SELL suppressed if regime ∈ {"trending_up",   "high_volatility"}
+    None (before first historical run) → transparent
+
+  LIFECYCLE:
+    Instantiated in websocket_main.py (step 4b) before threads start.
+    get_klines_data() + select_hmm_model() run outside _regime_lock (slow).
+    assign_regime_labels() runs inside _regime_lock (fast label write only).
+    Repeated every HIST_INTERVAL (60 s) in historical_analysis().
+
+─────────────────────────────────────────────────────────────────────────────
 5. SESSION DRIVER  (websocket_main.py)
 ─────────────────────────────────────────────────────────────────────────────
   Orchestrates the full lifecycle:
@@ -233,7 +310,16 @@ FILES
   Step 4 — Seed local_book from REST snapshot (depth=100).
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
-  Step 5 — Instantiate OrderBookState, MessageHandler, OrderExecutor, AnalysisEngine.
+  Step 4b— Pre-session HMM regime detection (RegimeDirector):
+              • regime_director.get_klines_data()     — downloads ~240 rows of
+                1-min klines (last 4 h, public endpoint, no auth).
+              • regime_director.select_hmm_model()    — fits GaussianHMM for
+                n=2..5, selects best BIC model, sets current_regime.
+              • regime_director.assign_regime_labels()— assigns regime_label.
+            regime_label is populated BEFORE threads start so the first
+            low_latency_analysis iteration never reads None.
+  Step 5 — Instantiate OrderBookState, MessageHandler, OrderExecutor,
+            AnalysisEngine (with regime_director injected).
             OrderExecutor creates its own SpotWebsocketAPIClient internally
             (wss://testnet.binance.vision/ws-api/v3) with:
               on_message = self.handle_order_response

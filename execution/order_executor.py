@@ -475,6 +475,7 @@ class OrderExecutor:
             "\n========== END-OF-SESSION ORDER REPORT (%d order(s)) ==========",
             len(self.placed_orders),
         )
+        # TODO maybe print out the first and last 100 orders?
         filled = partial = pending = other = 0
         for record in self.placed_orders:
             order_id = record.get("orderId")

@@ -1,3 +1,5 @@
+from binance.client import Client
+
 # =============================================================================
 # config_parameters.py — central configuration file
 # All tunable constants live here. Edit this file to adjust behaviour across
@@ -11,6 +13,15 @@ SYMBOL = "BTCUSDT"  # trading pair
 CCY = "USDT"  # quote currency
 CRYPTOCCY = "BTC"  # base / cryptocurrency
 
+# ---------------------------------------------------------------------------
+# HMM Parameters and Features
+# ---------------------------------------------------------------------------
+HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
+HMM_N_ITERATIONS = 1000
+HMM_MAX_REGIMES = 5
+HMM_RANDOM_STATE = 46
+HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
+HMM_LOOKBACK = "4 hours ago UTC"
 # ---------------------------------------------------------------------------
 # Order book state
 # ---------------------------------------------------------------------------

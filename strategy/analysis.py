@@ -13,26 +13,44 @@ from config_parameters import (
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import volume_weighted_average_price
+from strategy.regime_director import RegimeDirector
 
 
 class AnalysisEngine:
     """
     Strategy engine that consumes shared ``OrderBookState`` to run both
-    high-frequency and historical analyses in separate background threads.
+    low-latency and historical analyses in separate background threads.
 
     The class is intentionally decoupled from ``MessageHandler``: the two
     communicate exclusively through the injected ``OrderBookState`` instance,
-    which guarantees that both threads always operate on the same data and
-    the same lock.
+    which guarantees that both threads always operate on the same data under
+    the same locks.
 
     Both loops respect a shared ``threading.Event`` (``stop_event``) so that
     ``websocket_main.py`` can terminate the session cleanly after the
-    user-defined duration has elapsed.
+    configured duration has elapsed.
 
     Attributes:
         state (OrderBookState): Shared order book state, injected at construction.
         stop_event (threading.Event): Shared event; when set, both loops exit
             at their next scheduled wake-up.
+        order_executor (OrderExecutor): Injected order placement handler.
+        regime_director (RegimeDirector): Pre-fitted HMM regime detector,
+            injected at construction (initial fit done in ``websocket_main.py``
+            before threads start).  Re-fitted every ``HIST_INTERVAL`` seconds
+            inside ``historical_analysis()`` to keep the current market regime
+            up to date.  Reads are protected by ``_regime_lock``.
+        _vwap_lock (threading.Lock): Serialises access to ``_bid_vwap`` and
+            ``_ask_vwap`` between ``historical_analysis`` (writer) and
+            ``low_latency_analysis`` (reader).
+        _regime_lock (threading.Lock): Serialises access to
+            ``regime_director.regime_label`` between ``historical_analysis``
+            (writer via ``assign_regime_labels()``) and ``low_latency_analysis``
+            (reader).
+        _bid_vwap (float | None): Latest bid VWAP published by
+            ``historical_analysis``; ``None`` until the first iteration.
+        _ask_vwap (float | None): Latest ask VWAP published by
+            ``historical_analysis``; ``None`` until the first iteration.
     """
 
     def __init__(
@@ -40,21 +58,32 @@ class AnalysisEngine:
         state: OrderBookState,
         stop_event: threading.Event,
         executor: OrderExecutor,
+        regime_director: RegimeDirector,
     ):
         """
         Args:
             state (OrderBookState): The shared order book state instance that
-                provides ``local_book``, ``history_order_book``, and
-                ``thread_lock``.
+                provides ``local_book``, ``history_order_book``, ``thread_lock``,
+                ``balance_status``, and ``thread_balance_lock``.
             stop_event (threading.Event): Set by the session driver
-                (``websocket_main.py``) when the session duration has
-                elapsed.  Both analysis loops check this event on every
-                iteration and exit gracefully when it is set.
+                (``websocket_main.py``) when the session duration has elapsed.
+                Both analysis loops check this event on every iteration and
+                exit gracefully when it is set.
+            executor (OrderExecutor): Injected order execution handler.
+                Called by ``low_latency_analysis`` when a trade opportunity
+                passes all filters.
+            regime_director (RegimeDirector): Pre-fitted HMM regime detector.
+                Must already have ``regime_label`` populated (i.e. called via
+                ``websocket_main.py`` before threads start) so the very first
+                ``low_latency_analysis`` iteration has a valid regime to read.
+                Re-fitted on every ``historical_analysis`` iteration.
         """
+        self.regime_director = regime_director
         self.state = state
         self.stop_event = stop_event
         self.order_executor = executor
         self._vwap_lock = threading.Lock()
+        self._regime_lock = threading.Lock()
         self._bid_vwap: float | None = None
         self._ask_vwap: float | None = None
 
@@ -191,17 +220,42 @@ class AnalysisEngine:
 
     def low_latency_analysis(self):
         """
-        Periodically inspect the live order book and apply a high-frequency
-        trading strategy.
+        Periodically inspect the live order book and apply the low-latency
+        trading strategy, gated by both a VWAP momentum filter and an HMM
+        regime filter.
 
         Runs every ``HFT_INTERVAL`` seconds (default 1 s) until ``stop_event``
-        is set.  On each wake-up it
-        acquires ``state.thread_lock``, takes a local copy of the current bids
-        and asks, then releases the lock before executing any heavier strategy
-        logic — keeping the critical section as short as possible.
+        is set.  On each wake-up it:
 
-        Logs a message and skips the iteration if no bids are present yet
-        (e.g. the WebSocket snapshot has not arrived yet).
+        1. **Balance guard** — reads ``state.balance_status`` under
+           ``thread_balance_lock``.  Skips the iteration if both
+           ``usdt_balance < 10.0`` and ``btc_balance < 0.0001``.
+        2. **Order book copy** — acquires ``state.thread_lock``, copies bids
+           and asks, releases the lock immediately.  Skips if bids are empty.
+        3. **Level construction** — builds the top ``N_LEVELS`` (50) bid/ask
+           pairs; computes ``total_depth``, ``mid_price``, ``micro_price``,
+           ``OBI``, ``bq``, ``aq`` per level.
+        4. **Candidate selection** — filters levels by depth adequacy (≥ 50 %
+           of level-0 depth) and micro-mid direction (``micro_price > mid_price``
+           → BUY candidate; ``micro_price < mid_price`` → SELL candidate).
+        5. **Scoring** — ranks candidates by
+           ``0.70 × norm_depth + 0.30 × norm_delta``; picks the best for each
+           side.  Returns an 8-element tuple
+           ``(level_idx, score|None, delta, depth, obi, micro_price, bq, aq)``.
+        6. **VWAP filter** (momentum confirmation) — reads ``_bid_vwap`` /
+           ``_ask_vwap`` under ``_vwap_lock``:
+           - BUY: skip if ``ask_vwap`` is set **and** ``micro_price ≤ ask_vwap``.
+           - SELL: skip if ``bid_vwap`` is set **and** ``micro_price ≥ bid_vwap``.
+           Both are ``None`` for the first ~1 min; filter is transparent until
+           ``historical_analysis`` publishes the first VWAP.
+        7. **Regime filter** (HMM gate) — reads
+           ``regime_director.regime_label`` under ``_regime_lock``:
+           - BUY:  skip if regime is ``"trending_down"`` or ``"high_volatility"``.
+           - SELL: skip if regime is ``"trending_up"``  or ``"high_volatility"``.
+           ``None`` label (before first ``historical_analysis`` run) is treated
+           as transparent — all orders are allowed through.
+        8. **Order execution** — delegates to
+           ``OrderExecutor.execute("BUY"|"SELL", opportunity)``.
 
         Exits cleanly when ``stop_event`` is set, logging how many iterations
         were completed.
@@ -240,7 +294,11 @@ class AnalysisEngine:
                 bid_vwap = self._bid_vwap
                 ask_vwap = self._ask_vwap
 
-            # TODO: review momentum-check logic below.
+            with self._regime_lock:
+                current_regime = (
+                    self.regime_director.regime_label
+                )  # reads the label assigned in the historical_analysis thread.
+
             # After the first historical_analysis iteration (~1 min), _bid_vwap
             # and _ask_vwap are populated.  They act as a confirmation filter:
             #   BUY  → execute only if micro_price > ask_vwap (upward momentum:
@@ -251,7 +309,16 @@ class AnalysisEngine:
             # and orders execute based on the score alone.
             if best_buy:
                 micro_price = best_buy[5]  # index 5 of the tuple
-                if ask_vwap is not None and micro_price <= ask_vwap:
+                if (
+                    current_regime == "trending_down"
+                    or current_regime == "high_volatility"
+                ):
+                    logging.info(
+                        "HFT #%d [buy] — skipped: regime is '%s'",
+                        iteration,
+                        current_regime,
+                    )
+                elif ask_vwap is not None and micro_price <= ask_vwap:
                     logging.info(
                         "HFT #%d [buy] — skipped: micro_price %.2f ≤ ask_vwap %.2f",
                         iteration,
@@ -262,7 +329,16 @@ class AnalysisEngine:
                     self.order_executor.execute("BUY", best_buy)
             if best_sell:
                 micro_price = best_sell[5]
-                if bid_vwap is not None and micro_price >= bid_vwap:
+                if (
+                    current_regime == "trending_up"
+                    or current_regime == "high_volatility"
+                ):
+                    logging.info(
+                        "HFT #%d [sell] — skipped: regime is '%s'",
+                        iteration,
+                        current_regime,
+                    )
+                elif bid_vwap is not None and micro_price >= bid_vwap:
                     logging.info(
                         "HFT #%d [sell] — skipped: micro_price %.2f ≥ bid_vwap %.2f",
                         iteration,
@@ -278,17 +354,48 @@ class AnalysisEngine:
 
     def historical_analysis(self):
         """
-        Periodically analyze the rolling window of order book snapshots stored
-        in ``state.history_order_book`` to compute VWAPs for momentum filtering.
+        Periodically analyse the rolling order book snapshot window to compute
+        VWAPs and refresh the HMM market-regime label.
 
         Runs every ``HIST_INTERVAL`` seconds (default 60 s / 1 min) until
-        ``stop_event`` is set.  If fewer than ``MIN_SNAPSHOTS`` (100) have
-        accumulated the iteration is skipped and a log message is emitted so
-        the operator knows the engine is still warming up.
+        ``stop_event`` is set.  If fewer than ``MIN_SNAPSHOTS`` (100) snapshots
+        have accumulated the iteration is skipped and a warm-up log message is
+        emitted.
 
-        Computes ``bid_vwap`` and ``ask_vwap`` from the rolling deque and
-        publishes them under ``_vwap_lock`` so that ``low_latency_analysis``
-        can use them as a momentum-confirmation gate.
+        **On each iteration:**
+
+        1. **VWAP computation** — copies ``state.history_order_book`` under
+           ``thread_lock``, converts to numpy arrays, and computes:
+
+           .. code-block:: text
+
+               bid_vwap = Σ(best_bid_i × volume_best_bid_i) / Σ(volume_best_bid_i)
+               ask_vwap = Σ(best_ask_i × volume_best_ask_i) / Σ(volume_best_ask_i)
+
+           Both VWAPs are published under ``_vwap_lock`` so that
+           ``low_latency_analysis`` can read them safely on the next iteration.
+
+        2. **HMM regime re-fit** — calls, in order, outside any lock:
+              - ``regime_director.get_klines_data()`` — fetches the latest
+                ``HMM_LOOKBACK`` (4 h) of ``HMM_INTERVAL`` (1 m) klines from
+                Binance (public endpoint, no auth) and computes the four HMM
+                features: ``return``, ``volatility``, ``obi_proxy``,
+                ``trade_density``.
+              - ``regime_director.select_hmm_model()`` — fits
+                ``GaussianHMM`` models for ``n = 2 … HMM_MAX_REGIMES``,
+                selects the best by BIC, predicts the state sequence, and
+                sets ``current_regime`` to the state of the **last candle**.
+           Then, inside ``_regime_lock``:
+              - ``regime_director.assign_regime_labels()`` — maps each HMM
+                state integer to a human-readable label
+                (``"trending_up"``, ``"trending_down"``, ``"high_volatility"``,
+                ``"active_neutral"``, ``"neutral"``) using cross-state mean /
+                std thresholds.  Writes ``regime_director.regime_label``.
+
+           The slow network + CPU work (kline download + model fitting) runs
+           **outside** ``_regime_lock``; only the fast label assignment is
+           performed inside the lock to minimise contention with
+           ``low_latency_analysis``.
 
         Exits cleanly when ``stop_event`` is set, logging how many iterations
         were completed.
@@ -332,13 +439,23 @@ class AnalysisEngine:
             with self._vwap_lock:
                 self._bid_vwap = bid_vwap
                 self._ask_vwap = ask_vwap
-
             logging.info(
                 "Historical Analysis #%d — %d snapshots | bid_vwap=%.2f | ask_vwap=%.2f",
                 iteration,
                 snap_count,
                 bid_vwap,
                 ask_vwap,
+            )
+
+            self.regime_director.get_klines_data()  # fetch latest 3h of 1m candles
+            self.regime_director.select_hmm_model()  # re-fit
+
+            with self._regime_lock:
+                self.regime_director.assign_regime_labels()  # write regime label
+            logging.info(
+                "Historical #%d — regime updated → '%s'",
+                iteration,
+                self.regime_director.regime_label,
             )
 
         logging.info(

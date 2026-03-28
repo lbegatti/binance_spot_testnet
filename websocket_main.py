@@ -9,6 +9,7 @@ from strategy.analysis import AnalysisEngine
 from core.message_handler import MessageHandler
 from core.order_book_state import OrderBookState
 from execution.order_executor import OrderExecutor
+from strategy.regime_director import RegimeDirector
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     HFT_INTERVAL,
@@ -171,6 +172,15 @@ state.local_book = {
     "asks": {price: qty for price, qty in snapshot["asks"]},
     "lastUpdateId": snapshot["lastUpdateId"],
 }
+# ---------------------------------------------------------------------------
+# 4b. Pre-session regime detection (initial HMM fit on recent klines)
+# ---------------------------------------------------------------------------
+logging.info("Running initial regime detection — fetching klines and fitting HMM...")
+regime_director = RegimeDirector()
+regime_director.get_klines_data()
+regime_director.select_hmm_model()
+regime_director.assign_regime_labels()
+logging.info("Initial market regime: '%s'", regime_director.regime_label)
 
 # stop_event is set by this file when the session duration elapses; both
 # analysis loops check it on every iteration and exit if stop_event is reached.
@@ -201,7 +211,12 @@ logging.info(
     "pending" if executor.ws_api_client is not None else "REST-only",
 )
 
-engine = AnalysisEngine(state=state, stop_event=stop_event, executor=executor)
+engine = AnalysisEngine(
+    state=state,
+    stop_event=stop_event,
+    executor=executor,
+    regime_director=regime_director,
+)
 
 low_latency_thread = threading.Thread(
     target=engine.low_latency_analysis, daemon=True, name="low-latency-analysis"
