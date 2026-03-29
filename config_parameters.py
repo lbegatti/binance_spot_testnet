@@ -18,10 +18,22 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
 HMM_N_ITERATIONS = 1000
-HMM_MAX_REGIMES = 5
+HMM_MAX_REGIMES = 4
 HMM_RANDOM_STATE = 46
 HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
-HMM_LOOKBACK = "4 hours ago UTC"
+HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
+# while keeping enough data for stable EM convergence
+# Regularisation floor added to the diagonal of every state's covariance
+# matrix.  Prevents "covars must be symmetric, positive-definite" errors
+# when a hidden state has few observations relative to the feature count.
+# 1e-3 is a safe default for normalised financial features (return,
+# volatility, obi_proxy, trade_density all sit in the [-1, +1] range).
+HMM_MIN_COVAR = 1e-3
+# Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
+# inside historical_analysis().  Between re-fits, only a cheap Viterbi
+# prediction (predict_current_regime()) is run on the latest kline features.
+# Must be a multiple of HIST_INTERVAL (60 s).  Default: 300 s = 5 minutes.
+HMM_REFIT_INTERVAL = 300
 # ---------------------------------------------------------------------------
 # Order book state
 # ---------------------------------------------------------------------------
@@ -57,3 +69,11 @@ WS_SPEED = 100  # ms — WebSocket diff-depth update interval
 # At WS_SPEED=100 ms, 10 ticks ≈ 1 second — enough to keep the console
 # readable without missing meaningful spread changes.
 QUOTE_EVERY_N_TICKS = 10
+
+# ---------------------------------------------------------------------------
+# End-of-session order report
+# ---------------------------------------------------------------------------
+# Maximum number of orders shown at the head *and* tail of the report.
+# If the session produces more than 2 * ORDER_REPORT_LIMIT orders, the middle
+# block is collapsed to a single summary line to avoid flooding the console.
+ORDER_REPORT_LIMIT = 100

@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-28)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-30)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -51,10 +51,13 @@ FILES
     # HMM regime detection
     HMM_FEATURE_COLS     = ["return","volatility","obi_proxy","trade_density"]
     HMM_N_ITERATIONS     = 1000   # max EM iterations per model fit
-    HMM_MAX_REGIMES      = 5      # upper bound on hidden states (BIC search: 2…5)
+    HMM_MAX_REGIMES      = 4      # upper bound on hidden states (BIC search: 2…4)
     HMM_RANDOM_STATE     = 46     # seed for reproducible HMM initialisation
     HMM_INTERVAL         = KLINE_INTERVAL_1MINUTE  # kline granularity (1 m)
-    HMM_LOOKBACK         = "4 hours ago UTC"        # ~240 rows at 1 m
+    HMM_LOOKBACK         = "2 hours ago UTC"        # ~120 rows at 1 m
+    HMM_MIN_COVAR        = 1e-3   # regularisation floor for covariance matrices
+    HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
+    ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -139,7 +142,10 @@ FILES
     _ask_vwap       : float | None  — latest ask VWAP from historical_analysis
     _regime_lock    : Lock          — serialises regime_director.regime_label
     regime_director : RegimeDirector — injected pre-fitted HMM detector;
-                                       re-fitted every HIST_INTERVAL seconds.
+                                       updated every HIST_INTERVAL seconds via
+                                       a two-speed scheme: cheap Viterbi prediction
+                                       on most iterations, full re-fit every
+                                       HMM_REFIT_INTERVAL (300 s).
   _bid_vwap and _ask_vwap start as None (no historical data yet).
   regime_director.regime_label is set BEFORE threads start (initial fit in
   websocket_main.py step 4b) so the very first low_latency iteration has a
@@ -194,13 +200,19 @@ FILES
           ask_vwap = volume_weighted_average_price(asks, vols_asks)
         using the helper from indicators.py.
         Publishes bid_vwap and ask_vwap under _vwap_lock.
-      • HMM REGIME RE-FIT (outside _regime_lock — slow network + CPU work):
-          regime_director.get_klines_data()    — fetches last 4 h of 1-min klines,
-                                                 computes return, volatility,
-                                                 obi_proxy, trade_density.
-          regime_director.select_hmm_model()   — fits GaussianHMM for n=2..5,
-                                                 selects best BIC model, predicts
-                                                 state sequence, sets current_regime.
+      • HMM REGIME UPDATE (two-speed — outside _regime_lock for the slow work):
+          Every iteration (60 s):
+            regime_director.get_klines_data()            — fetches last 2 h of 1-min klines,
+                                                           computes return, volatility,
+                                                           obi_proxy, trade_density.
+          If iteration % refit_every == 0 (every 5 min / 300 s):
+            regime_director.select_hmm_model()           — fits GaussianHMM for n=2..4,
+                                                           selects best BIC model, predicts
+                                                           state sequence, sets current_regime.
+          Otherwise (cheap path):
+            regime_director.predict_current_regime()     — single Viterbi pass on the
+                                                           existing model, updates current_regime.
+                                                           ~1000× cheaper than select_hmm_model.
         (inside _regime_lock — fast label assignment only):
           regime_director.assign_regime_labels() — maps state int → label string,
                                                     writes regime_label.
@@ -258,38 +270,43 @@ FILES
                     low  → few large trades  (institutional blocks)
 
   MODEL SELECTION (BIC):
-    GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (5) states.
+    GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (4) states.
     Best model selected by lowest BIC = -2 ln L̂ + k ln N.
     current_regime set to state index of the last candle.
 
-  LABEL ASSIGNMENT (assign_regime_labels — all thresholds data-driven):
-    Cross-state mean and std computed per feature from model.means_.
-    Boolean flags per state (0.5 × std threshold unless noted):
-      high_return   : return  > mean_r   + 0.5 × std_r
-      low_return    : return  < mean_r   - 0.5 × std_r
-      buy_pressure  : obi     > mean_obi + 0.5 × std_obi
-      sell_pressure : obi     < mean_obi - 0.5 × std_obi
-      high_vol      : vol     > mean_vol + 1.0 × std_vol   (1 std)
-      high_td       : td      > mean_td  + 0.5 × std_td
-      low_td        : td      < mean_td  - 0.5 × std_td
+  LABEL ASSIGNMENT (assign_regime_labels — rank-based + threshold secondary):
+    Directional labels (guaranteed unique via rank):
+      direction_score = return.rank() + obi_proxy.rank()
+      best_state  (idxmax) → "trending_up"   — most bullish
+      worst_state (idxmin) → "trending_down"  — most bearish
 
-    Label priority (first match wins):
-      high_return + buy_pressure + low_td  → "trending_up"
-      low_return + sell_pressure + low_td  → "trending_down"
-      high_vol + high_td                   → "high_volatility"
-      high_td + not high_vol               → "active_neutral"
-      (default)                            → "neutral"
+    Secondary labels for remaining states:
+      high_vol : vol > mean_vol + 1.0 × std_vol        (large price swings)
+      high_td  : td  > mean_td  + 0.5 × std_td         (trade fragmentation)
+      high_vol OR high_td → "high_volatility"
+        Both independently indicate an unreliable market: large swings
+        (unpredictable fills) or fragmented activity (noisy, no directional
+        intent).
+      (default) → "neutral"
 
   REGIME GATE in low_latency_analysis:
     BUY  suppressed if regime ∈ {"trending_down", "high_volatility"}
     SELL suppressed if regime ∈ {"trending_up",   "high_volatility"}
     None (before first historical run) → transparent
 
-  LIFECYCLE:
+  LIFECYCLE (two-speed update):
     Instantiated in websocket_main.py (step 4b) before threads start.
-    get_klines_data() + select_hmm_model() run outside _regime_lock (slow).
-    assign_regime_labels() runs inside _regime_lock (fast label write only).
-    Repeated every HIST_INTERVAL (60 s) in historical_analysis().
+    Initial fit: get_klines_data() + select_hmm_model() + assign_regime_labels().
+
+    Every HIST_INTERVAL (60 s) in historical_analysis():
+      get_klines_data()           — refresh features (outside _regime_lock)
+      predict_current_regime()    — cheap Viterbi pass (outside _regime_lock)
+      assign_regime_labels()      — fast label write (inside _regime_lock)
+
+    Every HMM_REFIT_INTERVAL (300 s) — replaces predict with full refit:
+      get_klines_data()           — refresh features (outside _regime_lock)
+      select_hmm_model()          — full EM refit  (outside _regime_lock)
+      assign_regime_labels()      — fast label write (inside _regime_lock)
 
 ─────────────────────────────────────────────────────────────────────────────
 5. SESSION DRIVER  (websocket_main.py)
@@ -311,10 +328,10 @@ FILES
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
   Step 4b— Pre-session HMM regime detection (RegimeDirector):
-              • regime_director.get_klines_data()     — downloads ~240 rows of
-                1-min klines (last 4 h, public endpoint, no auth).
+              • regime_director.get_klines_data()     — downloads ~120 rows of
+                1-min klines (last 2 h, public endpoint, no auth).
               • regime_director.select_hmm_model()    — fits GaussianHMM for
-                n=2..5, selects best BIC model, sets current_regime.
+                n=2..4, selects best BIC model, sets current_regime.
               • regime_director.assign_regime_labels()— assigns regime_label.
             regime_label is populated BEFORE threads start so the first
             low_latency_analysis iteration never reads None.
@@ -395,9 +412,13 @@ FILES
            (level_idx, score|None, delta, total_depth, obi, micro_price, bq, aq)
       3) BALANCE READ — acquires thread_balance_lock, reads usdt and btc.
       4) QUANTITY — aq for BUY (ask-side liquidity), bq for SELL (bid-side).
-      5) BALANCE GUARD —
-           BUY:  quantity × micro_price > usdt → skip with warning.
-           SELL: quantity > btc                → skip with warning.
+      5) DYNAMIC QUANTITY CAP —
+           BUY:  quantity = min(aq, usdt / micro_price).
+           SELL: quantity = min(bq, btc).
+           If the capped quantity is > 0 but less than the requested amount,
+           a logging.info message is emitted and the order proceeds at reduced
+           size.  Only skipped (returns None) when quantity == 0 — i.e. the
+           balance is fully depleted for that direction.
       6) ORDER SUBMISSION —
            WS path (preferred): ws_api_client.new_order(...)
            REST path (fallback): rest_client.new_order(...)
@@ -407,6 +428,12 @@ FILES
         userDataStream on disconnect.
 
   ▸ order_status_report()
-      • Queries final status of all placed_orders via REST.
+      • Queries final status of placed_orders via REST.
+      • To avoid flooding the console during long sessions, only the first
+        and last ORDER_REPORT_LIMIT (100) orders are printed individually.
+        When total > 2 × ORDER_REPORT_LIMIT the middle block is collapsed
+        to a single summary line.
+      • Each order is queried and logged by _query_and_log_order() (private
+        class method).
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
 """

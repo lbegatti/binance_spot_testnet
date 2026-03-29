@@ -9,6 +9,7 @@ from config_parameters import (
     HMM_MAX_REGIMES,
     HMM_INTERVAL,
     HMM_LOOKBACK,
+    HMM_MIN_COVAR,
     SYMBOL,
 )
 import logging
@@ -36,20 +37,25 @@ class RegimeDirector:
     automatically via the **Bayesian Information Criterion (BIC)** — the model
     with the lowest BIC is retained.
 
-    State labels are assigned in ``assign_regime_labels()`` by comparing each
-    state's feature means against cross-state statistics (mean ± k × std),
-    so no domain-specific price constants are hard-coded.  Possible labels:
-    ``"trending_up"``, ``"trending_down"``, ``"high_volatility"``,
-    ``"active_neutral"``, ``"neutral"``.
+    State labels are assigned in ``assign_regime_labels()`` using a rank-based
+    directional assignment and volatility thresholds.  Possible labels:
+    ``"trending_up"``, ``"trending_down"``, ``"high_volatility"``, ``"neutral"``.
 
     **Intended usage**:
 
     1. Instantiate once in ``websocket_main.py`` before threads start.
     2. Call ``get_klines_data()`` → ``select_hmm_model()`` →
        ``assign_regime_labels()`` for the initial fit.
-    3. ``AnalysisEngine.historical_analysis()`` repeats steps 2–4 every
-       ``HIST_INTERVAL`` seconds so the label stays current throughout the
-       trading session.
+    3. ``AnalysisEngine.historical_analysis()`` then applies a **two-speed**
+       update every ``HIST_INTERVAL`` seconds:
+
+       * **Cheap path (every iteration):** ``get_klines_data()`` →
+         ``predict_current_regime()`` → ``assign_regime_labels()``.
+         Runs the Viterbi algorithm on the existing model — O(n × k).
+       * **Full re-fit (every ``HMM_REFIT_INTERVAL`` seconds, default 5 min):**
+         ``get_klines_data()`` → ``select_hmm_model()`` →
+         ``assign_regime_labels()``.  Replaces the model entirely.
+
     4. ``AnalysisEngine.low_latency_analysis()`` reads ``regime_label`` under
        ``_regime_lock`` and uses it to gate order execution.
 
@@ -87,7 +93,7 @@ class RegimeDirector:
             interval (str): Kline granularity (e.g. ``Client.KLINE_INTERVAL_1MINUTE``).
                 Pulled from ``HMM_INTERVAL`` in ``config_parameters.py``.
             lookback (str): How far back to download data
-                (e.g. ``"4 hours ago UTC"``).  Pulled from ``HMM_LOOKBACK``.
+                (e.g. ``"2 hours ago UTC"``).  Pulled from ``HMM_LOOKBACK``.
             random_state (int): Seed for ``GaussianHMM`` initialisation to
                 ensure reproducible state numbering across runs.
             n_iterations (int): Maximum number of Expectation–Maximisation
@@ -169,8 +175,16 @@ class RegimeDirector:
         and select the best one by **Bayesian Information Criterion (BIC)**.
 
         For each candidate ``n``:
+
         * A ``GaussianHMM`` with full covariance is fitted on the feature
           matrix from ``self.klines_df[HMM_FEATURE_COLS]``.
+        * ``min_covar=HMM_MIN_COVAR`` is passed to the model so that a small
+          regularisation constant is added to the diagonal of every state's
+          covariance matrix, preventing ``"covars must be symmetric,
+          positive-definite"`` errors when a state has too few observations.
+        * If ``fit()`` or ``bic()`` still raise ``ValueError`` or
+          ``numpy.linalg.LinAlgError`` (e.g. extreme feature values), that
+          ``n`` is skipped with a ``WARNING`` log and the search continues.
         * BIC is computed as ``model.bic(features)`` — lower is better.
 
         The model with the lowest BIC is stored in ``self.model``.  The full
@@ -183,6 +197,9 @@ class RegimeDirector:
         Raises:
             AttributeError: if ``self.klines_df`` is ``None`` (``get_klines_data``
                 not yet called).
+            RuntimeError: if every candidate ``n`` fails to produce a valid
+                covariance matrix.  Increase ``HMM_MIN_COVAR`` or decrease
+                ``HMM_MAX_REGIMES`` in ``config_parameters.py`` to resolve.
         """
         features = self.klines_df[HMM_FEATURE_COLS].values
         best_hmm_model, best_hmm_bic = None, np.inf
@@ -192,13 +209,29 @@ class RegimeDirector:
                 covariance_type="full",
                 n_iter=self.n_iterations,
                 random_state=self.random_state,
+                min_covar=HMM_MIN_COVAR,  # regularisation floor — keeps covariance
+                # matrices positive-definite when a state
+                # has few observations
             )
-            m.fit(features)
-            # TODO numpy.linalg.LinAlgError: 2-th leading minor of the array is not positive definite
-            bic = m.bic(features)
-            logging.info("RegimeDetector: n=%d  BIC=%.1f", n, bic)
+            try:
+                m.fit(features)
+                bic = m.bic(features)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                # Covariance matrix became singular for this n — skip and try next
+                logging.warning(
+                    "RegimeDirector: n=%d skipped — covariance error (%s)", n, exc
+                )
+                continue
+            logging.info("RegimeDirector: n=%d  BIC=%.1f", n, bic)
             if bic < best_hmm_bic:
                 best_hmm_bic, best_hmm_model = bic, m
+
+        if best_hmm_model is None:
+            raise RuntimeError(
+                "RegimeDirector: all GaussianHMM fits failed. "
+                "Try increasing HMM_MIN_COVAR or reducing HMM_MAX_REGIMES."
+            )
+
         self.model = best_hmm_model
         self.regimes = self.model.predict(features)
         self.current_regime = int(self.regimes[-1])
@@ -208,45 +241,101 @@ class RegimeDirector:
             self.current_regime,
         )
 
+    def predict_current_regime(self) -> None:
+        """
+        Update ``current_regime`` using the **already-fitted** model — no
+        re-training.
+
+        This is the cheap alternative to ``select_hmm_model()``.  It runs the
+        Viterbi algorithm (``model.predict()``) on the feature matrix that was
+        last downloaded by ``get_klines_data()`` and updates
+        ``self.current_regime`` to the state of the **last candle**.
+        ``self.regimes`` (the full state sequence) is also refreshed so that
+        ``assign_regime_labels()`` always operates on a current sequence.
+
+        Complexity vs. ``select_hmm_model()``:
+
+        * ``select_hmm_model()`` — O(n × k × iterations) per candidate model,
+          repeated for every ``n = 2 … max_states``.  Expensive.
+        * ``predict_current_regime()`` — O(n × k) single Viterbi pass on the
+          existing model.  ~1000× cheaper for ``n_iter = 1000``.
+
+        Call pattern expected by ``AnalysisEngine.historical_analysis()``:
+
+        .. code-block:: text
+
+            every HIST_INTERVAL (60 s):
+                get_klines_data()          # refresh self.klines_df
+                predict_current_regime()   # cheap Viterbi inference
+                assign_regime_labels()     # map state → label (under _regime_lock)
+
+            every HMM_REFIT_INTERVAL (300 s):
+                get_klines_data()          # refresh self.klines_df
+                select_hmm_model()         # full re-fit (replaces predict step)
+                assign_regime_labels()     # under _regime_lock
+
+        Requires:
+            * ``get_klines_data()`` must have been called first so that
+              ``self.klines_df`` is populated.
+            * ``select_hmm_model()`` must have been called at least once so
+              that ``self.model`` is not ``None``.
+
+        Raises:
+            RuntimeError: if ``self.model`` is ``None`` (no prior fit exists).
+            AttributeError: if ``self.klines_df`` is ``None`` (``get_klines_data``
+                not yet called).
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "predict_current_regime() called before select_hmm_model(). "
+                "Run the initial fit first."
+            )
+        features = self.klines_df[HMM_FEATURE_COLS].values
+        self.regimes = self.model.predict(features)
+        self.current_regime = int(self.regimes[-1])
+        logging.info(
+            "RegimeDirector: predict (no refit) → current_regime=%d",
+            self.current_regime,
+        )
+
     def assign_regime_labels(self):
         """
         Assign a human-readable label to each HMM state and expose the label
         for the current (latest) candle via ``self.regime_label``.
 
-        Labels are derived **entirely** from the model's own learned parameters
-        (``model.means_``) — no domain-specific price thresholds are hard-coded.
-        For each feature the cross-state mean and standard deviation are
-        computed, then boolean flags are set per state:
+        **Directional labels** are assigned by ranking all states on a combined
+        score of ``return.rank() + obi_proxy.rank()``:
 
-        * ``high_return``   — return  > cross-state mean + 0.5 × std
-        * ``low_return``    — return  < cross-state mean − 0.5 × std
-        * ``buy_pressure``  — obi     > cross-state mean + 0.5 × std
-        * ``sell_pressure`` — obi     < cross-state mean − 0.5 × std
-        * ``high_vol``      — volatility > cross-state mean + 1 × std
-        * ``high_td``       — trade_density > cross-state mean + 0.5 × std
-          (many small trades — fragmented / retail activity)
-        * ``low_td``        — trade_density < cross-state mean − 0.5 × std
-          (few large trades — institutional blocks)
+        * ``trending_up``   — state with the **highest** combined rank
+          (highest mean return + strongest buy-side order flow).
+        * ``trending_down`` — state with the **lowest** combined rank
+          (lowest mean return + weakest / most negative order flow).
 
-        Label assignment priority (first matching rule wins):
+        This guarantees **exactly one state per directional label** regardless
+        of ``n_components``, eliminating the duplicate-label problem that
+        arises when multiple states simultaneously exceed a threshold.
 
-        ===========================  ==========================================
-        Condition                    Label
-        ===========================  ==========================================
-        high_return + buy_pressure   ``"trending_up"``
-        low_return + sell_pressure   ``"trending_down"``
-        high_vol                     ``"high_volatility"``
-        high_td + not high_vol       ``"active_neutral"``
-        (default)                    ``"neutral"``
-        ===========================  ==========================================
+        **Secondary labels** are assigned to the remaining states:
 
-        .. note::
-            ``low_td`` is **not** required for trending regimes.  Requiring
-            all three features to simultaneously exceed cross-state thresholds
-            is too strict in practice (most states fall through to ``"neutral"``
-            with a triple-AND rule).  ``high_vol`` alone is sufficient to
-            classify a state as ``"high_volatility"`` — adding ``high_td`` as a
-            second required condition suppresses that label too aggressively.
+        ==========================================  ===========================
+        Condition                                   Label
+        ==========================================  ===========================
+        high_vol OR high_td                         ``"high_volatility"``
+        (default)                                   ``"neutral"``
+        ==========================================  ===========================
+
+        ``"high_volatility"`` is triggered by **either**:
+
+        * Large intra-bar price swings (``volatility > mean + 1 × std``) — the
+          market is moving too fast for limit orders to fill predictably.
+        * High trade fragmentation (``trade_density > mean + 0.5 × std``) —
+          many small retail/HFT orders with no clear directional intent, making
+          the order-book signal unreliable.
+
+        Both conditions independently indicate an **unreliable market** to
+        trade in: one from the price side (large swings), the other from the
+        flow side (fragmented activity).  Together they give ``trade_density``
+        a meaningful role beyond logging.
 
         ``self.regime_label`` is set to the label of ``self.current_regime``
         and is safe to read from another thread once this method returns,
@@ -260,57 +349,52 @@ class RegimeDirector:
         """
         means = pd.DataFrame(self.model.means_, columns=HMM_FEATURE_COLS)
 
-        # --- cross-state thresholds, fully data-driven ---
-        # so this is the mean across the states != the self.model.means_ so we do not need to hardcode the threshold.
-        std_r = means["return"].std()
-        mean_r = means["return"].mean()
-
-        mean_obi = means["obi_proxy"].mean()
-        std_obi = means["obi_proxy"].std()
-
+        # Thresholds for secondary labels
         mean_vol = means["volatility"].mean()
         std_vol = means["volatility"].std()
-
         mean_td = means["trade_density"].mean()
         std_td = means["trade_density"].std()
+
+        # --- rank-based directional assignment ---
+        # Sum the ordinal rank of each state on return and obi_proxy.
+        # idxmax / idxmin are exclusive by definition → no duplicate
+        # trending_up / trending_down labels regardless of n_components.
+        direction_score = means["return"].rank() + means["obi_proxy"].rank()
+        best_state = int(direction_score.idxmax())
+        worst_state = int(direction_score.idxmin())
 
         labels = {}
 
         for state in range(self.model.n_components):
-            r = means.loc[state, "return"]
-            obi = means.loc[state, "obi_proxy"]
             vol = means.loc[state, "volatility"]
             td = means.loc[state, "trade_density"]
 
-            # boolean - thresholds are derived from cross-state statistics and are dynamically adapted to the data.
-            high_return = r > mean_r + 0.5 * std_r
-            low_return = r < mean_r - 0.5 * std_r
-            buy_pressure = obi > mean_obi + 0.5 * std_obi
-            sell_pressure = obi < mean_obi - 0.5 * std_obi
-            high_vol = vol > mean_vol + std_vol  # 1std above avg volatility
-            high_td = td > mean_td + 0.5 * std_td  # above-average fragmentation
-            low_td = (
-                td < mean_td - 0.5 * std_td
-            )  # below-average fragmentation (large blocks)
+            # large intra-bar swings → unpredictable fills
+            high_vol = vol > mean_vol + std_vol
+            # many small fragmented trades → no clear directional intent
+            high_td = td > mean_td + 0.5 * std_td
 
-            # Priority: direction first, then volatility, then activity, then default.
-            # Only 2 conditions required for directional regimes — requiring a
-            # third (low_td) was too strict and caused almost every state to
-            # fall through to "neutral".
-            if high_return and buy_pressure:
+            if state == best_state:
                 labels[state] = "trending_up"
-            elif low_return and sell_pressure:
+            elif state == worst_state:
                 labels[state] = "trending_down"
-            elif high_vol:                          # vol alone is enough
+            elif high_vol or high_td:
+                # Either large price swings OR heavy fragmentation makes the
+                # market unreliable to trade in — both signal noise over signal.
                 labels[state] = "high_volatility"
-            elif high_td and not high_vol:
-                labels[state] = "active_neutral"
             else:
                 labels[state] = "neutral"
 
             logging.info(
-                "RegimeDirector: state=%d label='%s' | r=%.5f vol=%.5f obi=%.4f td=%.6f",
-                state, labels[state], r, vol, obi, td,
+                "RegimeDirector: state=%d label='%s' | r=%.5f vol=%.5f obi=%.4f td=%.6f"
+                " | direction_score=%.2f",
+                state,
+                labels[state],
+                means.loc[state, "return"],
+                vol,
+                means.loc[state, "obi_proxy"],
+                td,
+                direction_score[state],
             )
 
         self.regime_label = labels[self.current_regime]

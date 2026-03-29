@@ -3,7 +3,7 @@ import logging
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 from binance.lib.utils import websocket_api_signature, get_uuid
 from core.order_book_state import OrderBookState
-from config_parameters import SYMBOL, CRYPTOCCY, CCY, RECV_WINDOW
+from config_parameters import SYMBOL, CRYPTOCCY, CCY, RECV_WINDOW, ORDER_REPORT_LIMIT
 
 
 class OrderExecutor:
@@ -324,9 +324,22 @@ class OrderExecutor:
         Send a LIMIT GTC order request over the WebSocket API (preferred) or
         the REST API (fallback).
 
-        The method validates the strategy, checks available balances, and
-        dispatches the order frame.  The actual Binance response is handled
-        asynchronously in ``handle_order_response``.
+        The method validates the strategy, dynamically caps the requested
+        quantity to the available balance, and dispatches the order frame.
+        The actual Binance response is handled asynchronously in
+        ``handle_order_response``.
+
+        **Dynamic quantity cap** — rather than skipping an order when the
+        order-book level quantity exceeds the available balance, the quantity
+        is capped to the affordable amount:
+
+        * BUY:  ``quantity = min(aq, usdt / micro_price)``
+        * SELL: ``quantity = min(bq, btc)``
+
+        The order is only skipped (returns ``None``) when the capped quantity
+        is effectively zero, meaning the balance is fully depleted for that
+        direction.  A ``logging.info`` message is emitted whenever a cap is
+        applied so the operator can observe partial fills.
 
         Args:
             strategy (str): ``"BUY"`` or ``"SELL"``.
@@ -346,26 +359,52 @@ class OrderExecutor:
 
         # BUY  → quantity is aq (ask-side liquidity available at this level)
         # SELL → quantity is bq (bid-side liquidity available at this level)
-        quantity = aq if strategy == "BUY" else bq
-
-        if strategy == "BUY" and quantity * micro_price > usdt:
-            logging.warning(
-                "LIMIT BUY skipped: cost %.2f %s exceeds available %.2f %s",
-                quantity * micro_price,
-                CCY,
-                usdt,
-                CCY,
-            )
-            return
-        if strategy == "SELL" and quantity > btc:
-            logging.warning(
-                "LIMIT SELL skipped: qty %.6f %s exceeds available %.6f %s.",
-                quantity,
-                CRYPTOCCY,
-                btc,
-                CRYPTOCCY,
-            )
-            return
+        # Dynamically cap the quantity to what the available balance can afford,
+        # so the algo still trades at a reduced size rather than skipping entirely.
+        if strategy == "BUY":
+            max_affordable = usdt / micro_price if micro_price > 0 else 0.0
+            quantity = min(aq, max_affordable)
+            if quantity <= 0:
+                logging.warning(
+                    "LIMIT BUY skipped: available %s balance (%.2f) is too low "
+                    "to buy at price %.2f.",
+                    CCY,
+                    usdt,
+                    micro_price,
+                )
+                return
+            if quantity < aq:
+                logging.info(
+                    "LIMIT BUY quantity capped: requested %.6f %s → affordable %.6f %s "
+                    "(balance %.2f %s at price %.2f).",
+                    aq,
+                    CRYPTOCCY,
+                    quantity,
+                    CRYPTOCCY,
+                    usdt,
+                    CCY,
+                    micro_price,
+                )
+        else:  # SELL
+            quantity = min(bq, btc)
+            if quantity <= 0:
+                logging.warning(
+                    "LIMIT SELL skipped: available %s balance (%.6f) is too low.",
+                    CRYPTOCCY,
+                    btc,
+                )
+                return
+            if quantity < bq:
+                logging.info(
+                    "LIMIT SELL quantity capped: requested %.6f %s → affordable %.6f %s "
+                    "(balance %.6f %s).",
+                    bq,
+                    CRYPTOCCY,
+                    quantity,
+                    CRYPTOCCY,
+                    btc,
+                    CRYPTOCCY,
+                )
 
         logging.info(
             "Sending LIMIT %s: level=%d price=%.2f qty=%.6f",
@@ -444,14 +483,77 @@ class OrderExecutor:
     # End-of-session order report
     # ------------------------------------------------------------------
 
+    def _query_and_log_order(self, record: dict) -> tuple[int, int, int, int]:
+        """
+        Query a single order from Binance and log its status in the report table.
+
+        Called exclusively by :meth:`order_status_report` for each order record
+        that falls within the head or tail slice of ``placed_orders``.
+
+        Args:
+            record (dict): Entry from ``placed_orders`` containing at minimum
+                ``orderId``, ``side``, ``price``, and ``origQty``.
+
+        Returns:
+            tuple[int, int, int, int]: Increments ``(filled, partial, pending, other)``
+                — exactly one of the four values is 1, the rest are 0.
+        """
+        order_id = record.get("orderId")
+        _filled = _partial = _pending = _other = 0
+        try:
+            result = self.rest_client.get_order(
+                symbol=SYMBOL, orderId=order_id, recvWindow=RECV_WINDOW
+            )
+            status = result.get("status", "UNKNOWN")
+            side = result.get("side", record.get("side", "?"))
+            price = float(result.get("price", record.get("price", 0)))
+            orig_qty = float(result.get("origQty", record.get("origQty", 0)))
+            exec_qty = float(result.get("executedQty", 0))
+            quote_spent = float(result.get("cummulativeQuoteQty", 0))
+
+            if status == "FILLED":
+                label = "✔ FILLED"
+                _filled = 1
+            elif status == "PARTIALLY_FILLED":
+                label = "~ PARTIAL"
+                _partial = 1
+            elif status == "NEW":
+                label = "○ OPEN"
+                _pending = 1
+            else:
+                label = f"  {status}"
+                _other = 1
+
+            logging.info(
+                "  orderId=%-12s  %-4s  %s  price=%-10.2f  "
+                "origQty=%-12.6f  execQty=%-12.6f  quoteQty=%.4f",
+                order_id,
+                side,
+                label,
+                price,
+                orig_qty,
+                exec_qty,
+                quote_spent,
+            )
+        except Exception as e:
+            logging.error("  orderId=%-12s  could not query status: %s", order_id, e)
+        return _filled, _partial, _pending, _other
+
     def order_status_report(self) -> None:
         """
         Query the final status of every order placed during the session and
         log a formatted summary table.
 
-        For each order in ``placed_orders`` the method calls
-        ``GET /api/v3/order`` via the REST client and maps the Binance
-        ``status`` field to a human-readable label:
+        To avoid flooding the console during long sessions the report is
+        capped: only the first and last ``ORDER_REPORT_LIMIT`` orders (default
+        100 each) are printed individually.  When the total exceeds
+        ``2 * ORDER_REPORT_LIMIT`` the middle block is collapsed to a single
+        summary line that states how many orders were omitted.  Raise
+        ``ORDER_REPORT_LIMIT`` in ``config_parameters.py`` to expose more rows.
+
+        For each printed order the method calls ``GET /api/v3/order`` via the
+        REST client and maps the Binance ``status`` field to a human-readable
+        label:
 
         * ``FILLED``           — fully executed
         * ``PARTIALLY_FILLED`` — partially executed (``executedQty`` < ``origQty``)
@@ -475,49 +577,45 @@ class OrderExecutor:
             "\n========== END-OF-SESSION ORDER REPORT (%d order(s)) ==========",
             len(self.placed_orders),
         )
-        # TODO maybe print out the first and last 100 orders?
+
+        total = len(self.placed_orders)
+        # If the session generated more orders than 2 * ORDER_REPORT_LIMIT,
+        # only print the first and last ORDER_REPORT_LIMIT to avoid flooding
+        # the console.  The skipped middle block is summarized on one line.
+        if total > 2 * ORDER_REPORT_LIMIT:
+            head = self.placed_orders[:ORDER_REPORT_LIMIT]
+            tail = self.placed_orders[-ORDER_REPORT_LIMIT:]
+            skipped = total - 2 * ORDER_REPORT_LIMIT
+        else:
+            head = self.placed_orders
+            tail = []
+            skipped = 0
+
         filled = partial = pending = other = 0
-        for record in self.placed_orders:
-            order_id = record.get("orderId")
-            try:
-                result = self.rest_client.get_order(
-                    symbol=SYMBOL, orderId=order_id, recvWindow=RECV_WINDOW
-                )
-                status = result.get("status", "UNKNOWN")
-                side = result.get("side", record.get("side", "?"))
-                price = float(result.get("price", record.get("price", 0)))
-                orig_qty = float(result.get("origQty", record.get("origQty", 0)))
-                exec_qty = float(result.get("executedQty", 0))
-                quote_spent = float(result.get("cummulativeQuoteQty", 0))
 
-                if status == "FILLED":
-                    label = "✔ FILLED"
-                    filled += 1
-                elif status == "PARTIALLY_FILLED":
-                    label = "~ PARTIAL"
-                    partial += 1
-                elif status == "NEW":
-                    label = "○ OPEN"
-                    pending += 1
-                else:
-                    label = f"  {status}"
-                    other += 1
+        logging.info("  ── first %d order(s) ──", len(head))
+        for record in head:
+            f, p, pe, o = self._query_and_log_order(record)
+            filled += f
+            partial += p
+            pending += pe
+            other += o
 
-                logging.info(
-                    "  orderId=%-12s  %-4s  %s  price=%-10.2f  "
-                    "origQty=%-12.6f  execQty=%-12.6f  quoteQty=%.4f",
-                    order_id,
-                    side,
-                    label,
-                    price,
-                    orig_qty,
-                    exec_qty,
-                    quote_spent,
-                )
-            except Exception as e:
-                logging.error(
-                    "  orderId=%-12s  could not query status: %s", order_id, e
-                )
+        if skipped:
+            logging.info(
+                "  ── … %d order(s) omitted (set ORDER_REPORT_LIMIT in "
+                "config_parameters.py to raise the cap) … ──",
+                skipped,
+            )
+
+        if tail:
+            logging.info("  ── last %d order(s) ──", len(tail))
+            for record in tail:
+                f, p, pe, o = self._query_and_log_order(record)
+                filled += f
+                partial += p
+                pending += pe
+                other += o
 
         logging.info(
             "  Summary → filled: %d | partial: %d | still open: %d | other: %d",

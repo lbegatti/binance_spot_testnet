@@ -10,6 +10,7 @@ from config_parameters import (
     N_LEVELS,
     CCY,
     CRYPTOCCY,
+    HMM_REFIT_INTERVAL,
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import volume_weighted_average_price
@@ -37,9 +38,11 @@ class AnalysisEngine:
         order_executor (OrderExecutor): Injected order placement handler.
         regime_director (RegimeDirector): Pre-fitted HMM regime detector,
             injected at construction (initial fit done in ``websocket_main.py``
-            before threads start).  Re-fitted every ``HIST_INTERVAL`` seconds
-            inside ``historical_analysis()`` to keep the current market regime
-            up to date.  Reads are protected by ``_regime_lock``.
+            before threads start).  Updated every ``HIST_INTERVAL`` seconds
+            inside ``historical_analysis()`` using a **two-speed** scheme:
+            cheap Viterbi prediction on most iterations, full model re-fit
+            every ``HMM_REFIT_INTERVAL`` seconds (default 300 s = 5 min).
+            Reads are protected by ``_regime_lock``.
         _vwap_lock (threading.Lock): Serialises access to ``_bid_vwap`` and
             ``_ask_vwap`` between ``historical_analysis`` (writer) and
             ``low_latency_analysis`` (reader).
@@ -375,22 +378,31 @@ class AnalysisEngine:
            Both VWAPs are published under ``_vwap_lock`` so that
            ``low_latency_analysis`` can read them safely on the next iteration.
 
-        2. **HMM regime re-fit** — calls, in order, outside any lock:
-              - ``regime_director.get_klines_data()`` — fetches the latest
-                ``HMM_LOOKBACK`` (4 h) of ``HMM_INTERVAL`` (1 m) klines from
-                Binance (public endpoint, no auth) and computes the four HMM
-                features: ``return``, ``volatility``, ``obi_proxy``,
-                ``trade_density``.
-              - ``regime_director.select_hmm_model()`` — fits
-                ``GaussianHMM`` models for ``n = 2 … HMM_MAX_REGIMES``,
-                selects the best by BIC, predicts the state sequence, and
-                sets ``current_regime`` to the state of the **last candle**.
-           Then, inside ``_regime_lock``:
-              - ``regime_director.assign_regime_labels()`` — maps each HMM
-                state integer to a human-readable label
-                (``"trending_up"``, ``"trending_down"``, ``"high_volatility"``,
-                ``"active_neutral"``, ``"neutral"``) using cross-state mean /
-                std thresholds.  Writes ``regime_director.regime_label``.
+        2. **HMM regime update** — two-speed update to avoid re-training on
+           nearly identical data every minute:
+
+           * **Every ``HIST_INTERVAL`` (60 s)** — cheap path:
+
+             - ``regime_director.get_klines_data()`` — fetches the latest
+               ``HMM_LOOKBACK`` (2 h) of ``HMM_INTERVAL`` (1 m) klines.
+             - ``regime_director.predict_current_regime()`` — runs the Viterbi
+               algorithm on the already-fitted model (O(n × k)), extracts the
+               state of the last candle.  No re-training.
+
+           * **Every ``HMM_REFIT_INTERVAL`` (300 s, i.e. every 5th iteration)** — full path:
+
+             - ``regime_director.get_klines_data()`` — same as above.
+             - ``regime_director.select_hmm_model()`` — fits all candidate
+               ``GaussianHMM`` models (2 … ``HMM_MAX_REGIMES``), selects best
+               by BIC, and replaces the stored model.
+               O(n × k × ``HMM_N_ITERATIONS``) per candidate — expensive.
+
+           Then, inside ``_regime_lock`` on **every** iteration:
+
+           - ``regime_director.assign_regime_labels()`` — maps the current
+             state integer to a human-readable label using cross-state mean/std
+             thresholds on ``model.means_``.  Writes
+             ``regime_director.regime_label``.
 
            The slow network + CPU work (kline download + model fitting) runs
            **outside** ``_regime_lock``; only the fast label assignment is
@@ -401,11 +413,15 @@ class AnalysisEngine:
         were completed.
         """
         iteration = 0
+        refit_every = max(
+            1, HMM_REFIT_INTERVAL // HIST_INTERVAL
+        )  # constant for the session
 
         logging.info(
-            "Historical analysis loop started (interval: %ds / %.0f min).",
+            "Historical analysis loop started (interval: %ds / %.0f min, refit every %d iteration(s)).",
             HIST_INTERVAL,
             HIST_INTERVAL / 60,
+            refit_every,
         )
         while not self.stop_event.is_set():
             self.stop_event.wait(HIST_INTERVAL)  # interruptible sleep
@@ -447,8 +463,15 @@ class AnalysisEngine:
                 ask_vwap,
             )
 
-            self.regime_director.get_klines_data()  # fetch latest 3h of 1m candles
-            self.regime_director.select_hmm_model()  # re-fit
+            self.regime_director.get_klines_data()  # fetch latest 2h of 1m candles
+
+            # Full re-fit every HMM_REFIT_INTERVAL seconds (default 5 min);
+            # cheap Viterbi inference on every other iteration.
+            if iteration % refit_every == 0:
+                self.regime_director.select_hmm_model()  # O(n × k × iters) — slow
+                logging.info("Historical #%d — full HMM re-fit completed.", iteration)
+            else:
+                self.regime_director.predict_current_regime()  # O(n × k) — fast
 
             with self._regime_lock:
                 self.regime_director.assign_regime_labels()  # write regime label

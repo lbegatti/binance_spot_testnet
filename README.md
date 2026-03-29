@@ -98,17 +98,20 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Quote throttle** | `QUOTE_EVERY_N_TICKS` | `10` | Ticks between `calculate_best_quote()` calls.  At `WS_SPEED=100 ms`, 10 ticks ≈ 1 s |
 | **HMM** | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Feature columns fed to the `GaussianHMM` |
 | **HMM** | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
-| **HMM** | `HMM_MAX_REGIMES` | `5` | Upper bound on hidden states evaluated during BIC search (2 … 5) |
+| **HMM** | `HMM_MAX_REGIMES` | `4` | Upper bound on hidden states evaluated during BIC search (2 … 4) |
 | **HMM** | `HMM_RANDOM_STATE` | `46` | Random seed for reproducible HMM initialisation |
 | **HMM** | `HMM_INTERVAL` | `Client.KLINE_INTERVAL_1MINUTE` | Kline granularity for regime detection (1 m — intra-session resolution) |
-| **HMM** | `HMM_LOOKBACK` | `"4 hours ago UTC"` | Kline history window (~240 rows at 1 m — captures recent intra-day regime) |
+| **HMM** | `HMM_LOOKBACK` | `"2 hours ago UTC"` | Kline history window (~120 rows at 1 m — captures recent intra-day regime without being stale) |
+| **HMM** | `HMM_MIN_COVAR` | `1e-3` | Regularisation floor for covariance matrices — prevents positive-definite errors |
+| **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
+| **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
 
 **Imported by:**
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
 - `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
-- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`
-- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`
-- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`
+- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`
+- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`
+- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
 
 ---
@@ -206,7 +209,7 @@ Binance REST API                   Binance WebSocket (production)
 | *(constants)* | `config_parameters.py` | Single source of truth for all tunable constants (`SYMBOL`, `CCY`, `CRYPTOCCY`, intervals, depths, timeouts, HMM parameters) — imported by every package |
 | `OrderBookState` | `core/order_book_state.py` | Single source of truth — owns `local_book`, `history_order_book`, `balance_status`, `thread_lock`, and `thread_balance_lock` |
 | `MessageHandler` | `core/message_handler.py` | One active WebSocket callback: `handle_depth_message` (merges diff-depth ticks into `local_book`, appends snapshots, calls `calculate_best_quote` every 10th tick).  `handle_balance_message` is preserved but superseded — see `OrderExecutor` |
-| `RegimeDirector` | `strategy/regime_director.py` | Detects the current market regime via a `GaussianHMM` fitted on recent 1-minute klines.  Fitted once at pre-session startup, then re-fitted every `HIST_INTERVAL` (60 s) inside `historical_analysis()`.  Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"active_neutral"`, `"neutral"`) protected by `_regime_lock` |
+| `RegimeDirector` | `strategy/regime_director.py` | Detects the current market regime via a `GaussianHMM` fitted on recent 1-minute klines.  Fitted once at pre-session startup; then updated every `HIST_INTERVAL` (60 s) via a **two-speed** scheme: cheap Viterbi prediction on most iterations, full model re-fit every `HMM_REFIT_INTERVAL` (300 s).  Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) protected by `_regime_lock` |
 | `AnalysisEngine` | `strategy/analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks; applies VWAP and regime filters before delegating order placement to `OrderExecutor` |
 | `OrderExecutor` | `execution/order_executor.py` | Places LIMIT GTC orders **and** maintains real-time balance updates via a single Binance WebSocket API connection.  On connect: `session.logon` (HMAC-signed) → `userDataStream.subscribe` → receives `outboundAccountPosition` push events on the **same** socket.  Falls back to REST for orders if WS is unavailable; balances fall back to startup REST snapshot |
 | `websocket_main` | `websocket_main.py` | Session driver — instantiates all classes, seeds initial balances into `state`, runs pre-session regime detection, opens WebSocket streams, starts all threads, manages session lifetime and shutdown |
@@ -223,7 +226,7 @@ Binance REST API                   Binance WebSocket (production)
    - **SELL**: execute only if `_bid_vwap is None` (first ~1 min) **or** `micro_price < bid_vwap` (downward momentum confirmed).
    - This logic may be inverted for a buy-the-dip / mean-reversion strategy — see the *Historical VWAP & Momentum Filter* section.
 7. **Real-time balance tracking (no listenKey)** — `OrderExecutor` owns the single `SpotWebsocketAPIClient` connection (`wss://testnet.binance.vision/ws-api/v3`).  On socket open (`on_open` callback) it sends a signed `session.logon` frame.  On success it immediately sends `userDataStream.subscribe`.  Once confirmed, Binance pushes `outboundAccountPosition` events on the **same** connection whenever a balance changes (e.g. after an order fill).  `handle_order_response` routes these push events (frames with no `"id"` field) to `_handle_balance_update`, which writes to `state.balance_status` under `thread_balance_lock`.  If the testnet doesn't support `session.logon` or `userDataStream.subscribe`, the executor falls back silently to the REST snapshot taken at session startup.
-8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` is never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration re-runs the same three steps (network + CPU outside the lock; label write inside `_regime_lock`) to keep the regime current.  `low_latency_analysis` reads `regime_label` under `_regime_lock` and gates execution: BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
+8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` is never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration applies a **two-speed** update: cheap Viterbi prediction (`predict_current_regime()`) on most iterations, full model re-fit (`select_hmm_model()`) every `HMM_REFIT_INTERVAL` (300 s, i.e. every 5th iteration).  Label assignment (`assign_regime_labels()`) runs inside `_regime_lock` on every iteration.  `low_latency_analysis` reads `regime_label` under `_regime_lock` and gates execution: BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
 
 ---
 
@@ -300,7 +303,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
 5. Session duration fixed at `DEFAULT_SESSION_MINUTES` (20 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
-7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~240 rows of 1-minute klines (last 4 hours), fits `GaussianHMM` models for 2–5 states, selects the best by BIC, and assigns `regime_label` before any thread starts.
+7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of 1-minute klines (last 2 hours), fits `GaussianHMM` models for 2–4 states, selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.
 9. Open one `SpotWebsocketStreamClient` (`ws_client`) on the production stream endpoint; subscribe to `diff_book_depth` at 100 ms intervals; callback: `handle_depth_message`.
 10. Wait 1 second for the first diff-depth messages to arrive and populate `local_book["bids"]`.
@@ -470,7 +473,7 @@ A **Hidden Markov Model (HMM)** is a statistical model for systems that move thr
 
 In this project:
 
-- The **hidden states** are the market regimes (`trending_up`, `trending_down`, `high_volatility`, `active_neutral`, `neutral`).  You cannot observe the regime directly; you can only infer it from market data.
+- The **hidden states** are the market regimes (`trending_up`, `trending_down`, `high_volatility`, `neutral`).  You cannot observe the regime directly; you can only infer it from market data.
 - The **observations** are the four feature vectors computed from 1-minute klines: `[return, volatility, obi_proxy, trade_density]`.
 
 An HMM is fully described by three components:
@@ -522,35 +525,53 @@ The last element of the predicted sequence, `regimes[-1]`, corresponds to the **
 
 ### Model Selection (BIC)
 
-`GaussianHMM` models are fitted for `n = 2 … HMM_MAX_REGIMES` (default 5) hidden states with full covariance.  The best model is selected by **Bayesian Information Criterion**:
+`GaussianHMM` models are fitted for `n = 2 … HMM_MAX_REGIMES` (default 4) hidden states with full covariance.  The best model is selected by **Bayesian Information Criterion**:
 
 $$\text{BIC} = -2 \ln \hat{L} + k \ln N$$
 
 where $\hat{L}$ is the model likelihood, $k$ the number of free parameters, and $N$ the number of observations.  The model with the **lowest BIC** is retained.
 
+### Two-Speed Update
+
+To avoid re-training the full model on nearly identical data every 60 s, `historical_analysis()` uses a two-speed scheme:
+
+| Cadence | Method called | Cost | When |
+|---|---|---|---|
+| Every `HIST_INTERVAL` (60 s) | `predict_current_regime()` | O(n × k) — single Viterbi pass | Iterations 1, 2, 3, 4, 6, 7, … |
+| Every `HMM_REFIT_INTERVAL` (300 s) | `select_hmm_model()` | O(n × k × `HMM_N_ITERATIONS`) per candidate — expensive | Iterations 5, 10, 15, … |
+
+`assign_regime_labels()` runs inside `_regime_lock` on **every** iteration regardless of path.
+
 ### State Labelling
 
-State integers (0, 1, 2, …) carry no inherent meaning.  `assign_regime_labels()` assigns labels by comparing each state's learned mean vector against **cross-state statistics** (no hard-coded thresholds):
+State integers (0, 1, 2, …) carry no inherent meaning.  `assign_regime_labels()` assigns labels using a **rank-based** directional scheme and threshold-based secondary rules — no hard-coded price constants:
+
+**Directional labels** — guaranteed to be unique (exactly one each):
+
+A combined **direction score** is computed per state:
+
+$$\text{direction\_score}_i = \text{rank}(\text{return}_i) + \text{rank}(\text{obi\_proxy}_i)$$
+
+| Assignment | Rule |
+|---|---|
+| `"trending_up"` | State with the **highest** direction score (most bullish: highest return + strongest buy-side flow) |
+| `"trending_down"` | State with the **lowest** direction score (most bearish: lowest return + weakest flow) |
+
+Because `idxmax()` and `idxmin()` are exclusive by definition, duplicate directional labels are structurally impossible regardless of `n_components`.
+
+**Secondary labels** — applied to remaining states via volatility and trade-density thresholds:
 
 | Flag | Condition |
 |---|---|
-| `high_return` | `return > cross-state mean + 0.5 × std` |
-| `low_return` | `return < cross-state mean − 0.5 × std` |
-| `buy_pressure` | `obi_proxy > cross-state mean + 0.5 × std` |
-| `sell_pressure` | `obi_proxy < cross-state mean − 0.5 × std` |
 | `high_vol` | `volatility > cross-state mean + 1 × std` |
 | `high_td` | `trade_density > cross-state mean + 0.5 × std` |
-| `low_td` | `trade_density < cross-state mean − 0.5 × std` |
 
-**Label priority (first match wins):**
+| Condition | Label | Rationale |
+|---|---|---|
+| `high_vol` **or** `high_td` | `"high_volatility"` | Either large price swings (unpredictable fills) **or** heavy trade fragmentation (noisy, no directional intent) makes the market **unreliable to trade in** |
+| *(default)* | `"neutral"` | No dominant signal |
 
-| Condition | Label |
-|---|---|
-| `high_return + buy_pressure + low_td` | `"trending_up"` — positive momentum, buy-side dominated, institutional block size |
-| `low_return + sell_pressure + low_td` | `"trending_down"` — negative momentum, sell-side dominated, institutional block size |
-| `high_vol + high_td` | `"high_volatility"` — large swings with many small trades (choppy/retail-driven) |
-| `high_td + not high_vol` | `"active_neutral"` — busy market, small trades, no directional swing (accumulation/distribution) |
-| *(default)* | `"neutral"` |
+> **Why OR?** Both `high_vol` and `high_td` independently indicate an unreliable market — one from the price side (large swings), the other from the flow side (fragmented activity). Using OR ensures `trade_density` has a meaningful role in the label assignment rather than being used only for model training.
 
 ### Regime Gate in `low_latency_analysis`
 
@@ -559,7 +580,6 @@ State integers (0, 1, 2, …) carry no inherent meaning.  `assign_regime_labels(
 | `"trending_up"` | ✅ allowed | ❌ suppressed |
 | `"trending_down"` | ❌ suppressed | ✅ allowed |
 | `"high_volatility"` | ❌ suppressed | ❌ suppressed |
-| `"active_neutral"` | ✅ allowed | ✅ allowed |
 | `"neutral"` | ✅ allowed | ✅ allowed |
 | `None` (before first historical run) | ✅ transparent | ✅ transparent |
 
@@ -568,8 +588,8 @@ State integers (0, 1, 2, …) carry no inherent meaning.  `assign_regime_labels(
 ```
 websocket_main.py startup
 │
-├── Pre-session: RegimeDirector.get_klines_data()   ← fetches last 4 h of 1-min klines
-│               RegimeDirector.select_hmm_model()  ← fits HMM, selects best BIC
+├── Pre-session: RegimeDirector.get_klines_data()   ← fetches last 2 h of 1-min klines (~120 rows)
+│               RegimeDirector.select_hmm_model()  ← fits HMM n=2..4, selects best BIC
 │               RegimeDirector.assign_regime_labels() ← sets regime_label
 │               regime_label is set BEFORE threads start
 │
@@ -577,9 +597,13 @@ websocket_main.py startup
 │   └── reads regime_label under _regime_lock  ← never None
 │
 └── historical_analysis — every 60 s
-    ├── compute bid_vwap / ask_vwap            ← existing VWAP logic
-    ├── get_klines_data() + select_hmm_model() ← slow work, outside _regime_lock
-    └── assign_regime_labels() under _regime_lock ← only the label write is locked
+    ├── compute bid_vwap / ask_vwap                         ← existing VWAP logic
+    ├── get_klines_data()                                   ← refresh features from Binance
+    ├── if iteration % 5 == 0:
+    │     select_hmm_model()                                ← full re-fit (every 5 min)
+    │   else:
+    │     predict_current_regime()                          ← cheap Viterbi inference
+    └── assign_regime_labels() under _regime_lock           ← label write (every iteration)
 ```
 
 ---
@@ -600,17 +624,19 @@ No magic numbers appear anywhere else in the strategy code.
 |---|---|---|
 | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to `GaussianHMM` |
 | `HMM_INTERVAL` | `Client.KLINE_INTERVAL_1MINUTE` | Kline granularity (1 min — intra-session resolution) |
-| `HMM_LOOKBACK` | `"4 hours ago UTC"` | Rolling window (~240 rows); captures the current session's regime |
-| `HMM_MAX_REGIMES` | `5` | Upper bound on hidden states evaluated during BIC search (2 … 5) |
+| `HMM_LOOKBACK` | `"2 hours ago UTC"` | Rolling window (~120 rows); responsive to intra-day BTC shifts while keeping enough data for stable EM convergence |
+| `HMM_MAX_REGIMES` | `4` | Upper bound on hidden states evaluated during BIC search (2 … 4) |
 | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | `46` | Seed for reproducible state numbering across fits |
+| `HMM_MIN_COVAR` | `1e-3` | Regularisation floor for covariance matrices |
+| `HMM_REFIT_INTERVAL` | `300` | Full re-fit cadence (s).  Between re-fits only Viterbi prediction runs |
 
-> **Why 4 hours and not 30 days?**  
-> A market regime (trending, choppy, neutral) persists for hours, not weeks.
-> Using 4 h of 1-min candles keeps the regime signal fresh and relevant to the
-> current session while keeping the startup download fast (~240 rows, 1–2 API
-> calls).  Using 30 days of 1-min data (43,200 rows) would capture structural
-> trends from weeks ago that are irrelevant to a 20-minute trading session.
+> **Why 2 hours and not 4?**  
+> A market regime persists for minutes to hours, but Bitcoin's direction can
+> shift quickly.  A 4-hour window means a regime change 30 minutes ago barely
+> moves the model (the session's own data is only ~8 % of the training set).
+> 2 hours (~120 candles) is reactive enough to capture intra-day shifts while
+> keeping enough data points for stable EM convergence with up to 4 states.
 
 ---
 
@@ -624,8 +650,8 @@ in the single-threaded startup block of `websocket_main.py`:
 from strategy.regime_director import RegimeDirector
 
 regime_director = RegimeDirector()             # 1. instantiate — no data yet
-regime_director.get_klines_data()              # 2. download ~240 rows, compute features
-regime_director.select_hmm_model()             # 3. fit HMM n=2..5, pick best BIC
+regime_director.get_klines_data()              # 2. download ~120 rows, compute features
+regime_director.select_hmm_model()             # 3. fit HMM n=2..4, pick best BIC
 regime_director.assign_regime_labels()        # 4. map state int → label string
 # → regime_director.regime_label == e.g. "trending_up"
 
@@ -667,9 +693,15 @@ on the latest 4 hours of klines.  The expensive work runs **outside** the lock;
 only the instant label assignment is locked:
 
 ```python
-# OUTSIDE _regime_lock — slow: network download + CPU model fit (~2–5 s)
-self.regime_director.get_klines_data()         # re-fetch latest 4 h of klines
-self.regime_director.select_hmm_model()        # re-fit, update current_regime
+# OUTSIDE _regime_lock — slow: network download + CPU model fit/predict
+self.regime_director.get_klines_data()         # re-fetch latest 2 h of klines
+
+# Two-speed update: full re-fit every HMM_REFIT_INTERVAL (300 s),
+# cheap Viterbi prediction on all other iterations.
+if iteration % refit_every == 0:
+    self.regime_director.select_hmm_model()    # full re-fit — slow
+else:
+    self.regime_director.predict_current_regime()  # Viterbi only — fast
 
 # INSIDE _regime_lock — fast: dict lookup + string assignment only
 with self._regime_lock:
@@ -719,13 +751,14 @@ if best_sell:
 ```
 config_parameters.py
   HMM_FEATURE_COLS, HMM_INTERVAL, HMM_LOOKBACK,
-  HMM_MAX_REGIMES, HMM_N_ITERATIONS, HMM_RANDOM_STATE
+  HMM_MAX_REGIMES, HMM_N_ITERATIONS, HMM_RANDOM_STATE,
+  HMM_REFIT_INTERVAL
         │
         ▼
 websocket_main.py  ── step 4b, single-threaded, BEFORE threads start ──
   RegimeDirector()
     .get_klines_data()           ← Binance public REST (no auth needed)
-    .select_hmm_model()          ← GaussianHMM BIC search (n = 2 … 5)
+    .select_hmm_model()          ← GaussianHMM BIC search (n = 2 … 4)
     .assign_regime_labels()     ← regime_label = "trending_up" / ...
         │
         │  injected as parameter
@@ -742,14 +775,14 @@ historical_analysis()                       low_latency_analysis()
     (from live order book deque)               ② copy order book under lock
   ② write VWAPs under _vwap_lock              ③ build levels, score candidates
   ③ get_klines_data()    ← outside lock       ④ read regime_label
-     select_hmm_model()  ← outside lock            under _regime_lock
-  ④ assign_regime_labels()                   ⑤ REGIME FILTER
-        under _regime_lock                         BUY  blocked if "trending_down"
-        (fast write only)                               or "high_volatility"
-                                                   SELL blocked if "trending_up"
-                                                        or "high_volatility"
-                                              ⑥ VWAP FILTER
-                                                   BUY  blocked if micro ≤ ask_vwap
+     if iter % 5 == 0:                              under _regime_lock
+       select_hmm_model()← full refit         ⑤ REGIME FILTER
+     else:                                         BUY  blocked if "trending_down"
+       predict_current_regime()                         or "high_volatility"
+                          ← Viterbi only           SELL blocked if "trending_up"
+  ④ assign_regime_labels()                          or "high_volatility"
+        under _regime_lock                    ⑥ VWAP FILTER
+        (fast write only)                          BUY  blocked if micro ≤ ask_vwap
                                                    SELL blocked if micro ≥ bid_vwap
                                               ⑦ OrderExecutor.execute()
                                                    LIMIT GTC via WebSocket API
@@ -761,10 +794,9 @@ historical_analysis()                       low_latency_analysis()
 
 | `regime_label` | BUY | SELL | Typical market condition |
 |---|---|---|---|
-| `"trending_up"` | ✅ | ❌ | Positive return + buy-side OBI + large block trades |
-| `"trending_down"` | ❌ | ✅ | Negative return + sell-side OBI + large block trades |
-| `"high_volatility"` | ❌ | ❌ | Large intra-bar swings + high trade fragmentation (choppy) |
-| `"active_neutral"` | ✅ | ✅ | High trade count, no directional swing (accumulation/distribution) |
+| `"trending_up"` | ✅ | ❌ | Highest combined return + OBI rank (most bullish state) |
+| `"trending_down"` | ❌ | ✅ | Lowest combined return + OBI rank (most bearish state) |
+| `"high_volatility"` | ❌ | ❌ | Large intra-bar swings OR heavy trade fragmentation — unreliable market |
 | `"neutral"` | ✅ | ✅ | No dominant signal in any feature |
 | `None` *(impossible after step 4b)* | ✅ | ✅ | Transparent — all orders pass through |
 
@@ -775,7 +807,8 @@ historical_analysis()                       low_latency_analysis()
 | Operation | Lock held | Duration |
 |---|---|---|
 | `get_klines_data()` | none | ~1–2 s (network I/O) |
-| `select_hmm_model()` | none | ~2–5 s (CPU — EM iterations) |
+| `select_hmm_model()` | none | ~2–5 s (CPU — EM iterations) — every 5 min |
+| `predict_current_regime()` | none | < 50 ms (single Viterbi pass) — every 60 s |
 | `assign_regime_labels()` | `_regime_lock` | < 1 ms (dict lookup + string write) |
 | Read `regime_label` in `low_latency_analysis` | `_regime_lock` | < 1 ms |
 
