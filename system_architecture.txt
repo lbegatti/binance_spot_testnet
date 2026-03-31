@@ -16,6 +16,7 @@ FILES
 
   strategy/
     analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter)
+    book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity)
     regime_director.py                — RegimeDirector: GaussianHMM regime detection on 1-min klines
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
     metrics.py                        — Order book depth metrics
@@ -28,6 +29,11 @@ FILES
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
+
+  backtest/                           — Offline backtesting framework (see BACKTESTING.md)
+    data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT)
+    synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
+    signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
 
 ─────────────────────────────────────────────────────────────────────────────
 1. CONFIGURATION  (config_parameters.py)
@@ -58,6 +64,12 @@ FILES
     HMM_MIN_COVAR        = 1e-3   # regularisation floor for covariance matrices
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
+    # Backtesting
+    BACKTEST_LOOKBACK    = "30 days ago UTC"  # kline fetch window for backtest dataset (~43 200 candles)
+    VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
+    HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
+    VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
+    REFIT_EVERY          = 5      # HMM_REFIT_INTERVAL // HIST_INTERVAL — backtest refit cadence
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -436,4 +448,45 @@ FILES
       • Each order is queried and logged by _query_and_log_order() (private
         class method).
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
+
+─────────────────────────────────────────────────────────────────────────────
+8. BACKTESTING  (backtest/)
+─────────────────────────────────────────────────────────────────────────────
+  Offline replay of the live strategy on 30 days of historical 1-min klines.
+  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
+
+  backtest/data.py            — fetch_klines(): downloads ~43 200 candles via
+                                Client.get_historical_klines() (public, no auth).
+  backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
+                                50-level order book (spread reconstruction +
+                                exponential volume decay + OBI asymmetry injection).
+                                Returns {"bids": {…}, "asks": {…}} matching
+                                state.local_book format → feeds _build_levels()
+                                directly.
+
+  Three data flows per candle (mirroring the live architecture):
+    Flow A — Opportunity scoring  : synthetic book → build_levels →
+             collect_candidates → select_best_opportunity
+             (all three via strategy/book_utils.py — the same public
+             functions that AnalysisEngine._build_levels / _collect_candidates
+             / _select_best_opportunity delegate to)
+    Flow B — Regime filter        : rolling 120-candle kline window →
+             RegimeDirector (HMM)
+    Flow C — VWAP momentum filter : rolling 5-candle best-bid/ask → VWAP
+
+  backtest/signals.py             — run_signals(): orchestrates all three flows
+                                    per candle, applies the combined gate
+                                    (regime + VWAP), and returns a time-indexed
+                                    DataFrame with signal (+1/−1/0), regime
+                                    label, bid/ask VWAP, and micro-price details.
+                                    Uses _add_hmm_features() to pre-compute HMM
+                                    features on the full kline DataFrame without
+                                    an API call.  HMM warm-up on first
+                                    HMM_LOOKBACK_ROWS (120) candles; main loop
+                                    from row 120 onward with two-speed refit
+                                    (full BIC every REFIT_EVERY iterations,
+                                    cheap Viterbi otherwise).
+
+  Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
+                         pnl.py / runner.py / visualization.py — pending.
 """

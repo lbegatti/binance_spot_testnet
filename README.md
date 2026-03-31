@@ -47,6 +47,7 @@ binance_spot_testnet/
 ├── restapi_main.py                    # REST orchestration — loops over depth limits
 ├── websocket_main.py                  # WebSocket — real-time local order book + session driver
 ├── README.md
+├── BACKTESTING.md                     # Backtesting design, pseudo-code, and implementation roadmap
 ├── system_architecture.txt
 │
 ├── core/                              # Shared state and data ingestion
@@ -57,6 +58,7 @@ binance_spot_testnet/
 ├── strategy/                          # Analysis and scoring pipeline
 │   ├── __init__.py
 │   ├── analysis.py                    # AnalysisEngine — low-latency (1 s) and historical (1 min) loops
+│   ├── book_utils.py                  # Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity)
 │   ├── regime_director.py             # RegimeDirector — HMM regime detection (fitted pre-session, refreshed every 1 min)
 │   ├── best_quote_calculator.py       # Live spread printer — prints best_bid | best_ask on every tick
 │   ├── metrics.py                     # Order book metric calculations
@@ -67,6 +69,12 @@ binance_spot_testnet/
 ├── execution/                         # Order placement
 │   ├── __init__.py
 │   └── order_executor.py             # OrderExecutor — LIMIT GTC orders via WebSocket API
+│
+├── backtest/                          # Offline backtesting framework (see BACKTESTING.md)
+│   ├── __init__.py
+│   ├── data.py                        # Historical kline downloader (30 days, 1 m)
+│   ├── synthetic_book.py              # Synthetic 50-level order book builder (per kline row)
+│   └── signals.py                     # Signal replay loop — full pipeline + regime & VWAP filters
 │
 └── visualization/                     # Plotting utilities
     ├── __init__.py
@@ -105,13 +113,22 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_MIN_COVAR` | `1e-3` | Regularisation floor for covariance matrices — prevents positive-definite errors |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
+| **Backtesting** | `BACKTEST_LOOKBACK` | `"30 days ago UTC"` | How far back to fetch klines for the backtest dataset (~43 200 candles at 1 m) |
+| **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
+| **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
+| **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
+| **Backtesting** | `REFIT_EVERY` | `5` | Iterations between full HMM BIC re-fits during the backtest signal loop (`HMM_REFIT_INTERVAL / HIST_INTERVAL`) |
 
 **Imported by:**
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
 - `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
 - `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`
+- `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`
+- `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`
+- `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
 
 ---
@@ -605,6 +622,34 @@ websocket_main.py startup
     │     predict_current_regime()                          ← cheap Viterbi inference
     └── assign_regime_labels() under _regime_lock           ← label write (every iteration)
 ```
+
+---
+
+## Backtesting
+
+A backtesting framework is being built to replay the live strategy against
+30 days of historical 1-minute klines (~43 200 candles).  Because Binance does
+not expose historical Level-2 order book data, a **synthetic 50-level depth
+ladder** is reconstructed from each kline's OHLCV data and taker volume split,
+then fed through the **same production scoring pipeline** used by
+`low_latency_analysis()`.
+
+Three independent data flows — opportunity scoring (synthetic book), HMM regime
+filter (kline features), and VWAP momentum filter (level-0 rolling window) —
+are combined into a single signal per candle, exactly mirroring the live
+architecture.
+
+All design decisions, pseudo-code, data-flow diagrams, approximation caveats,
+and a step-by-step implementation roadmap with progress tracking are documented
+in **[`BACKTESTING.md`](BACKTESTING.md)**.
+
+| Module | Status | Purpose |
+|---|---|---|
+| `backtest/data.py` | ✅ done | Download historical klines |
+| `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
+| `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
+| `backtest/pnl.py` | ⬜ pending | Simulated P&L and performance metrics |
+| `backtest/runner.py` | ⬜ pending | Top-level orchestration script |
 
 ---
 

@@ -14,6 +14,11 @@ from config_parameters import (
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import volume_weighted_average_price
+from strategy.book_utils import (
+    build_levels,
+    collect_candidates,
+    select_best_opportunity,
+)
 from strategy.regime_director import RegimeDirector
 
 
@@ -54,6 +59,15 @@ class AnalysisEngine:
             ``historical_analysis``; ``None`` until the first iteration.
         _ask_vwap (float | None): Latest ask VWAP published by
             ``historical_analysis``; ``None`` until the first iteration.
+
+    Note:
+        The static helpers ``_build_levels``, ``_collect_candidates``, and
+        ``_select_best_opportunity`` are thin wrappers that delegate to the
+        public functions in ``strategy.book_utils``.  The implementations were
+        extracted so that the backtesting pipeline (``backtest/signals.py``)
+        can consume them without importing ``AnalysisEngine``.  The private
+        names are retained here to keep all existing internal call sites
+        unchanged.
     """
 
     def __init__(
@@ -93,133 +107,60 @@ class AnalysisEngine:
     @staticmethod
     def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
         """
-        Helper method to construct order book levels for HFT analysis.
-        Sorting must happen before any metric is computed.
+        Thin wrapper around :func:`strategy.book_utils.build_levels`.
+
+        The implementation lives in ``book_utils.py`` so it can be consumed by
+        both the live ``AnalysisEngine`` and the backtesting pipeline without
+        importing ``AnalysisEngine``.  This wrapper preserves all existing
+        internal call sites unchanged.
 
         :param snaps_bids: dictionary of bids streamed via websocket.
         :param snaps_asks: dictionary of asks streamed via websocket.
-        :param n: integer signaling the depth of the order book levels to be used in the HFT strategy.
-                  Defaults to N_LEVELS (50).
-        :return: levels -> list of (total_depth, mid_price, micro_price, obi, bq, aq).
-                 median_depth -> median total depth across the levels.
-                 level_0_depth -> total depth at the best bid/ask level.
+        :param n: depth of order book levels. Defaults to N_LEVELS (50).
+        :return: (levels, median_depth, level_0_depth) — see
+                 :func:`strategy.book_utils.build_levels` for full details.
         """
-        sorted_bids = sorted(
-            snaps_bids.items(), key=lambda x: float(x[0]), reverse=True
-        )[:n]
-        sorted_asks = sorted(
-            snaps_asks.items(), key=lambda x: float(x[0]), reverse=False
-        )[:n]
-        levels = []
-        for (bp, bq), (ap, aq) in zip(sorted_bids, sorted_asks):
-            bp, bq, ap, aq = float(bp), float(bq), float(ap), float(aq)
-            total_depth = bq + aq
-            mid_price = (bp + ap) / 2
-            micro_price = (bp * aq + ap * bq) / total_depth
-            obi = (bq - aq) / (bq + aq)
-            levels.append((total_depth, mid_price, micro_price, obi, bq, aq))
-
-        all_depths = [lv[0] for lv in levels]
-        median_depth = float(
-            np.median(all_depths)
-        )  # mirrors np.median() in indicators.py
-        level_0_depth = all_depths[0]
-
-        return levels, median_depth, level_0_depth
+        return build_levels(snaps_bids, snaps_asks, n)
 
     @staticmethod
     def _collect_candidates(
         levels: list, median_depth: float, level_0_depth: float
     ) -> tuple:
         """
-        Helper method to identify potential HFT opportunities based on the
-        computed order book levels and depth metrics.
+        Thin wrapper around :func:`strategy.book_utils.collect_candidates`.
+
+        The implementation lives in ``book_utils.py`` so it can be consumed by
+        both the live ``AnalysisEngine`` and the backtesting pipeline without
+        importing ``AnalysisEngine``.  This wrapper preserves all existing
+        internal call sites unchanged.
 
         :param levels: list of tuples (total_depth, mid_price, micro_price, obi, bq, aq) for the top N levels.
         :param median_depth: median total depth across the levels, used to identify thin order book conditions.
         :param level_0_depth: total depth at the best bid/ask level, used to assess liquidity.
-        :return: candidates -> list of dictionaries with opportunity indicators for each level.
+        :return: (buy_candidates, sell_candidates) — see
+                 :func:`strategy.book_utils.collect_candidates` for full details.
         """
-        buy_candidates = []
-        sell_candidates = []
-
-        for i, (total_depth, mid_price, micro_price, obi, bq, aq) in enumerate(levels):
-            if i == 0:
-                continue
-            is_thin = total_depth < median_depth
-            depth_ok = total_depth >= 0.5 * level_0_depth
-            # obi > 0.0  # "Buy Wall" is heavier than the sell side, so the price might be pushed up.
-            # obi < 0.0  # Indicates that sellers are crowding the book, suggesting a downward move.
-            # obi = 0    # balance.
-            if not is_thin and depth_ok:
-                if micro_price > mid_price:  # buy signal
-                    delta = micro_price - mid_price
-                    buy_candidates.append(
-                        (i, delta, total_depth, obi, micro_price, bq, aq)
-                    )
-                elif micro_price < mid_price:  # sell signal
-                    delta = mid_price - micro_price
-                    sell_candidates.append(
-                        (i, delta, total_depth, obi, micro_price, bq, aq)
-                    )
-
-        return buy_candidates, sell_candidates
+        return collect_candidates(levels, median_depth, level_0_depth)
 
     @staticmethod
     def _select_best_opportunity(
         candidates: list, strategy_name: str, iteration: int
     ) -> tuple | None:
         """
-        Helper method to score the identified candidates based on a weighted combination of depth and micro-mid delta,
-        and pick the best one for potential execution.
+        Thin wrapper around :func:`strategy.book_utils.select_best_opportunity`.
 
-        :param candidates: list of tuples (level_idx, delta, total_depth, obi, micro_price, bq, aq) for the identified opportunities.
-        :param strategy_name: string indicating the strategy type ("buy" or "sell") for logging purposes.
-        :param iteration: integer indicating the current iteration of the HFT loop for logging purposes.
-        :return: tuple of (level_idx, score, delta, total_depth, obi, micro_price, bq, aq) for the best candidate or None if no
-                 candidates are available.
+        The implementation lives in ``book_utils.py`` so it can be consumed by
+        both the live ``AnalysisEngine`` and the backtesting pipeline without
+        importing ``AnalysisEngine``.  This wrapper preserves all existing
+        internal call sites unchanged.
+
+        :param candidates: list of tuples (level_idx, delta, total_depth, obi, micro_price, bq, aq).
+        :param strategy_name: ``"buy"`` or ``"sell"`` — for logging.
+        :param iteration: current loop iteration number — for logging.
+        :return: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq)
+                 or ``None`` — see :func:`strategy.book_utils.select_best_opportunity`.
         """
-        if not candidates:
-            logging.info(
-                "HFT #%d [%s] — no opportunities found.", iteration, strategy_name
-            )
-            return None
-        if len(candidates) == 1:
-            level_idx, delta, depth, obi, micro_price, bq, aq = candidates[0]
-            logging.info(
-                "HFT #%d [%s] — single candidate at level %d | delta=%.6f | depth=%.4f | order_imbalance=%.3f "
-                "| micro price = %.3f",
-                iteration,
-                strategy_name,
-                level_idx,
-                delta,
-                depth,
-                obi,
-                micro_price,
-            )
-            return level_idx, None, delta, depth, obi, micro_price, bq, aq
-        max_depth = max(c[2] for c in candidates)
-        max_delta = max(c[1] for c in candidates)
-        scored = []
-        for level_idx, delta, depth, obi, micro_price, bq, aq in candidates:
-            norm_depth = depth / max_depth
-            norm_delta = delta / max_delta
-            score = (norm_depth * 0.70) + (norm_delta * 0.30)
-            scored.append((level_idx, score, delta, depth, obi, micro_price, bq, aq))
-        trade_opportunity = max(scored, key=lambda x: x[1])
-        logging.info(
-            "HFT #%d [%s] — level %d | score=%.4f | delta=%.6f | depth=%.4f | order_imbalance = %.3f "
-            "| micro price = %.3f",
-            iteration,
-            strategy_name,
-            trade_opportunity[0],
-            trade_opportunity[1],
-            trade_opportunity[2],
-            trade_opportunity[3],
-            trade_opportunity[4],
-            trade_opportunity[5],
-        )
-        return trade_opportunity
+        return select_best_opportunity(candidates, strategy_name, iteration)
 
     def low_latency_analysis(self):
         """

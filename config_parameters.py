@@ -14,6 +14,17 @@ CCY = "USDT"  # quote currency
 CRYPTOCCY = "BTC"  # base / cryptocurrency
 
 # ---------------------------------------------------------------------------
+# Backtesting Parameters and Features
+# ---------------------------------------------------------------------------
+BACKTEST_LOOKBACK = "30 days ago UTC"
+VOLUME_DECAY_FACTOR = (
+    0.80  # each lever down the order book retains 80% of the previous level's volume
+)
+HMM_LOOKBACK_ROWS = 120  # 2 h at 1 m — matches HMM_LOOKBACK in the live system
+VWAP_WINDOW = 5  # 5 candles = 5 min at 1 m — matches live VWAP window
+REFIT_EVERY = 5  # HMM_REFIT_INTERVAL // HIST_INTERVAL = 300 // 60
+
+# ---------------------------------------------------------------------------
 # HMM Parameters and Features
 # ---------------------------------------------------------------------------
 HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
