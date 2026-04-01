@@ -2,6 +2,7 @@
   <dictionary name="project">
     <words>
       <w>maxlen</w>
+      <w>sortino</w>
     </words>
   </dictionary>
 </component>

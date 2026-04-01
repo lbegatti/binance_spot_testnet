@@ -61,4 +61,12 @@ def volume_weighted_average_price(
         float: The calculated volume-weighted average price.
     """
 
-    return float(np.sum(price * volume) / np.sum(volume))
+    total_vol = float(np.sum(volume))
+    if total_vol == 0.0:
+        # Guard against all-zero volume arrays (e.g. a deque window full of
+        # candles where one side of the synthetic book had buy_ratio = 0 or 1).
+        # Returning NaN explicitly avoids a silent numpy RuntimeWarning and
+        # makes the downstream VWAP filter transparently pass-through
+        # (NaN comparisons always evaluate to False in Python).
+        return float("nan")
+    return float(np.sum(price * volume) / total_vol)

@@ -74,7 +74,9 @@ binance_spot_testnet/
 │   ├── __init__.py
 │   ├── data.py                        # Historical kline downloader (30 days, 1 m)
 │   ├── synthetic_book.py              # Synthetic 50-level order book builder (per kline row)
-│   └── signals.py                     # Signal replay loop — full pipeline + regime & VWAP filters
+│   ├── signals.py                     # Signal replay loop — full pipeline + regime & VWAP filters
+│   ├── pnl.py                         # P&L simulation — balance guard, fill price, equity curve, metrics
+│   └── runner.py                      # Top-level backtest runner — chains all modules, prints report
 │
 └── visualization/                     # Plotting utilities
     ├── __init__.py
@@ -118,6 +120,11 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
 | **Backtesting** | `REFIT_EVERY` | `5` | Iterations between full HMM BIC re-fits during the backtest signal loop (`HMM_REFIT_INTERVAL / HIST_INTERVAL`) |
+| **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `10_000.0` | Starting USDT balance for the simulation |
+| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
+| **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %) |
+| **Backtesting P&L** | `BACKTEST_SLIPPAGE` | `0.0` | Extra slippage fraction on top of `half_spread` fill cost (default: spread cost only) |
+| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full 30-day run) |
 
 **Imported by:**
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
@@ -126,9 +133,11 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`
-- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
+- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_SLIPPAGE`
+- `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_SLIPPAGE`, `SYMBOL`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
 
 ---
@@ -648,8 +657,8 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/data.py` | ✅ done | Download historical klines |
 | `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
-| `backtest/pnl.py` | ⬜ pending | Simulated P&L and performance metrics |
-| `backtest/runner.py` | ⬜ pending | Top-level orchestration script |
+| `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, `half_spread` fill, equity curve, Step 5 metrics |
+| `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, prints formatted report |
 
 ---
 

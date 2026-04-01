@@ -14,7 +14,7 @@ from strategy.book_utils import (
 from strategy.indicators import volume_weighted_average_price
 from strategy.regime_director import RegimeDirector
 
-from config_parameters import HMM_LOOKBACK_ROWS, VWAP_WINDOW, REFIT_EVERY
+from config_parameters import HMM_LOOKBACK_ROWS, VWAP_WINDOW, REFIT_EVERY, BACKTEST_MAX_ROWS
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -47,8 +47,8 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
         "close"
     ]
     klines_df["obi_proxy"] = (
-        klines_df["taker_buy_base_vol"] / klines_df["volume"]
-    ) * 2 - 1
+                                     klines_df["taker_buy_base_vol"] / klines_df["volume"]
+                             ) * 2 - 1
     klines_df["trade_density"] = klines_df["num_trades"] / klines_df["volume"]
     return klines_df.dropna()
 
@@ -88,27 +88,37 @@ def run_signals() -> pd.DataFrame:
     Returns:
         pd.DataFrame: One row per candle (from ``HMM_LOOKBACK_ROWS`` onward),
             indexed by ``timestamp``, with columns:
-            ``signal``, ``regime``, ``bid_vwap``, ``ask_vwap``,
-            ``best_buy_micro``, ``best_sell_micro``.
+            ``close`` (candle close — VWAP anchor),
+            ``half_spread`` (``(high-low)/2`` — taker fill cost; BUY fills at
+            ``close + half_spread``, SELL fills at ``close - half_spread``),
+            ``signal`` (+1 BUY / -1 SELL / 0 HOLD),
+            ``regime``, ``bid_vwap``, ``ask_vwap``,
+            ``best_buy_micro``, ``best_sell_micro``,
+            ``buy_qty`` (ask-side quantity at the best-buy level),
+            ``sell_qty`` (bid-side quantity at the best-sell level).
+            ``buy_qty`` / ``sell_qty`` are ``None`` when no signal fired.
     """
-    # ── 1. Fetch and prepare data ────────────────────────────────────────
+    # 1. Fetch and prepare data
     klines = fetch_klines()
     features_df = _add_hmm_features(klines)
+    if BACKTEST_MAX_ROWS is not None:
+        features_df = features_df.iloc[:HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS]
+        logging.info("Debug mode: capped at %d rows (%d replay candles).", len(features_df), BACKTEST_MAX_ROWS)
     logging.info(
         "Fetched %d klines; %d rows after HMM features.", len(klines), len(features_df)
     )
 
-    # ── 2. Initial HMM fit on the warm-up window (first 120 rows) ────────────────────────
+    # 2. Initial HMM fit on the warm-up window (first 120 rows)
     rd = RegimeDirector()
     rd.klines_df = features_df.iloc[:HMM_LOOKBACK_ROWS]
     rd.select_hmm_model()
     rd.assign_regime_labels()
     logging.info("Initial HMM fit complete — regime: '%s'", rd.regime_label)
 
-    # ── 3. Rolling VWAP window ──────────────────────────────────────────
+    # 3. Rolling VWAP window
     vwap_deque: deque = deque(maxlen=VWAP_WINDOW)
 
-    # ── 4. Main loop ────────────────────────────────────────────────────
+    # 4. Main loop
     records: list[dict] = []
     hist_iteration = 0  # counts iterations since warm-up (for refit cadence)
 
@@ -117,7 +127,7 @@ def run_signals() -> pd.DataFrame:
         timestamp = features_df.index[i]
         hist_iteration += 1
 
-        # ── Flow A: synthetic book → levels → candidates → best ─────────
+        # Flow A: synthetic book → levels → candidates → best
         order_book = build_synthetic_book(row)
         levels, median_depth, level_0_depth = build_levels(
             order_book["bids"], order_book["asks"]
@@ -128,7 +138,7 @@ def run_signals() -> pd.DataFrame:
         best_buy = select_best_opportunity(buy_candidates, "buy", hist_iteration)
         best_sell = select_best_opportunity(sell_candidates, "sell", hist_iteration)
 
-        # ── Flow C: VWAP from synthetic best bid/ask ────────────────────
+        # Flow C: VWAP from synthetic best bid/ask
         best_bid_price = float(max(order_book["bids"].keys(), key=float))
         best_ask_price = float(min(order_book["asks"].keys(), key=float))
         vol_best_bid = float(order_book["bids"][f"{best_bid_price:.2f}"])
@@ -143,6 +153,22 @@ def run_signals() -> pd.DataFrame:
             }
         )
 
+        # ── Rolling VWAP ─────────────────────────────────────────────────────
+        # deque(maxlen=VWAP_WINDOW) acts as a self-evicting rolling window:
+        # once it holds VWAP_WINDOW entries the oldest is dropped automatically
+        # on every append, so len() == VWAP_WINDOW for the rest of the loop.
+        #
+        # The else branch (None) only fires during the first VWAP_WINDOW-1
+        # iterations while the window is still warming up.  Setting None makes
+        # the downstream VWAP gate transparent (ask_vwap is None → any
+        # micro_price passes), mirroring the live system's warm-up behaviour.
+        #
+        # VWAP formula (bid side shown; ask side is identical):
+        #   bid_vwap = Σ(best_bid[t] × vol_bid[t]) / Σ(vol_bid[t])
+        #
+        # Heavier candles (larger vol_bid) pull the average more, giving a
+        # momentum-aware reference price: if recent large volume traded at
+        # high bid prices, bid_vwap is elevated, tightening the SELL gate.
         if len(vwap_deque) >= VWAP_WINDOW:
             bid_prices = np.array([s["best_bid"] for s in vwap_deque])
             bid_vols = np.array([s["vol_bid"] for s in vwap_deque])
@@ -151,11 +177,12 @@ def run_signals() -> pd.DataFrame:
             bid_vwap = volume_weighted_average_price(bid_prices, bid_vols)
             ask_vwap = volume_weighted_average_price(ask_prices, ask_vols)
         else:
+            # Window still filling — filter is transparent for both sides.
             bid_vwap = None
             ask_vwap = None
 
-        # ── Flow B: HMM regime update ──────────────────────────────────
-        rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
+        # Flow B: HMM regime update
+        rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS: i]
         if hist_iteration % REFIT_EVERY == 0:
             rd.select_hmm_model()  # full BIC re-fit
         else:
@@ -163,22 +190,34 @@ def run_signals() -> pd.DataFrame:
         rd.assign_regime_labels()
         regime = rd.regime_label
 
-        # ── Combined gate (mirrors live low_latency_analysis) ──────────
+        # Fill price anchor and spread for Step-4 P&L.
+        # half_spread = (high - low) / 2 is the same quantity computed in
+        # synthetic_book.py Step 1.  It represents the natural taker cost:
+        #   BUY  fill = close + half_spread  (≡ synthetic_best_ask)
+        #   SELL fill = close - half_spread  (≡ synthetic_best_bid)
+        close_price = float(row["close"])
+        half_spread = (float(row["high"]) - float(row["low"])) / 2.0
+
+        # Combined gate (mirrors live low_latency_analysis)
         signal = 0
         best_buy_micro = None
         best_sell_micro = None
+        buy_qty = None  # aq at the best-buy level  (ask-side qty we consume)
+        sell_qty = None  # bq at the best-sell level (bid-side qty we consume)
 
         if best_buy:
             micro_price = best_buy[5]  # index 5 = micro_price
             best_buy_micro = micro_price
+            buy_qty = float(best_buy[7])  # index 7 = aq
             regime_ok = regime not in ("trending_down", "high_volatility")
             vwap_ok = ask_vwap is None or micro_price > ask_vwap
             if regime_ok and vwap_ok:
                 signal = 1
 
         if best_sell and signal == 0:
-            micro_price = best_sell[5]
+            micro_price = best_sell[5]  # index 5 = micro_price
             best_sell_micro = micro_price
+            sell_qty = float(best_sell[6])  # index 6 = bq
             regime_ok = regime not in ("trending_up", "high_volatility")
             vwap_ok = bid_vwap is None or micro_price < bid_vwap
             if regime_ok and vwap_ok:
@@ -186,13 +225,17 @@ def run_signals() -> pd.DataFrame:
 
         records.append(
             {
-                "timestamp": timestamp,
-                "signal": signal,
-                "regime": regime,
-                "bid_vwap": bid_vwap,
-                "ask_vwap": ask_vwap,
-                "best_buy_micro": best_buy_micro,
+                "timestamp":       timestamp,
+                "close":           close_price,    # candle close — VWAP anchor
+                "half_spread":     half_spread,    # (high-low)/2 — taker fill cost
+                "signal":          signal,
+                "regime":          regime,
+                "bid_vwap":        bid_vwap,
+                "ask_vwap":        ask_vwap,
+                "best_buy_micro":  best_buy_micro,
                 "best_sell_micro": best_sell_micro,
+                "buy_qty":         buy_qty,        # aq from best_buy candidate
+                "sell_qty":        sell_qty,       # bq from best_sell candidate
             }
         )
 
@@ -205,8 +248,3 @@ def run_signals() -> pd.DataFrame:
         (result["signal"] == 0).sum(),
     )
     return result
-
-
-if __name__ == "__main__":
-    df = run_signals()
-    print(df.head(20))

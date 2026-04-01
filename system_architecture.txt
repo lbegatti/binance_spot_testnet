@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-03-30)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-02)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -34,6 +34,8 @@ FILES
     data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT)
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
+    pnl.py                            — P&L simulation: balance guard, half_spread fill, equity curve, Step 5 metrics
+    runner.py                         — Top-level backtest runner: chains all modules, prints formatted report
 
 ─────────────────────────────────────────────────────────────────────────────
 1. CONFIGURATION  (config_parameters.py)
@@ -70,6 +72,12 @@ FILES
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
     VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
     REFIT_EVERY          = 5      # HMM_REFIT_INTERVAL // HIST_INTERVAL — backtest refit cadence
+    BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 30-day run)
+    # Backtesting P&L (Step 4)
+    BACKTEST_INITIAL_CAPITAL = 10_000.0  # starting USDT balance for the P&L simulation
+    BACKTEST_INITIAL_BTC     = 0.0       # starting BTC balance (set > 0 to simulate existing position)
+    BACKTEST_FEE_RATE        = 0.001     # 0.10 % taker fee per side (Binance Spot standard)
+    BACKTEST_SLIPPAGE        = 0.0       # extra slippage on top of half_spread fill cost (spread already embedded)
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -98,9 +106,9 @@ FILES
                                     Falls back to REST snapshot if the testnet
                                     WS does not support session.logon.
                                     Only the free (non-locked) quantity is stored.
-    thread_lock          : Lock   — serialises local_book and history_order_book
+    thread_lock          : Lock   — serializes local_book and history_order_book
                                     (MessageHandler writes; AnalysisEngine reads)
-    thread_balance_lock  : Lock   — serialises balance_status independently of
+    thread_balance_lock  : Lock   — serializes balance_status independently of
                                     thread_lock to avoid unnecessary contention
 
 ─────────────────────────────────────────────────────────────────────────────
@@ -149,10 +157,10 @@ FILES
   Checks stop_event on every iteration; exits gracefully when it is set.
 
   Owns five private attributes for cross-thread sharing:
-    _vwap_lock      : Lock          — serialises _bid_vwap and _ask_vwap
+    _vwap_lock      : Lock          — serializes _bid_vwap and _ask_vwap
     _bid_vwap       : float | None  — latest bid VWAP from historical_analysis
     _ask_vwap       : float | None  — latest ask VWAP from historical_analysis
-    _regime_lock    : Lock          — serialises regime_director.regime_label
+    _regime_lock    : Lock          — serializes regime_director.regime_label
     regime_director : RegimeDirector — injected pre-fitted HMM detector;
                                        updated every HIST_INTERVAL seconds via
                                        a two-speed scheme: cheap Viterbi prediction
@@ -219,7 +227,7 @@ FILES
                                                            obi_proxy, trade_density.
           If iteration % refit_every == 0 (every 5 min / 300 s):
             regime_director.select_hmm_model()           — fits GaussianHMM for n=2..4,
-                                                           selects best BIC model, predicts
+                                                           selects the best BIC model, predicts
                                                            state sequence, sets current_regime.
           Otherwise (cheap path):
             regime_director.predict_current_regime()     — single Viterbi pass on the
@@ -478,7 +486,8 @@ FILES
                                     per candle, applies the combined gate
                                     (regime + VWAP), and returns a time-indexed
                                     DataFrame with signal (+1/−1/0), regime
-                                    label, bid/ask VWAP, and micro-price details.
+                                    label, bid/ask VWAP, micro-price, half_spread,
+                                    and buy_qty/sell_qty details for P&L sizing.
                                     Uses _add_hmm_features() to pre-compute HMM
                                     features on the full kline DataFrame without
                                     an API call.  HMM warm-up on first
@@ -487,6 +496,35 @@ FILES
                                     (full BIC every REFIT_EVERY iterations,
                                     cheap Viterbi otherwise).
 
+  backtest/pnl.py                — simulate_pnl(): walks the signal DataFrame
+                                    candle by candle, executing BUY/SELL trades
+                                    with a balance guard identical to the live
+                                    OrderExecutor.  Fill price per trade:
+                                      BUY  = close + half_spread  (synthetic ask)
+                                      SELL = close - half_spread  (synthetic bid)
+                                    plus optional BACKTEST_SLIPPAGE on top.
+                                    Marks the portfolio to market at every candle
+                                    (including HOLDs) to produce a continuous
+                                    equity curve.  Outputs: trades_df, equity_df,
+                                    and a stats dict with Step 5 metrics (total
+                                    return, win rate, max drawdown, Sharpe √365,
+                                    Sortino, profit factor, avg holding period,
+                                    regime/VWAP filter hit rates).
+                                    _pair_round_trips(): FIFO BUY→SELL matching;
+                                    open positions closed at last candle mark-to-
+                                    market.
+
+  backtest/runner.py             — run_backtest(): top-level orchestrator.
+                                    Chains run_signals() → simulate_pnl() →
+                                    _print_report().  Prints a formatted console
+                                    report: SESSION info (initial USDT + BTC,
+                                    fee, slippage), SIGNALS breakdown, P&L
+                                    SUMMARY, RISK METRICS, TRADE LOG PREVIEW.
+                                    Optionally saves timestamped trades_*.csv
+                                    and equity_*.csv to backtest/results/.
+                                    Entry point: python -m backtest.runner.
+
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
-                         pnl.py / runner.py / visualization.py — pending.
+                         pnl.py ✅, runner.py ✅,
+                         visualization.py — pending.
 """

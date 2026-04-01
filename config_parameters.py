@@ -16,13 +16,33 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 # Backtesting Parameters and Features
 # ---------------------------------------------------------------------------
+# TODO maybe 30 days is too much for crypto? maybe 10 days?
+# 30 *calendar* days (including weekends) — crypto trades 24/7 so there are
+# no weekend gaps in Binance kline data.  At 1 m resolution this yields
+# 30 × 24 × 60 = 43 200 rows.  Contrast with equity markets where "30 days"
+# would mean ~30 working days (≈ 6 calendar weeks) with weekend gaps.
 BACKTEST_LOOKBACK = "30 days ago UTC"
+BACKTEST_MAX_ROWS: int | None = 500
 VOLUME_DECAY_FACTOR = (
     0.80  # each lever down the order book retains 80% of the previous level's volume
 )
 HMM_LOOKBACK_ROWS = 120  # 2 h at 1 m — matches HMM_LOOKBACK in the live system
 VWAP_WINDOW = 5  # 5 candles = 5 min at 1 m — matches live VWAP window
 REFIT_EVERY = 5  # HMM_REFIT_INTERVAL // HIST_INTERVAL = 300 // 60
+
+# ---------------------------------------------------------------------------
+# Backtesting P&L Parameters  (Step 4 — backtest/pnl.py)
+# ---------------------------------------------------------------------------
+BACKTEST_INITIAL_CAPITAL = 10_000.0  # starting USDT balance for the simulation
+BACKTEST_INITIAL_BTC     = 0.0       # starting BTC balance for the simulation
+BACKTEST_FEE_RATE = 0.001            # 0.10 % taker fee per side (Binance Spot standard)
+# Spread cost is already embedded in the fill price via half_spread:
+#   BUY  fill = close + half_spread   (you pay the synthetic ask)
+#   SELL fill = close - half_spread   (you receive the synthetic bid)
+# BACKTEST_SLIPPAGE is an *additional* fractional cost on top of the spread,
+# modelling queue position / latency effects beyond the raw bid-ask crossing.
+# Set to 0.0 to include only the spread cost (recommended default).
+BACKTEST_SLIPPAGE = 0.0
 
 # ---------------------------------------------------------------------------
 # HMM Parameters and Features

@@ -1,7 +1,9 @@
 # Backtesting Plan — Binance Spot Testnet Strategy
 
-> **Status:** Not yet implemented.  This document captures the design intent
-> agreed during development.  See the TODO section in `README.md` for context.
+> **Status:** Steps 1–5 implemented (``data.py``, ``synthetic_book.py``,
+> ``signals.py``, ``pnl.py``, ``runner.py``).  Steps 6–7 (parameter grid,
+> visualisation) are pending.  See the Implementation Roadmap at the bottom
+> for a per-module progress tracker.
 
 ---
 
@@ -332,10 +334,16 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
 ## Step 4 — Simulated P&L
 
 ### Fill assumption
-- Fill price = `close` of the signal candle (optimistic; real fills depend on
-  order placement latency and queue position which cannot be modelled from
-  klines).
-- Alternative conservative assumption: fill at the next candle's `open`.
+- Fill prices are derived from ``half_spread = (high − low) / 2``, the same
+  quantity used in Step 2c to place ``synthetic_best_bid`` and
+  ``synthetic_best_ask``.  This ensures fill prices are **consistent with
+  the synthetic order book** the signals were generated from:
+  ```
+  BUY  fill = close + half_spread   (≡ synthetic_best_ask — you cross the spread)
+  SELL fill = close - half_spread   (≡ synthetic_best_bid — you receive the bid)
+  ```
+- An optional extra ``BACKTEST_SLIPPAGE`` fraction (default ``0.0``) can be
+  added on top to model queue / latency effects beyond the raw bid-ask crossing.
 
 ### Trade sizing
 - The candidate tuple from the production pipeline contains `bq` (bid quantity)
@@ -370,7 +378,7 @@ PnL(trade) = exit_price - entry_price - costs   (for BUY)
 | **Win rate** | `n_profitable_trades / n_total_trades` |
 | **Average trade PnL** | Mean PnL per trade |
 | **Max drawdown** | Largest peak-to-trough equity decline |
-| **Sharpe ratio** | `mean(daily_return) / std(daily_return) × √252` |
+| **Sharpe ratio** | `mean(daily_return) / std(daily_return) × √365` (crypto trades 24/7 — no weekend gaps, so √365 rather than the equity-market convention of √252) |
 | **Sortino ratio** | Like Sharpe but penalises only downside volatility |
 | **Profit factor** | `gross_profit / gross_loss` |
 | **Avg holding period** | Mean number of candles between entry and exit |
@@ -422,8 +430,9 @@ catastrophically) as parameters shift away from their tuned values.
    the depth profile is artificial (exponential decay, uniform asymmetry).
    Real order books have irregular, level-specific imbalances that the
    synthetic reconstruction cannot capture.
-2. **Fill price** — using close or next open overstates fill quality for a
-   LIMIT GTC strategy; real fills depend on queue position.
+2. **Fill price** — using `close ± half_spread` (synthetic bid/ask) is more
+   realistic than a naive `close` fill, but still overstates fill quality for
+   a LIMIT GTC strategy; real fills depend on queue position and latency.
 3. **No partial fills** — the backtest assumes full fill on every signal.
 4. **No latency** — the 100 ms WS delay and the 1-second analysis cadence are
    not modelled in a candle-level simulation.
@@ -458,11 +467,17 @@ concrete file in `backtest/`.
   filter (Flow C), and returns a time-indexed signal DataFrame (`+1` BUY,
   `−1` SELL, `0` flat) plus regime, VWAP, and micro-price details.
   *(Implemented.)*
-- ⬜ **Step 4 — `backtest/pnl.py`** — Converts the signal Series into
-  simulated trades (using `bq`/`aq` quantities and the balance guard) and
-  computes the performance metrics listed in Step 5.
-- ⬜ **Step 5 — `backtest/runner.py`** — Top-level script (or notebook) that
-  chains all four modules and prints a summary report.
+- ✅ **Step 4 — `backtest/pnl.py`** — Converts the signal Series into
+  simulated trades (using ``bq``/``aq`` quantities and the balance guard)
+  and computes the Step 5 performance metrics: total return, win rate,
+  max drawdown, Sharpe, Sortino, profit factor, average holding period,
+  and regime / VWAP filter hit rates.  *(Implemented.)*
+- ✅ **Step 5 — `backtest/runner.py`** — Top-level script that chains all
+  four modules and prints a formatted summary report (session info, signal
+  breakdown, P&L summary, risk metrics, trade log preview).  Optionally
+  saves timestamped ``trades_*.csv`` and ``equity_*.csv`` to
+  ``backtest/results/``.  Run with ``python -m backtest.runner``.
+  *(Implemented.)*
 - ⬜ **Step 6 — Parameter grid** *(optional)* — Wraps the runner in a loop
   over the sensitivity grid described in Step 7.
 - ⬜ **Step 7 — `backtest/visualization.py`** — Plots and charts to inspect
@@ -483,5 +498,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-04-01*
+*Document last updated: 2026-04-02*
 

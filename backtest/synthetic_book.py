@@ -124,8 +124,18 @@ def build_synthetic_book(row) -> dict:
     # The factor of 2 preserves total volume per level after the split
     # because: 2*buy_ratio + 2*sell_ratio = 2*(buy_ratio + sell_ratio) = 2.
     # Falls back to a neutral 50/50 split if volume is zero.
+    #
+    # _MIN_RATIO floor: real kline data can have taker_buy_base_vol == 0
+    # (a purely sell-driven candle) or == volume (purely buy-driven).
+    # Either extreme collapses the corresponding side of the book to zero
+    # volume, which propagates NaN into the downstream VWAP calculation
+    # (numpy returns nan when summing an all-zero volume array).
+    # Clamping to [_MIN_RATIO, 1 - _MIN_RATIO] guarantees at least 0.1%
+    # liquidity on both sides while preserving the directional OBI signal.
     # ------------------------------------------------------------------
-    buy_ratio = (taker_buy_base_vol / volume) if volume > 0 else 0.5
+    _MIN_RATIO = 1e-3
+    raw_ratio = (taker_buy_base_vol / volume) if volume > 0 else 0.5
+    buy_ratio = max(_MIN_RATIO, min(1.0 - _MIN_RATIO, raw_ratio))
     sell_ratio = 1.0 - buy_ratio
 
     bids = {p: f"{float(q) * 2.0 * buy_ratio:.8f}" for p, q in bids.items()}
