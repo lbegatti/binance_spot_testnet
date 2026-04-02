@@ -14,7 +14,13 @@ from strategy.book_utils import (
 from strategy.indicators import volume_weighted_average_price
 from strategy.regime_director import RegimeDirector
 
-from config_parameters import HMM_LOOKBACK_ROWS, VWAP_WINDOW, REFIT_EVERY, BACKTEST_MAX_ROWS
+from config_parameters import (
+    HMM_LOOKBACK_ROWS,
+    VWAP_WINDOW,
+    REFIT_EVERY,
+    BACKTEST_MAX_ROWS,
+    HMM_MIN_CONFIDENCE,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -47,8 +53,8 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
         "close"
     ]
     klines_df["obi_proxy"] = (
-                                     klines_df["taker_buy_base_vol"] / klines_df["volume"]
-                             ) * 2 - 1
+        klines_df["taker_buy_base_vol"] / klines_df["volume"]
+    ) * 2 - 1
     klines_df["trade_density"] = klines_df["num_trades"] / klines_df["volume"]
     return klines_df.dropna()
 
@@ -77,12 +83,14 @@ def run_signals() -> pd.DataFrame:
         that (filter is transparent, same as live).
 
     **Combined gate** (mirrors the live ``low_latency_analysis`` decision):
-        * ``signal = +1`` (BUY)  when ``best_buy`` exists **and** regime ∉
-          {``trending_down``, ``high_volatility``} **and** (``ask_vwap`` is
-          ``None`` or ``micro_price > ask_vwap``).
-        * ``signal = -1`` (SELL) when ``best_sell`` exists **and** regime ∉
-          {``trending_up``, ``high_volatility``} **and** (``bid_vwap`` is
-          ``None`` or ``micro_price < bid_vwap``).
+        * ``signal = +1`` (BUY)  when ``best_buy`` exists **and**
+          ``regime_confidence ≥ HMM_MIN_CONFIDENCE`` (model is certain enough)
+          **and** regime ∉ {``trending_down``, ``high_volatility``}
+          **and** (``ask_vwap`` is ``None`` or ``micro_price > ask_vwap``).
+        * ``signal = -1`` (SELL) when ``best_sell`` exists **and**
+          ``regime_confidence ≥ HMM_MIN_CONFIDENCE``
+          **and** regime ∉ {``trending_up``, ``high_volatility``}
+          **and** (``bid_vwap`` is ``None`` or ``micro_price < bid_vwap``).
         * ``signal = 0``  otherwise (no trade).
 
     Returns:
@@ -92,7 +100,9 @@ def run_signals() -> pd.DataFrame:
             ``half_spread`` (``(high-low)/2`` — taker fill cost; BUY fills at
             ``close + half_spread``, SELL fills at ``close - half_spread``),
             ``signal`` (+1 BUY / -1 SELL / 0 HOLD),
-            ``regime``, ``bid_vwap``, ``ask_vwap``,
+            ``regime``, ``regime_confidence`` (posterior probability of the
+            predicted regime from ``predict_proba()``, ``None`` before the
+            first fit), ``bid_vwap``, ``ask_vwap``,
             ``best_buy_micro``, ``best_sell_micro``,
             ``buy_qty`` (ask-side quantity at the best-buy level),
             ``sell_qty`` (bid-side quantity at the best-sell level).
@@ -102,18 +112,37 @@ def run_signals() -> pd.DataFrame:
     klines = fetch_klines()
     features_df = _add_hmm_features(klines)
     if BACKTEST_MAX_ROWS is not None:
-        features_df = features_df.iloc[:HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS]
-        logging.info("Debug mode: capped at %d rows (%d replay candles).", len(features_df), BACKTEST_MAX_ROWS)
+        features_df = features_df.iloc[: HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS]
+        logging.info(
+            "Debug mode: capped at %d rows (%d replay candles).",
+            len(features_df),
+            BACKTEST_MAX_ROWS,
+        )
     logging.info(
         "Fetched %d klines; %d rows after HMM features.", len(klines), len(features_df)
     )
 
-    # 2. Initial HMM fit on the warm-up window (first 120 rows)
+    # 2. Initial HMM fit on the warm-up window (first HMM_LOOKBACK_ROWS rows)
+    # NOTE: the train/predict split and StandardScaler are applied INSIDE
+    # select_hmm_model() — no explicit split is needed here.
+    # Concretely, select_hmm_model() does:
+    #   train_features = klines_df[:HMM_TRAIN_ROWS]   (first 80 rows — in-sample)
+    #   scaler.fit_transform(train_features)            (scale on training rows only)
+    #   scaler.transform(klines_df)                     (apply same scale to all 120 rows)
+    #   model.fit(train_scaled)                         (EM on 80 rows)
+    #   model.predict(full_scaled)                      (Viterbi on all 120 rows)
+    #   model.predict_proba(full_scaled)                (confidence on all 120 rows)
+    # current_regime / regime_confidence reflect the LAST (most recent) row,
+    # which was genuinely out-of-sample during training.
     rd = RegimeDirector()
     rd.klines_df = features_df.iloc[:HMM_LOOKBACK_ROWS]
     rd.select_hmm_model()
     rd.assign_regime_labels()
-    logging.info("Initial HMM fit complete — regime: '%s'", rd.regime_label)
+    logging.info(
+        "Initial HMM fit complete — regime: '%s' (confidence: %.2f)",
+        rd.regime_label,
+        rd.regime_confidence or 0.0,
+    )
 
     # 3. Rolling VWAP window
     vwap_deque: deque = deque(maxlen=VWAP_WINDOW)
@@ -182,13 +211,21 @@ def run_signals() -> pd.DataFrame:
             ask_vwap = None
 
         # Flow B: HMM regime update
-        rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS: i]
+        # A rolling window of HMM_LOOKBACK_ROWS (120) candles is assigned to
+        # rd.klines_df on every iteration.  The train/predict split and
+        # StandardScaler are handled INSIDE select_hmm_model() /
+        # predict_current_regime() — see regime_director.py for details.
+        # In brief: oldest HMM_TRAIN_ROWS (80) rows → fit; all 120 → predict.
+        rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
         if hist_iteration % REFIT_EVERY == 0:
             rd.select_hmm_model()  # full BIC re-fit
         else:
             rd.predict_current_regime()  # cheap Viterbi pass
         rd.assign_regime_labels()
         regime = rd.regime_label
+        # Posterior probability for the predicted regime — same value that
+        # low_latency_analysis reads from rd.regime_confidence under _regime_lock.
+        regime_confidence = rd.regime_confidence
 
         # Fill price anchor and spread for Step-4 P&L.
         # half_spread = (high - low) / 2 is the same quantity computed in
@@ -198,7 +235,9 @@ def run_signals() -> pd.DataFrame:
         close_price = float(row["close"])
         half_spread = (float(row["high"]) - float(row["low"])) / 2.0
 
-        # Combined gate (mirrors live low_latency_analysis)
+        # Always capture raw candidate details for reporting (needed by
+        # _compute_stats in pnl.py to count raw candidates and blocked rates
+        # independently of which gates fired).
         signal = 0
         best_buy_micro = None
         best_sell_micro = None
@@ -206,36 +245,50 @@ def run_signals() -> pd.DataFrame:
         sell_qty = None  # bq at the best-sell level (bid-side qty we consume)
 
         if best_buy:
-            micro_price = best_buy[5]  # index 5 = micro_price
-            best_buy_micro = micro_price
-            buy_qty = float(best_buy[7])  # index 7 = aq
-            regime_ok = regime not in ("trending_down", "high_volatility")
-            vwap_ok = ask_vwap is None or micro_price > ask_vwap
-            if regime_ok and vwap_ok:
-                signal = 1
+            best_buy_micro = float(best_buy[5])  # micro_price
+            buy_qty = float(best_buy[7])  # aq
+        if best_sell:
+            best_sell_micro = float(best_sell[5])  # micro_price
+            sell_qty = float(best_sell[6])  # bq
 
-        if best_sell and signal == 0:
-            micro_price = best_sell[5]  # index 5 = micro_price
-            best_sell_micro = micro_price
-            sell_qty = float(best_sell[6])  # index 6 = bq
-            regime_ok = regime not in ("trending_up", "high_volatility")
-            vwap_ok = bid_vwap is None or micro_price < bid_vwap
-            if regime_ok and vwap_ok:
-                signal = -1
+        # --- confidence gate (mirrors low_latency_analysis in analysis.py) ---
+        # predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE means the
+        # model cannot distinguish the current state clearly enough to justify
+        # an order.  Skip both sides — ambiguous HMM signal treated as flat.
+        # While regime_confidence is None (warm-up / before first fit) the
+        # gate is transparent, matching the live system's behaviour.
+        confidence_ok = (
+            regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
+        )
+
+        # Combined gate (mirrors live low_latency_analysis)
+        if confidence_ok:
+            if best_buy:
+                regime_ok = regime not in ("trending_down", "high_volatility")
+                vwap_ok = ask_vwap is None or best_buy_micro > ask_vwap
+                if regime_ok and vwap_ok:
+                    signal = 1
+
+            if best_sell and signal == 0:
+                regime_ok = regime not in ("trending_up", "high_volatility")
+                vwap_ok = bid_vwap is None or best_sell_micro < bid_vwap
+                if regime_ok and vwap_ok:
+                    signal = -1
 
         records.append(
             {
-                "timestamp":       timestamp,
-                "close":           close_price,    # candle close — VWAP anchor
-                "half_spread":     half_spread,    # (high-low)/2 — taker fill cost
-                "signal":          signal,
-                "regime":          regime,
-                "bid_vwap":        bid_vwap,
-                "ask_vwap":        ask_vwap,
-                "best_buy_micro":  best_buy_micro,
+                "timestamp": timestamp,
+                "close": close_price,  # candle close — VWAP anchor
+                "half_spread": half_spread,  # (high-low)/2 — taker fill cost
+                "signal": signal,
+                "regime": regime,
+                "regime_confidence": regime_confidence,  # posterior prob of winning state
+                "bid_vwap": bid_vwap,
+                "ask_vwap": ask_vwap,
+                "best_buy_micro": best_buy_micro,
                 "best_sell_micro": best_sell_micro,
-                "buy_qty":         buy_qty,        # aq from best_buy candidate
-                "sell_qty":        sell_qty,       # bq from best_sell candidate
+                "buy_qty": buy_qty,  # aq from best_buy candidate
+                "sell_qty": sell_qty,  # bq from best_sell candidate
             }
         )
 

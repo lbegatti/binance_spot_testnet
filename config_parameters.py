@@ -33,23 +33,23 @@ REFIT_EVERY = 5  # HMM_REFIT_INTERVAL // HIST_INTERVAL = 300 // 60
 # ---------------------------------------------------------------------------
 # Backtesting P&L Parameters  (Step 4 — backtest/pnl.py)
 # ---------------------------------------------------------------------------
-BACKTEST_INITIAL_CAPITAL = 10_000.0  # starting USDT balance for the simulation
-BACKTEST_INITIAL_BTC     = 0.0       # starting BTC balance for the simulation
-BACKTEST_FEE_RATE = 0.001            # 0.10 % taker fee per side (Binance Spot standard)
-# Spread cost is already embedded in the fill price via half_spread:
+# TOTAL AMOUNT = USD + BTC = 10,000$ (assuming BTC is 68,000)
+BACKTEST_INITIAL_CAPITAL = 5000.0  # starting USDT balance for the simulation
+BACKTEST_INITIAL_BTC = 0.0735  # starting BTC balance for the simulation
+BACKTEST_FEE_RATE = 0.001  # 0.10 % taker fee per side (Binance Spot standard)
+# Slippage is NOT a fixed constant — it equals half the candle range:
+#   half_spread = (high - low) / 2
+# This quantity is computed per-candle in synthetic_book.py and stored in
+# the signals DataFrame.  Fill prices are then:
 #   BUY  fill = close + half_spread   (you pay the synthetic ask)
 #   SELL fill = close - half_spread   (you receive the synthetic bid)
-# BACKTEST_SLIPPAGE is an *additional* fractional cost on top of the spread,
-# modelling queue position / latency effects beyond the raw bid-ask crossing.
-# Set to 0.0 to include only the spread cost (recommended default).
-BACKTEST_SLIPPAGE = 0.0
 
 # ---------------------------------------------------------------------------
 # HMM Parameters and Features
 # ---------------------------------------------------------------------------
 HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
 HMM_N_ITERATIONS = 1000
-HMM_MAX_REGIMES = 4
+HMM_MAX_REGIMES = len(HMM_FEATURE_COLS) - 1
 HMM_RANDOM_STATE = 46
 HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
 HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
@@ -60,6 +60,20 @@ HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC s
 # 1e-3 is a safe default for normalised financial features (return,
 # volatility, obi_proxy, trade_density all sit in the [-1, +1] range).
 HMM_MIN_COVAR = 1e-3
+# Train/predict split for select_hmm_model().
+# The HMM is fitted on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
+# "in-sample" data).  Regime prediction (Viterbi) then runs on the FULL
+# window, so the most recent candles are genuinely out-of-sample for the model.
+# Rule of thumb: ~2/3 of the total rows.  At HMM_LOOKBACK="2 hours ago UTC"
+# this gives 80 training rows and ~40 out-of-sample rows.
+HMM_TRAIN_ROWS = 80
+# Minimum posterior probability the model must assign to the predicted regime
+# before an order is allowed.  When predict_proba()[-1][current_regime] < this
+# threshold the regime is treated as "uncertain" and the iteration is skipped.
+# 0.65 means at least 65 % probability mass on the winning state — a coin-flip
+# (0.50 for 2 states) would always be rejected, a clear signal (0.80+) passes
+# comfortably.  Raise to 0.75–0.80 for more conservative gating.
+HMM_MIN_CONFIDENCE = 0.70
 # Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
 # inside historical_analysis().  Between re-fits, only a cheap Viterbi
 # prediction (predict_current_regime()) is run on the latest kline features.

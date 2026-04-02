@@ -11,6 +11,7 @@ from config_parameters import (
     CCY,
     CRYPTOCCY,
     HMM_REFIT_INTERVAL,
+    HMM_MIN_CONFIDENCE,
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import volume_weighted_average_price
@@ -192,13 +193,20 @@ class AnalysisEngine:
            - SELL: skip if ``bid_vwap`` is set **and** ``micro_price ≥ bid_vwap``.
            Both are ``None`` for the first ~1 min; filter is transparent until
            ``historical_analysis`` publishes the first VWAP.
-        7. **Regime filter** (HMM gate) — reads
+        7. **Regime confidence gate** — reads ``regime_director.regime_confidence``
+           (posterior probability from ``predict_proba()``) under ``_regime_lock``:
+           - Skip **both** sides if ``regime_confidence < HMM_MIN_CONFIDENCE``
+             (default 0.65).  A sub-threshold score means the model cannot
+             distinguish the current state clearly enough to justify an order.
+           - When ``regime_confidence`` is ``None`` (before the first
+             ``historical_analysis`` run) the gate is transparent.
+        8. **Regime direction filter** (HMM gate) — reads
            ``regime_director.regime_label`` under ``_regime_lock``:
            - BUY:  skip if regime is ``"trending_down"`` or ``"high_volatility"``.
            - SELL: skip if regime is ``"trending_up"``  or ``"high_volatility"``.
            ``None`` label (before first ``historical_analysis`` run) is treated
            as transparent — all orders are allowed through.
-        8. **Order execution** — delegates to
+        9. **Order execution** — delegates to
            ``OrderExecutor.execute("BUY"|"SELL", opportunity)``.
 
         Exits cleanly when ``stop_event`` is set, logging how many iterations
@@ -242,6 +250,23 @@ class AnalysisEngine:
                 current_regime = (
                     self.regime_director.regime_label
                 )  # reads the label assigned in the historical_analysis thread.
+                regime_confidence = self.regime_director.regime_confidence
+
+            # --- regime confidence gate ---
+            # predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE means
+            # the model is not sure enough about the current state (e.g. 55 %
+            # trending_up vs 45 % neutral).  Skip both sides to avoid trading
+            # on a coin-flip signal.
+            if regime_confidence is not None and regime_confidence < HMM_MIN_CONFIDENCE:
+                logging.info(
+                    "HFT #%d — skipped: regime '%s' confidence %.2f < %.2f",
+                    iteration,
+                    current_regime,
+                    regime_confidence,
+                    HMM_MIN_CONFIDENCE,
+                )
+                self.stop_event.wait(HFT_INTERVAL)
+                continue
 
             # After the first historical_analysis iteration (~1 min), _bid_vwap
             # and _ask_vwap are populated.  They act as a confirmation filter:

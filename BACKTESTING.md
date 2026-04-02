@@ -265,17 +265,26 @@ RegimeDirector.predict_current_regime()  ← Viterbi only on other candles
         ▼
 RegimeDirector.assign_regime_labels()
         │
-        ▼
-regime_label(t)     ← one string: "trending_up" / "trending_down" /
-                                   "high_volatility" / "neutral"
+        ├─► regime_label(t)         ← one string: "trending_up" / "trending_down" /
+        │                                          "high_volatility" / "neutral"
+        │
+        └─► regime_confidence(t)    ← float in [0, 1]: posterior probability of
+                                       regime_label from predict_proba()[-1].
+                                       None before the first fit (warm-up).
 ```
 
 **Input:** 120 × 4 feature matrix (120 kline rows, 4 scalar features each).
-**Output:** one string label per candle.
+**Output:** one string label + one confidence float per candle.
 
-Gate applied to Flow A output:
-- BUY candidate suppressed if `regime_label ∈ {"trending_down", "high_volatility"}`
-- SELL candidate suppressed if `regime_label ∈ {"trending_up", "high_volatility"}`
+Two gates are applied sequentially to Flow A output:
+
+1. **Confidence gate** (applied first):
+   - Both BUY and SELL are suppressed if `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.65).
+   - When `regime_confidence` is `None` (warm-up) the gate is transparent.
+
+2. **Direction gate** (applied only to candidates that passed the confidence gate):
+   - BUY candidate suppressed if `regime_label ∈ {"trending_down", "high_volatility"}`
+   - SELL candidate suppressed if `regime_label ∈ {"trending_up", "high_volatility"}`
 
 ---
 
@@ -316,18 +325,26 @@ All three flows converge into a single decision per candle:
 
 ```
 Flow A: candidate tuple (or None)
-Flow B: regime_label
+Flow B: regime_label, regime_confidence
 Flow C: bid_vwap, ask_vwap
         │
         ▼
 signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
+                        AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
                         AND regime_label not in {"trending_down", "high_volatility"}
-                        AND micro_price > ask_vwap
+                        AND micro_price > ask_vwap (or ask_vwap is None)
           = −1 (SELL)  if Flow A produced a SELL candidate
+                        AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
                         AND regime_label not in {"trending_up", "high_volatility"}
-                        AND micro_price < bid_vwap
+                        AND micro_price < bid_vwap (or bid_vwap is None)
           =  0 (flat)  otherwise
 ```
+
+> The **confidence gate** is applied **before** the direction gate.  If the
+> model's posterior probability for the predicted regime is below
+> `HMM_MIN_CONFIDENCE`, both sides are skipped regardless of regime label or
+> VWAP — identical to the behaviour of `low_latency_analysis()` in the live
+> system.
 
 ---
 
@@ -342,8 +359,10 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
   BUY  fill = close + half_spread   (≡ synthetic_best_ask — you cross the spread)
   SELL fill = close - half_spread   (≡ synthetic_best_bid — you receive the bid)
   ```
-- An optional extra ``BACKTEST_SLIPPAGE`` fraction (default ``0.0``) can be
-  added on top to model queue / latency effects beyond the raw bid-ask crossing.
+- `half_spread = (high − low) / 2` **is** the slippage — it is computed
+  per-candle in `synthetic_book.py` and stored in the signal DataFrame.
+  No separate fixed `BACKTEST_SLIPPAGE` constant is used; the spread cost
+  is already fully embedded in the fill price.
 
 ### Trade sizing
 - The candidate tuple from the production pipeline contains `bq` (bid quantity)
@@ -360,13 +379,46 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
   a real backtest must account for them).
 - Slippage estimate: add half the high-low spread as a conservative proxy.
 
-### P&L per trade
+### P&L per trade and round-trip pairing
+
+A **round trip** is one complete BUY → SELL cycle and is the unit used to
+compute win rate, profit factor, and average holding time.  Round-trip pairing
+is handled by `_pair_round_trips()` in `backtest/pnl.py` **after** the
+simulation loop has already settled all trades.  This is purely an accounting
+step — every trade in `trades_df` is already executed; the pairing cursor
+(`open_buys` deque) is not a live order tracker.
+
+The pairing algorithm uses an **exhaustive FIFO `collections.deque`** to
+support three real-world multi-leg entry strategies:
+
+| Strategy | Behaviour |
+|---|---|
+| **Scaling in** | Multiple BUYs at descending prices → one SELL closes the oldest leg first |
+| **Layering** | BUYs placed at regular intervals (grid-style) → each SELL pops the front of the queue |
+| **Pyramiding** | Adding to a winning position → FIFO ensures the cheapest entry is closed first |
+
+Two sub-cases are handled within each SELL iteration:
+
+- **Partial close** — SELL qty < oldest leg qty: `matched_qty = sell_qty`,
+  the leftover qty is pushed back to the **front** of the deque via
+  `appendleft()` so the next SELL continues closing the same leg.
+- **Over-sell** — SELL qty > oldest leg qty: the loop consumes as many legs
+  as the remaining SELL qty allows, generating one round-trip record per
+  consumed leg.
+
+**Orphan SELL** (SELL with no open BUY leg — only possible when
+`initial_btc > 0`): the trade is correctly reflected in the equity curve and
+balance, but is excluded from round-trip stats.  A clearly visible WARNING box
+is printed to the console.
+
 ```
-BUY trade:   exit at next SELL signal or at session close
-SELL trade:  exit at next BUY signal  or at session close
-PnL(trade) = exit_price - entry_price - costs   (for BUY)
-           = entry_price - exit_price - costs   (for SELL)
+BUY  P&L entry  = fill_price = close + half_spread
+SELL P&L exit   = fill_price = close - half_spread
+round_trip PnL  = (exit_fill - entry_fill) × matched_qty
 ```
+
+Fees are already embedded in both fill prices via `fee_rate`; no separate
+deduction is needed inside the pairing function.
 
 ---
 
@@ -382,8 +434,9 @@ PnL(trade) = exit_price - entry_price - costs   (for BUY)
 | **Sortino ratio** | Like Sharpe but penalises only downside volatility |
 | **Profit factor** | `gross_profit / gross_loss` |
 | **Avg holding period** | Mean number of candles between entry and exit |
-| **Regime filter hit rate** | % of raw signals blocked by the regime filter |
-| **VWAP filter hit rate** | % of raw signals blocked by the VWAP filter |
+| **Confidence filter hit rate** | % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
+| **Regime filter hit rate** | % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
+| **VWAP filter hit rate** | % of raw candidates (that passed confidence + regime gates) blocked by the VWAP momentum filter |
 
 ---
 
@@ -463,21 +516,27 @@ concrete file in `backtest/`.
 - ✅ **Step 3 — `backtest/signals.py`** — Loops over all ~43 200 candles,
   calls `build_synthetic_book()` per row, runs the **production pipeline**
   (`build_levels` → `collect_candidates` → `select_best_opportunity` via
-  `strategy/book_utils.py`), applies the regime filter (Flow B) and VWAP
-  filter (Flow C), and returns a time-indexed signal DataFrame (`+1` BUY,
-  `−1` SELL, `0` flat) plus regime, VWAP, and micro-price details.
+  `strategy/book_utils.py`), applies three sequential gates — **confidence
+  gate** (`regime_confidence ≥ HMM_MIN_CONFIDENCE`), **regime direction gate**
+  (Flow B), and **VWAP momentum gate** (Flow C) — and returns a time-indexed
+  signal DataFrame (`+1` BUY, `−1` SELL, `0` flat) plus regime label,
+  `regime_confidence`, VWAP, and micro-price details.
   *(Implemented.)*
 - ✅ **Step 4 — `backtest/pnl.py`** — Converts the signal Series into
   simulated trades (using ``bq``/``aq`` quantities and the balance guard)
   and computes the Step 5 performance metrics: total return, win rate,
   max drawdown, Sharpe, Sortino, profit factor, average holding period,
-  and regime / VWAP filter hit rates.  *(Implemented.)*
-- ✅ **Step 5 — `backtest/runner.py`** — Top-level script that chains all
-  four modules and prints a formatted summary report (session info, signal
-  breakdown, P&L summary, risk metrics, trade log preview).  Optionally
-  saves timestamped ``trades_*.csv`` and ``equity_*.csv`` to
-  ``backtest/results/``.  Run with ``python -m backtest.runner``.
-  *(Implemented.)*
+  and regime / VWAP filter hit rates.  Round-trip pairing uses an
+  exhaustive FIFO `collections.deque` supporting scaling-in, layering, and
+  pyramiding.  Orphan SELLs emit a visible WARNING box.  *(Implemented.)*
+- ✅ **Step 5 — `backtest/runner.py` + `backtest/reporting/formatters.py`** —
+  Top-level script that chains all four modules.  Report formatting
+  (`print_report`) and CSV export (`save_csv`) are isolated in
+  `backtest/reporting/formatters.py` (AI-authored; all symbols public).
+  Prints a formatted console report: SESSION info, SIGNALS breakdown, P&L
+  SUMMARY, RISK METRICS, TRADE LOG PREVIEW.  Optionally saves timestamped
+  ``trades_*.csv`` and ``equity_*.csv`` to ``backtest/results/``.
+  Run with ``python -m backtest.runner``.  *(Implemented.)*
 - ⬜ **Step 6 — Parameter grid** *(optional)* — Wraps the runner in a loop
   over the sensitivity grid described in Step 7.
 - ⬜ **Step 7 — `backtest/visualization.py`** — Plots and charts to inspect
@@ -498,5 +557,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-04-02*
+*Document last updated: 2026-04-03*
 

@@ -34,8 +34,11 @@ FILES
     data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT)
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
-    pnl.py                            — P&L simulation: balance guard, half_spread fill, equity curve, Step 5 metrics
-    runner.py                         — Top-level backtest runner: chains all modules, prints formatted report
+    pnl.py                            — P&L simulation: balance guard, half_spread fill, FIFO round-trip pairing, equity curve, Step 5 metrics
+    runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
+    reporting/                        — Console report formatting and CSV export (AI-authored)
+      __init__.py                     — Re-exports fmt, print_report, save_csv
+      formatters.py                   — fmt(), print_report(), save_csv(), HEAVY/LIGHT/PREVIEW constants
 
 ─────────────────────────────────────────────────────────────────────────────
 1. CONFIGURATION  (config_parameters.py)
@@ -64,6 +67,10 @@ FILES
     HMM_INTERVAL         = KLINE_INTERVAL_1MINUTE  # kline granularity (1 m)
     HMM_LOOKBACK         = "2 hours ago UTC"        # ~120 rows at 1 m
     HMM_MIN_COVAR        = 1e-3   # regularisation floor for covariance matrices
+    HMM_TRAIN_ROWS       = 80     # in-sample rows for fit(); remaining ~40 rows are out-of-sample
+                                  # scaler is fit_transform'd on [:HMM_TRAIN_ROWS], transform'd on full window
+    HMM_MIN_CONFIDENCE   = 0.65  # min posterior probability (predict_proba) to allow an order;
+                                  # below this threshold both BUY and SELL are skipped
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
@@ -77,7 +84,8 @@ FILES
     BACKTEST_INITIAL_CAPITAL = 10_000.0  # starting USDT balance for the P&L simulation
     BACKTEST_INITIAL_BTC     = 0.0       # starting BTC balance (set > 0 to simulate existing position)
     BACKTEST_FEE_RATE        = 0.001     # 0.10 % taker fee per side (Binance Spot standard)
-    BACKTEST_SLIPPAGE        = 0.0       # extra slippage on top of half_spread fill cost (spread already embedded)
+    # Slippage = (high - low) / 2 per candle — computed dynamically in
+    # synthetic_book.py; no separate constant needed.
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -198,13 +206,22 @@ FILES
         are None, so the filter is transparent and orders execute as before.
         NOTE: This logic may be inverted in the future to implement a
         buy-the-dip / mean-reversion strategy instead.
-      • REGIME FILTER (HMM gate) — reads regime_director.regime_label under
-        _regime_lock:
+      • REGIME FILTER (two sequential gates) — reads regime_label AND
+        regime_confidence under _regime_lock:
+
+        GATE 1 — CONFIDENCE (evaluated first):
+          If regime_confidence < HMM_MIN_CONFIDENCE (0.65):
+            Skip BOTH BUY and SELL — model is uncertain (e.g. 55/45 split).
+          If regime_confidence is None (before first historical run): transparent.
+
+        GATE 2 — DIRECTION (evaluated only if Gate 1 passed):
           BUY:  suppressed if regime == "trending_down" or "high_volatility".
           SELL: suppressed if regime == "trending_up"   or "high_volatility".
           None (before first historical run) → transparent, all orders allowed.
-        Regime is applied BEFORE VWAP check; if regime blocks the trade, VWAP
-        is not evaluated.
+
+        Gate 1 is evaluated BEFORE Gate 2; if confidence is too low, the
+        direction label is irrelevant.  VWAP check is evaluated AFTER both
+        regime gates pass.
       • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
         The executor validates strategy, checks balances, computes quantity
         (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
@@ -226,12 +243,17 @@ FILES
                                                            computes return, volatility,
                                                            obi_proxy, trade_density.
           If iteration % refit_every == 0 (every 5 min / 300 s):
-            regime_director.select_hmm_model()           — fits GaussianHMM for n=2..4,
-                                                           selects the best BIC model, predicts
-                                                           state sequence, sets current_regime.
+            regime_director.select_hmm_model()           — fits GaussianHMM for n=2..4 on
+                                                           first HMM_TRAIN_ROWS (scaled) rows,
+                                                           selects the best BIC model; runs
+                                                           predict() + predict_proba() on the
+                                                           full scaled window; sets
+                                                           current_regime + regime_confidence.
           Otherwise (cheap path):
-            regime_director.predict_current_regime()     — single Viterbi pass on the
-                                                           existing model, updates current_regime.
+            regime_director.predict_current_regime()     — reuses existing model + scaler;
+                                                           single Viterbi pass (predict) and
+                                                           predict_proba() on full window;
+                                                           updates current_regime + regime_confidence.
                                                            ~1000× cheaper than select_hmm_model.
         (inside _regime_lock — fast label assignment only):
           regime_director.assign_regime_labels() — maps state int → label string,
@@ -278,7 +300,8 @@ FILES
 ─────────────────────────────────────────────────────────────────────────────
   Trains a Gaussian Hidden Markov Model on recent Binance 1-minute klines
   to classify the current market into a hidden regime.  The result is exposed
-  as a plain string label consumed by AnalysisEngine.low_latency_analysis.
+  as a plain string label AND a posterior confidence float consumed by
+  AnalysisEngine.low_latency_analysis.
 
   FEATURES (computed from OHLCV kline data):
     return        = close.pct_change()
@@ -289,10 +312,32 @@ FILES
                     high → many small trades (retail / HFT fragmentation)
                     low  → few large trades  (institutional blocks)
 
+  FEATURE SCALING (StandardScaler):
+    Before any fit() / predict() / predict_proba() call:
+      scaler = StandardScaler()
+      train_features = features[:HMM_TRAIN_ROWS]      (oldest ~⅔ of the 2-h window)
+      train_scaled   = scaler.fit_transform(train_features)   (fit on in-sample only)
+      full_scaled    = scaler.transform(features)             (applied to entire window)
+    The scaler is stored as self.scaler and reused in predict_current_regime()
+    so the distribution seen at training time is exactly reproduced at inference.
+    Without scaling, trade_density can dominate the covariance structure.
+
+  TRAIN / PREDICT SPLIT:
+    Model is fitted on train_scaled (first HMM_TRAIN_ROWS rows).
+    Regime is inferred on full_scaled (all rows including held-out recent ones).
+    self.current_regime = regimes[-1]  (last candle — genuinely out-of-sample)
+
   MODEL SELECTION (BIC):
     GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (4) states.
-    Best model selected by lowest BIC = -2 ln L̂ + k ln N.
+    Best model selected by lowest BIC = -2 ln L̂ + k ln N  (N = HMM_TRAIN_ROWS).
     current_regime set to state index of the last candle.
+
+  REGIME CONFIDENCE (predict_proba):
+    After predict(), predict_proba(full_scaled) is also called:
+      proba             = model.predict_proba(full_scaled)   # shape (n_rows, n_states)
+      regime_confidence = float(proba[-1, current_regime])   # ∈ [0, 1]
+    Stored as self.regime_confidence; published under _regime_lock alongside
+    regime_label so low_latency_analysis can read both atomically.
 
   LABEL ASSIGNMENT (assign_regime_labels — rank-based + threshold secondary):
     Directional labels (guaranteed unique via rank):
@@ -309,10 +354,14 @@ FILES
         intent).
       (default) → "neutral"
 
-  REGIME GATE in low_latency_analysis:
-    BUY  suppressed if regime ∈ {"trending_down", "high_volatility"}
-    SELL suppressed if regime ∈ {"trending_up",   "high_volatility"}
-    None (before first historical run) → transparent
+  REGIME GATES in low_latency_analysis (applied sequentially):
+    GATE 1 — CONFIDENCE:
+      Skip both BUY and SELL if regime_confidence < HMM_MIN_CONFIDENCE (0.65).
+      None (warm-up) → transparent.
+    GATE 2 — DIRECTION (only if Gate 1 passed):
+      BUY  suppressed if regime ∈ {"trending_down", "high_volatility"}
+      SELL suppressed if regime ∈ {"trending_up",   "high_volatility"}
+      None (before first historical run) → transparent
 
   LIFECYCLE (two-speed update):
     Instantiated in websocket_main.py (step 4b) before threads start.
@@ -320,12 +369,12 @@ FILES
 
     Every HIST_INTERVAL (60 s) in historical_analysis():
       get_klines_data()           — refresh features (outside _regime_lock)
-      predict_current_regime()    — cheap Viterbi pass (outside _regime_lock)
+      predict_current_regime()    — cheap Viterbi + predict_proba (outside _regime_lock)
       assign_regime_labels()      — fast label write (inside _regime_lock)
 
     Every HMM_REFIT_INTERVAL (300 s) — replaces predict with full refit:
       get_klines_data()           — refresh features (outside _regime_lock)
-      select_hmm_model()          — full EM refit  (outside _regime_lock)
+      select_hmm_model()          — full EM refit + new scaler (outside _regime_lock)
       assign_regime_labels()      — fast label write (inside _regime_lock)
 
 ─────────────────────────────────────────────────────────────────────────────
@@ -502,7 +551,8 @@ FILES
                                     OrderExecutor.  Fill price per trade:
                                       BUY  = close + half_spread  (synthetic ask)
                                       SELL = close - half_spread  (synthetic bid)
-                                    plus optional BACKTEST_SLIPPAGE on top.
+                                    Slippage = half_spread = (high-low)/2 and is
+                                    already embedded in the fill price above.
                                     Marks the portfolio to market at every candle
                                     (including HOLDs) to produce a continuous
                                     equity curve.  Outputs: trades_df, equity_df,
@@ -510,21 +560,42 @@ FILES
                                     return, win rate, max drawdown, Sharpe √365,
                                     Sortino, profit factor, avg holding period,
                                     regime/VWAP filter hit rates).
-                                    _pair_round_trips(): FIFO BUY→SELL matching;
-                                    open positions closed at last candle mark-to-
-                                    market.
+                                    _pair_round_trips(): exhaustive FIFO BUY→SELL
+                                    matching via collections.deque — supports
+                                    scaling-in, layering, and pyramiding (multiple
+                                    concurrent open legs).  Partial closes push
+                                    the remaining qty back to the front of the
+                                    queue (appendleft); over-sells consume as many
+                                    legs as the SELL qty allows.  Orphan SELLs
+                                    (no open BUY leg — only possible when
+                                    initial_btc > 0) emit a visible WARNING box.
+                                    NOTE: open_buys deque is a pure accounting
+                                    cursor — all trades in trades_df are already
+                                    settled by simulate_pnl() before pairing runs.
 
   backtest/runner.py             — run_backtest(): top-level orchestrator.
                                     Chains run_signals() → simulate_pnl() →
-                                    _print_report().  Prints a formatted console
-                                    report: SESSION info (initial USDT + BTC,
-                                    fee, slippage), SIGNALS breakdown, P&L
-                                    SUMMARY, RISK METRICS, TRADE LOG PREVIEW.
-                                    Optionally saves timestamped trades_*.csv
-                                    and equity_*.csv to backtest/results/.
+                                    print_report().  Report formatting and CSV
+                                    export are delegated to
+                                    backtest/reporting/formatters.py (public
+                                    helpers: fmt, print_report, save_csv).
+                                    Parameter renamed: save_csv → export_csv
+                                    to avoid shadowing the imported function.
                                     Entry point: python -m backtest.runner.
 
+  backtest/reporting/            — Console report formatting and CSV export.
+    __init__.py                  — Re-exports fmt, print_report, save_csv.
+    formatters.py                — print_report(): structured console report
+                                    (SESSION, SIGNALS, P&L SUMMARY, RISK
+                                    METRICS, TRADE LOG PREVIEW).
+                                    save_csv(): timestamped trades_*.csv and
+                                    equity_*.csv to backtest/results/.
+                                    fmt(): safe float formatter (NaN / inf safe).
+                                    NOTE: this module was written entirely by AI
+                                    (GitHub Copilot / GPT-4o) — see README.md
+                                    disclaimer.
+
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
-                         pnl.py ✅, runner.py ✅,
+                         pnl.py ✅, runner.py ✅, reporting/ ✅,
                          visualization.py — pending.
 """

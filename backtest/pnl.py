@@ -27,8 +27,8 @@ DataFrame (``(high - low) / 2`` — the same quantity computed in
     BUY  fill = close + half_spread   (≡ synthetic_best_ask — you cross the spread)
     SELL fill = close - half_spread   (≡ synthetic_best_bid — you receive the bid)
 
-An optional extra ``slippage`` fraction can be added on top to model
-queue/latency effects (defaults to ``BACKTEST_SLIPPAGE = 0.0``).
+No additional slippage fraction is applied — the half-spread already captures
+the round-trip cost of crossing the synthetic bid/ask.
 
 Usage
 -----
@@ -41,6 +41,7 @@ Usage
 """
 
 import logging
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -50,7 +51,7 @@ from config_parameters import (
     BACKTEST_FEE_RATE,
     BACKTEST_INITIAL_BTC,
     BACKTEST_INITIAL_CAPITAL,
-    BACKTEST_SLIPPAGE,
+    HMM_MIN_CONFIDENCE,
 )
 
 log = logging.getLogger(__name__)
@@ -64,12 +65,12 @@ _SELL_BLOCKED_REGIMES = {"trending_up", "high_volatility"}
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def simulate_pnl(
     signals: pd.DataFrame,
     initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
-    initial_btc:  float = BACKTEST_INITIAL_BTC,
-    fee_rate: float     = BACKTEST_FEE_RATE,
-    slippage: float     = BACKTEST_SLIPPAGE,
+    initial_btc: float = BACKTEST_INITIAL_BTC,
+    fee_rate: float = BACKTEST_FEE_RATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """
     Simulate P&L on the signal DataFrame from ``run_signals()``.
@@ -94,9 +95,6 @@ def simulate_pnl(
     fee_rate : float
         Taker fee fraction per side (e.g. 0.001 = 0.10 %).
         Defaults to ``BACKTEST_FEE_RATE``.
-    slippage : float
-        Additional slippage fraction applied on top of the half_spread fill
-        cost.  Defaults to ``BACKTEST_SLIPPAGE`` (0.0 = spread cost only).
 
     Returns
     -------
@@ -115,7 +113,7 @@ def simulate_pnl(
         list.
     """
     usdt = float(initial_usdt)
-    btc  = float(initial_btc)
+    btc = float(initial_btc)
 
     trade_rows: list[dict] = []
     equity_rows: list[dict] = []
@@ -127,12 +125,14 @@ def simulate_pnl(
         # ── BUY ─────────────────────────────────────────────────────────────
         if sig == 1:
             raw_qty = float(row["buy_qty"]) if pd.notna(row["buy_qty"]) else 0.0
-            half_spread = float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
+            half_spread = (
+                float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
+            )
 
             # Fill at the synthetic ask: close + half_spread.
             # This is the natural taker cost — you cross the spread when buying.
-            # An optional extra slippage fraction covers queue/latency effects.
-            eff_price = close + half_spread + close * slippage
+            # half_spread = (high - low) / 2 already captures the round-trip cost.
+            eff_price = close + half_spread
 
             # Balance guard: cannot spend more USDT than available.
             # Total debit per unit = eff_price × (1 + fee_rate).
@@ -147,36 +147,46 @@ def simulate_pnl(
                 net_cost = gross + fee  # total USDT debited
                 usdt -= net_cost
                 btc += qty
-                trade_rows.append({
-                    "timestamp": ts,
-                    "side": "BUY",
-                    "fill_price": eff_price,
-                    "quantity": qty,
-                    "gross": gross,
-                    "fee": fee,
-                    "net_cost": net_cost,
-                    "net_proceeds": None,
-                    "regime": row.get("regime"),
-                })
+                trade_rows.append(
+                    {
+                        "timestamp": ts,
+                        "side": "BUY",
+                        "fill_price": eff_price,
+                        "quantity": qty,
+                        "gross": gross,
+                        "fee": fee,
+                        "net_cost": net_cost,
+                        "net_proceeds": None,
+                        "regime": row.get("regime"),
+                    }
+                )
                 log.debug(
                     "BUY  %s | qty=%.6f | price=%.2f | cost=%.2f USDT | fee=%.4f",
-                    ts, qty, eff_price, net_cost, fee,
+                    ts,
+                    qty,
+                    eff_price,
+                    net_cost,
+                    fee,
                 )
             else:
                 log.warning(
                     "BUY skipped at %s — USDT %.2f insufficient at price %.2f",
-                    ts, usdt, close,
+                    ts,
+                    usdt,
+                    close,
                 )
 
         # ── SELL ─────────────────────────────────────────────────────────────
         elif sig == -1:
             raw_qty = float(row["sell_qty"]) if pd.notna(row["sell_qty"]) else 0.0
-            half_spread = float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
+            half_spread = (
+                float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
+            )
 
             # Fill at the synthetic bid: close - half_spread.
             # You receive less than mid when selling — the spread is the cost.
-            # The optional extra slippage fraction is subtracted on top.
-            eff_price = close - half_spread - close * slippage
+            # half_spread = (high - low) / 2 already captures the round-trip cost.
+            eff_price = close - half_spread
 
             # Balance guard: cannot sell more BTC than held.
             qty = min(raw_qty, btc)
@@ -187,38 +197,47 @@ def simulate_pnl(
                 net_proceeds = gross - fee  # USDT credited after fee
                 usdt += net_proceeds
                 btc -= qty
-                trade_rows.append({
-                    "timestamp": ts,
-                    "side": "SELL",
-                    "fill_price": eff_price,
-                    "quantity": qty,
-                    "gross": gross,
-                    "fee": fee,
-                    "net_cost": None,
-                    "net_proceeds": net_proceeds,
-                    "regime": row.get("regime"),
-                })
+                trade_rows.append(
+                    {
+                        "timestamp": ts,
+                        "side": "SELL",
+                        "fill_price": eff_price,
+                        "quantity": qty,
+                        "gross": gross,
+                        "fee": fee,
+                        "net_cost": None,
+                        "net_proceeds": net_proceeds,
+                        "regime": row.get("regime"),
+                    }
+                )
                 log.debug(
                     "SELL %s | qty=%.6f | price=%.2f | proceeds=%.2f USDT | fee=%.4f",
-                    ts, qty, eff_price, net_proceeds, fee,
+                    ts,
+                    qty,
+                    eff_price,
+                    net_proceeds,
+                    fee,
                 )
             else:
                 log.warning(
                     "SELL skipped at %s — BTC %.8f insufficient",
-                    ts, btc,
+                    ts,
+                    btc,
                 )
 
         # ── Mark-to-market at every candle (BUY, SELL, and HOLD) ────────────
         # The equity curve must be continuous so that drawdown and Sharpe
         # are computed correctly.  HOLD rows carry no cash flow but the
         # portfolio value still changes as the BTC price moves.
-        equity_rows.append({
-            "timestamp": ts,
-            "usdt": usdt,
-            "btc": btc,
-            "close": close,
-            "equity": usdt + btc * close,
-        })
+        equity_rows.append(
+            {
+                "timestamp": ts,
+                "usdt": usdt,
+                "btc": btc,
+                "close": close,
+                "equity": usdt + btc * close,
+            }
+        )
 
     # ── Post-loop bookkeeping ────────────────────────────────────────────────
     final_close = float(signals["close"].iloc[-1])
@@ -227,7 +246,9 @@ def simulate_pnl(
     if btc > 0:
         log.info(
             "Session ended with %.8f BTC open (≈ %.2f USDT at last close %.2f).",
-            btc, btc * final_close, final_close,
+            btc,
+            btc * final_close,
+            final_close,
         )
 
     # ── Build DataFrames ─────────────────────────────────────────────────────
@@ -245,13 +266,15 @@ def simulate_pnl(
     # ── Summary statistics ───────────────────────────────────────────────────
     round_trips = _pair_round_trips(trades_df, final_close)
     stats = _compute_stats(
-        signals, equity_df, round_trips,
-        initial_usdt, final_equity,
+        signals,
+        equity_df,
+        round_trips,
+        initial_usdt,
+        final_equity,
     )
 
     log.info(
-        "P&L: return=%.2f%%  trades=%d  win_rate=%.1f%%  "
-        "max_dd=%.2f%%  sharpe=%.3f",
+        "P&L: return=%.2f%%  trades=%d  win_rate=%.1f%%  max_dd=%.2f%%  sharpe=%.3f",
         stats["total_return_pct"],
         stats["n_round_trips"],
         stats["win_rate_pct"],
@@ -266,16 +289,23 @@ def simulate_pnl(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _pair_round_trips(
-        trades_df: pd.DataFrame,
-        last_close: float,
+    trades_df: pd.DataFrame,
+    last_close: float,
 ) -> list[dict]:
     """
     Pair each BUY with the subsequent SELL to form round-trip trades.
 
-    Uses FIFO matching: the oldest open BUY is closed by the first SELL
-    that follows it.  If a BUY is still open at session end it is closed
-    at ``last_close`` (mark-to-market exit).
+    Uses a FIFO queue so that multiple concurrent open legs are supported.
+    This correctly models three real-world entry strategies:
+
+    * **Scaling in**  — several BUYs at descending prices before one SELL.
+    * **Layering**    — BUYs placed at regular intervals (grid-style).
+    * **Pyramiding**  — adding to a winning position before exiting.
+
+    Each SELL closes the **oldest** open BUY leg (FIFO).  Any legs still
+    open at session end are closed at ``last_close`` (mark-to-market exit).
 
     Parameters
     ----------
@@ -295,74 +325,127 @@ def _pair_round_trips(
 
     round_trips: list[dict] = []
 
-    # Track an open long position using explicit typed scalars so the type
-    # checker can narrow them without warnings — avoids dict[str, Any] issues.
-    has_open_buy:   bool                 = False
-    open_buy_ts:    pd.Timestamp | None  = None
-    open_buy_price: float                = 0.0
-    open_buy_qty:   float                = 0.0
+    # FIFO queue used purely for accounting — NOT a live order tracker.
+    # All trades in trades_df are already settled (simulate_pnl executed and
+    # recorded every BUY and SELL before this function is called).  This queue
+    # is just a cursor that pairs each BUY entry with its matching SELL so that
+    # per-round-trip P&L, win rate, and holding time can be computed.
+    # Each entry: {"ts": pd.Timestamp, "price": float, "qty": float}
+    # A new BUY always appends to the right; a SELL pops from the left (oldest).
+    open_buys: deque[dict] = deque()
 
     for ts, row in trades_df.iterrows():
         if row["side"] == "BUY":
-            # If a previous BUY is still open, treat the new BUY as a
-            # separate position (back-to-back BUYs can happen when the
-            # regime and VWAP both allow repeated buy signals).
-            if not has_open_buy:
-                has_open_buy   = True
-                open_buy_ts    = pd.Timestamp(str(ts))
-                open_buy_price = float(row["fill_price"])
-                open_buy_qty   = float(row["quantity"])
+            # All three strategies (scale-in, layering, pyramiding) land here.
+            # Every BUY opens a new independent leg in the queue — no skipping.
+            open_buys.append(
+                {
+                    "ts": pd.Timestamp(str(ts)),
+                    "price": float(row["fill_price"]),
+                    "qty": float(row["quantity"]),
+                }
+            )
 
-        elif row["side"] == "SELL" and has_open_buy:
+        elif row["side"] == "SELL" and not open_buys:
+            # Orphan SELL — no open BUY leg to match against.
+            # Most likely cause: initial_btc > 0 and the first signal fired
+            # is a SELL.  The cash flow is already correct in the equity curve
+            # (simulate_pnl updated usdt/btc before _pair_round_trips runs);
+            # only the round-trip stats miss this leg.
+            log.warning(
+                "\n"
+                "  ╔══════════════════════════════════════════════════╗\n"
+                "  ║  ORPHAN SELL — no matching open BUY leg found.  ║\n"
+                "  ║  ts=%-44s  ║\n"
+                "  ║  qty=%-10.6f  price=%-10.2f                 ║\n"
+                "  ║  Equity curve is correct; round-trip stats skip  ║\n"
+                "  ║  this leg.  Set initial_btc=0 to avoid this.    ║\n"
+                "  ╚══════════════════════════════════════════════════╝\n",
+                str(ts),
+                float(row["quantity"]),
+                float(row["fill_price"]),
+            )
+
+        elif row["side"] == "SELL" and open_buys:
             exit_price: float = float(row["fill_price"])
-            qty:        float = min(open_buy_qty, float(row["quantity"]))
+            remaining_sell: float = float(row["quantity"])
 
-            # P&L in USDT: (exit − entry) × qty.  Fees are already
-            # embedded in the fill prices via the slippage / fee_rate
-            # adjustments made in simulate_pnl().
-            pnl_usdt: float = (exit_price - open_buy_price) * qty
+            # Exhaust as many open BUY legs as the SELL quantity allows.
+            # Two sub-cases are handled cleanly:
+            #
+            #   Partial close  — SELL qty < oldest leg qty:
+            #     matched_qty  = remaining_sell (full sell consumed)
+            #     leftover     = entry["qty"] - matched_qty > 0
+            #     → push leftover back to the FRONT of the queue (appendleft)
+            #       so the next SELL can continue closing the same leg.
+            #
+            #   Over-sell      — SELL qty > oldest leg qty:
+            #     matched_qty  = entry["qty"] (full leg consumed)
+            #     remaining_sell reduced; loop continues to the next leg.
+            while remaining_sell > 1e-10 and open_buys:
+                entry = open_buys.popleft()
+                matched_qty: float = min(entry["qty"], remaining_sell)
 
-            # Holding period in minutes (requires a datetime index).
-            try:
-                holding_min: float = (
-                    pd.Timestamp(str(ts)) - open_buy_ts
-                ).total_seconds() / 60.0
-            except (TypeError, ValueError):
-                holding_min = float("nan")
+                # If only part of the leg was consumed, push the remainder
+                # back to the front so the next SELL picks it up first.
+                leftover: float = entry["qty"] - matched_qty
+                if leftover > 1e-10:
+                    open_buys.appendleft(
+                        {"ts": entry["ts"], "price": entry["price"], "qty": leftover}
+                    )
 
-            round_trips.append({
-                "entry_ts": open_buy_ts,
-                "exit_ts": ts,
-                "entry_price": open_buy_price,
-                "exit_price": exit_price,
-                "quantity": qty,
+                remaining_sell -= matched_qty
+
+                # P&L in USDT: (exit − entry) × matched_qty.  Fees are
+                # already embedded in fill prices via half_spread / fee_rate.
+                pnl_usdt: float = (exit_price - entry["price"]) * matched_qty
+
+                try:
+                    holding_min: float = (
+                        pd.Timestamp(str(ts)) - entry["ts"]
+                    ).total_seconds() / 60.0
+                except (TypeError, ValueError):
+                    holding_min = float("nan")
+
+                round_trips.append(
+                    {
+                        "entry_ts": entry["ts"],
+                        "exit_ts": ts,
+                        "entry_price": entry["price"],
+                        "exit_price": exit_price,
+                        "quantity": matched_qty,
+                        "pnl_usdt": pnl_usdt,
+                        "holding_minutes": holding_min,
+                    }
+                )
+
+    # ── Drain remaining open legs at session-end mark-to-market ─────────────
+    # Any BUY that never found a matching SELL is closed at the last close. So basically a Market Order.
+    # price so that unrealized P&L is captured in the statistics.
+    while open_buys:
+        entry = open_buys.popleft()
+        pnl_usdt = (last_close - entry["price"]) * entry["qty"]
+        round_trips.append(
+            {
+                "entry_ts": entry["ts"],
+                "exit_ts": None,  # session close — no explicit SELL
+                "entry_price": entry["price"],
+                "exit_price": last_close,
+                "quantity": entry["qty"],
                 "pnl_usdt": pnl_usdt,
-                "holding_minutes": holding_min,
-            })
-            has_open_buy = False  # position closed
-
-    # ── Close any remaining open BUY at session-end mark-to-market ──────────
-    if has_open_buy:
-        pnl_usdt = (last_close - open_buy_price) * open_buy_qty
-        round_trips.append({
-            "entry_ts": open_buy_ts,
-            "exit_ts": None,  # session close — no explicit SELL
-            "entry_price": open_buy_price,
-            "exit_price": last_close,
-            "quantity": open_buy_qty,
-            "pnl_usdt": pnl_usdt,
-            "holding_minutes": float("nan"),
-        })
+                "holding_minutes": float("nan"),
+            }
+        )
 
     return round_trips
 
 
 def _compute_stats(
-        signals: pd.DataFrame,
-        equity_df: pd.DataFrame,
-        round_trips: list[dict],
-        initial_usdt: float,
-        final_equity: float,
+    signals: pd.DataFrame,
+    equity_df: pd.DataFrame,
+    round_trips: list[dict],
+    initial_usdt: float,
+    final_equity: float,
 ) -> dict[str, Any]:
     """
     Compute Step 5 performance metrics from the equity curve and round trips.
@@ -387,7 +470,8 @@ def _compute_stats(
         ``avg_trade_pnl_usdt``, ``max_drawdown_pct``, ``sharpe_ratio``,
         ``sortino_ratio``, ``profit_factor``, ``avg_holding_minutes``,
         ``n_buy_signals``, ``n_sell_signals``,
-        ``regime_filter_hit_rate_pct``, ``vwap_filter_hit_rate_pct``.
+        ``regime_filter_hit_rate_pct``, ``vwap_filter_hit_rate_pct``,
+        ``confidence_filter_hit_rate_pct``.
     """
     total_return_pct = (final_equity - initial_usdt) / initial_usdt * 100
 
@@ -402,8 +486,11 @@ def _compute_stats(
     gross_loss = abs(sum(p for p in pnls if p < 0))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    holdings = [rt["holding_minutes"] for rt in round_trips
-                if not np.isnan(rt["holding_minutes"])]
+    holdings = [
+        rt["holding_minutes"]
+        for rt in round_trips
+        if not np.isnan(rt["holding_minutes"])
+    ]
     avg_hold = float(np.mean(holdings)) if holdings else float("nan")
 
     # ── Drawdown ─────────────────────────────────────────────────────────────
@@ -429,37 +516,79 @@ def _compute_stats(
     # ── Filter hit rates ─────────────────────────────────────────────────────
     # raw_buy_candidates  = candles where a buy opportunity was scored
     #                       (best_buy_micro is not None/NaN).
-    # regime_blocked_buy  = candidates suppressed by the regime gate.
-    # vwap_blocked_buy    = candidates that passed the regime gate but
-    #                       were suppressed by the VWAP momentum filter.
-    # executed_buys       = candidates that passed both gates → signal == +1.
+    # confidence_blocked  = candidates suppressed because regime_confidence
+    #                       < HMM_MIN_CONFIDENCE (model too uncertain).
+    # regime_blocked      = candidates that passed the confidence gate but
+    #                       were suppressed by the regime direction gate.
+    # vwap_blocked        = candidates that passed both confidence and regime
+    #                       gates but were suppressed by the VWAP filter.
+    # executed            = candidates that passed all three gates → signal.
     raw_buy = signals["best_buy_micro"].notna().sum()
     raw_sell = signals["best_sell_micro"].notna().sum()
     exec_buy = (signals["signal"] == 1).sum()
     exec_sell = (signals["signal"] == -1).sum()
 
-    regime_blocked_buy = (
+    # Confidence-blocked: had a candidate but model posterior < threshold.
+    # regime_confidence column is present from signals.py v2+; fall back to 0
+    # if running against an older signal DataFrame that lacks the column.
+    has_confidence_col = "regime_confidence" in signals.columns
+    if has_confidence_col:
+        _conf_low = signals["regime_confidence"].notna() & (
+            signals["regime_confidence"] < HMM_MIN_CONFIDENCE
+        )
+        confidence_blocked_buy = int(
+            (signals["best_buy_micro"].notna() & _conf_low).sum()
+        )
+        confidence_blocked_sell = int(
+            (signals["best_sell_micro"].notna() & _conf_low).sum()
+        )
+        # Passed-confidence mask — needed to correctly attribute regime blocks
+        _conf_passed = ~_conf_low
+    else:
+        confidence_blocked_buy = 0
+        confidence_blocked_sell = 0
+        _conf_passed = pd.Series(True, index=signals.index)
+
+    # Regime-blocked: passed confidence gate but regime was unfavourable.
+    regime_blocked_buy = int(
+        (
             signals["best_buy_micro"].notna()
+            & _conf_passed
             & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
-    ).sum()
-    regime_blocked_sell = (
+        ).sum()
+    )
+    regime_blocked_sell = int(
+        (
             signals["best_sell_micro"].notna()
+            & _conf_passed
             & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
-    ).sum()
+        ).sum()
+    )
 
-    # VWAP-blocked = had a candidate, passed regime gate, but not executed.
-    vwap_blocked_buy = int(raw_buy - exec_buy - regime_blocked_buy)
-    vwap_blocked_sell = int(raw_sell - exec_sell - regime_blocked_sell)
+    # VWAP-blocked: residual after confidence and regime.
+    # max(0, …) guards against floating-point rounding edge cases.
+    vwap_blocked_buy = max(
+        0, int(raw_buy - exec_buy - confidence_blocked_buy - regime_blocked_buy)
+    )
+    vwap_blocked_sell = max(
+        0, int(raw_sell - exec_sell - confidence_blocked_sell - regime_blocked_sell)
+    )
 
+    total_raw = raw_buy + raw_sell
+    confidence_hit_rate = (
+        (confidence_blocked_buy + confidence_blocked_sell) / total_raw * 100
+        if total_raw > 0
+        else float("nan")
+    )
     regime_hit_rate = (
-        (regime_blocked_buy + regime_blocked_sell)
-        / (raw_buy + raw_sell) * 100
-        if (raw_buy + raw_sell) > 0 else float("nan")
+        (regime_blocked_buy + regime_blocked_sell) / total_raw * 100
+        if total_raw > 0
+        else float("nan")
     )
     vwap_hit_rate = (
-        (vwap_blocked_buy + vwap_blocked_sell)
-        / (raw_buy + raw_sell) * 100
-        if (raw_buy + raw_sell) > 0 else float("nan")
+        (vwap_blocked_buy + vwap_blocked_sell) / total_raw * 100
+        if total_raw > 0
+        else float("nan")
     )
 
     return {
@@ -485,4 +614,5 @@ def _compute_stats(
         # Filter hit rates
         "regime_filter_hit_rate_pct": regime_hit_rate,
         "vwap_filter_hit_rate_pct": vwap_hit_rate,
+        "confidence_filter_hit_rate_pct": confidence_hit_rate,
     }

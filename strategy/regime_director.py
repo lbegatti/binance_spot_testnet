@@ -2,6 +2,7 @@ import numpy as np
 from binance.client import Client
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
 from config_parameters import (
     HMM_FEATURE_COLS,
     HMM_N_ITERATIONS,
@@ -10,6 +11,7 @@ from config_parameters import (
     HMM_INTERVAL,
     HMM_LOOKBACK,
     HMM_MIN_COVAR,
+    HMM_TRAIN_ROWS,
     SYMBOL,
 )
 import logging
@@ -36,6 +38,12 @@ class RegimeDirector:
     The best number of hidden states (2 … ``HMM_MAX_REGIMES``) is selected
     automatically via the **Bayesian Information Criterion (BIC)** — the model
     with the lowest BIC is retained.
+
+    A **train / predict split** is applied in ``select_hmm_model()``: the model
+    is fitted only on the first ``HMM_TRAIN_ROWS`` rows of the downloaded
+    window (older, in-sample data).  Regime inference (Viterbi) then runs on
+    the **full** window, so ``current_regime`` always reflects the latest
+    candle, which was genuinely out-of-sample during training.
 
     State labels are assigned in ``assign_regime_labels()`` using a rank-based
     directional assignment and volatility thresholds.  Possible labels:
@@ -76,6 +84,16 @@ class RegimeDirector:
         current_regime (int | None): State index of the most recent candle.
         regime_label (str | None): Human-readable label for ``current_regime``;
             ``None`` until ``assign_regime_labels()`` is called.
+        scaler (StandardScaler | None): ``sklearn`` scaler fitted on the
+            training rows only.  Used to z-score all four features before
+            ``fit()`` and ``predict()``.  ``None`` until
+            ``select_hmm_model()`` is called.
+        regime_confidence (float | None): Posterior probability assigned by
+            ``predict_proba()`` to ``current_regime`` for the latest candle
+            (``proba[-1][current_regime]``).  Range ``[0.0, 1.0]``.
+            ``None`` until ``select_hmm_model()`` is called.
+            Used by ``AnalysisEngine`` to gate orders: executions are skipped
+            when ``regime_confidence < HMM_MIN_CONFIDENCE``.
     """
 
     def __init__(
@@ -114,6 +132,8 @@ class RegimeDirector:
         self.regimes: np.ndarray | None = None
         self.current_regime: int | None = None
         self.regime_label: str | None = None
+        self.scaler: StandardScaler | None = None
+        self.regime_confidence: float | None = None
 
     def get_klines_data(self):
         """
@@ -174,10 +194,40 @@ class RegimeDirector:
         Fit ``GaussianHMM`` models for ``n = 2 … self.max_states`` hidden states
         and select the best one by **Bayesian Information Criterion (BIC)**.
 
+        A **train / predict split** is applied to avoid overfitting the model
+        to the most recent candles:
+
+        * **Training set** — the first ``HMM_TRAIN_ROWS`` rows of
+          ``klines_df`` (older, in-sample data).  All ``fit()`` and ``bic()``
+          calls use only this slice.  At the default ``HMM_LOOKBACK`` of 2 h
+          (≈ 120 rows) and ``HMM_TRAIN_ROWS = 80``, roughly the oldest ⅔ of
+          the window is used for training.
+        * **Prediction set** — the **full** feature matrix.  After the best
+          model is selected, ``model.predict()`` runs on all rows so that
+          ``self.current_regime`` reflects the very latest candle, which was
+          genuinely out-of-sample during training.
+
+        **Feature scaling** via ``StandardScaler`` is applied before any
+        model call:
+
+        * The scaler is ``fit_transform``'d on **training rows only** —
+          mean and standard deviation from held-out (recent) candles cannot
+          leak into the model.
+        * The same scaler is ``transform``'d onto the full window for
+          prediction so that both sets live in the same z-score space.
+        * This is necessary because ``trade_density`` (``num_trades / volume``)
+          can be orders of magnitude larger than ``return`` or ``obi_proxy``
+          (which sit in ``[-1, +1]``).  Without scaling the largest feature
+          would dominate the covariance structure and inflate BIC for all
+          candidate ``n``.
+        * The fitted ``StandardScaler`` is stored in ``self.scaler`` so that
+          ``predict_current_regime()`` can reuse the exact same transform
+          without refitting.
+
         For each candidate ``n``:
 
-        * A ``GaussianHMM`` with full covariance is fitted on the feature
-          matrix from ``self.klines_df[HMM_FEATURE_COLS]``.
+        * A ``GaussianHMM`` with full covariance is fitted on
+          ``train_features`` (not the whole window).
         * ``min_covar=HMM_MIN_COVAR`` is passed to the model so that a small
           regularisation constant is added to the diagonal of every state's
           covariance matrix, preventing ``"covars must be symmetric,
@@ -185,7 +235,7 @@ class RegimeDirector:
         * If ``fit()`` or ``bic()`` still raise ``ValueError`` or
           ``numpy.linalg.LinAlgError`` (e.g. extreme feature values), that
           ``n`` is skipped with a ``WARNING`` log and the search continues.
-        * BIC is computed as ``model.bic(features)`` — lower is better.
+        * BIC is computed as ``model.bic(train_features)`` — lower is better.
 
         The model with the lowest BIC is stored in ``self.model``.  The full
         state sequence is predicted via ``self.model.predict(features)`` and
@@ -202,6 +252,30 @@ class RegimeDirector:
                 ``HMM_MAX_REGIMES`` in ``config_parameters.py`` to resolve.
         """
         features = self.klines_df[HMM_FEATURE_COLS].values
+
+        # --- train / predict split ---
+        # Train only on the older in-sample rows; the most recent rows are
+        # intentionally held out so that self.current_regime reflects a regime
+        # that the model has never "seen" during fitting.
+        train_features = features[:HMM_TRAIN_ROWS]
+
+        # --- feature scaling ---
+        # Fit the scaler ONLY on the training rows so that the mean and std
+        # of recent (held-out) candles cannot leak into the model.
+        # transform() is then applied to the full window for prediction.
+        # This is important because trade_density (num_trades / volume) can
+        # be orders of magnitude larger than return or obi_proxy [-1, +1],
+        # which would otherwise dominate the covariance structure.
+        self.scaler = StandardScaler()
+        train_features_scaled = self.scaler.fit_transform(train_features)
+        features_scaled = self.scaler.transform(features)
+
+        logging.info(
+            "RegimeDirector: fitting on %d rows (train), predicting on %d rows (full)",
+            len(train_features),
+            len(features),
+        )
+
         best_hmm_model, best_hmm_bic = None, np.inf
         for n in range(2, self.max_states + 1):
             m = GaussianHMM(
@@ -214,8 +288,8 @@ class RegimeDirector:
                 # has few observations
             )
             try:
-                m.fit(features)
-                bic = m.bic(features)
+                m.fit(train_features_scaled)
+                bic = m.bic(train_features_scaled)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 # Covariance matrix became singular for this n — skip and try next
                 logging.warning(
@@ -233,12 +307,22 @@ class RegimeDirector:
             )
 
         self.model = best_hmm_model
-        self.regimes = self.model.predict(features)
+        # Predict on the FULL scaled window — out-of-sample rows included
+        self.regimes = self.model.predict(features_scaled)
         self.current_regime = int(self.regimes[-1])
+
+        # Posterior probability of the winning state for the latest candle.
+        # predict_proba() runs Forward-Backward (vs Viterbi for predict()):
+        # it returns the marginal probability of each state at each time step.
+        # We only need the last row [-1] and the current state's column.
+        proba = self.model.predict_proba(features_scaled)
+        self.regime_confidence = float(proba[-1, self.current_regime])
+
         logging.info(
-            "RegimeDirector: best n=%d current_regime=%d",
+            "RegimeDirector: best n=%d current_regime=%d confidence=%.2f",
             self.model.n_components,
             self.current_regime,
+            self.regime_confidence,
         )
 
     def predict_current_regime(self) -> None:
@@ -278,7 +362,7 @@ class RegimeDirector:
             * ``get_klines_data()`` must have been called first so that
               ``self.klines_df`` is populated.
             * ``select_hmm_model()`` must have been called at least once so
-              that ``self.model`` is not ``None``.
+              that ``self.model`` and ``self.scaler`` are not ``None``.
 
         Raises:
             RuntimeError: if ``self.model`` is ``None`` (no prior fit exists).
@@ -291,11 +375,20 @@ class RegimeDirector:
                 "Run the initial fit first."
             )
         features = self.klines_df[HMM_FEATURE_COLS].values
-        self.regimes = self.model.predict(features)
+        # Reuse the scaler fitted during select_hmm_model() so the feature
+        # distribution seen by the model is identical to training time.
+        features_scaled = self.scaler.transform(features)
+        self.regimes = self.model.predict(features_scaled)
         self.current_regime = int(self.regimes[-1])
+
+        # Refresh the posterior confidence for the latest candle.
+        proba = self.model.predict_proba(features_scaled)
+        self.regime_confidence = float(proba[-1, self.current_regime])
+
         logging.info(
-            "RegimeDirector: predict (no refit) → current_regime=%d",
+            "RegimeDirector: predict (no refit) → current_regime=%d confidence=%.2f",
             self.current_regime,
+            self.regime_confidence,
         )
 
     def assign_regime_labels(self):
