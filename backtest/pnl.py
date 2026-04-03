@@ -51,6 +51,7 @@ from config_parameters import (
     BACKTEST_FEE_RATE,
     BACKTEST_INITIAL_BTC,
     BACKTEST_INITIAL_CAPITAL,
+    BACKTEST_RISK_FREE_RATE,
     HMM_MIN_CONFIDENCE,
 )
 
@@ -59,11 +60,6 @@ log = logging.getLogger(__name__)
 # Regimes that block a BUY / SELL signal (must stay in sync with analysis.py)
 _BUY_BLOCKED_REGIMES = {"trending_down", "high_volatility"}
 _SELL_BLOCKED_REGIMES = {"trending_up", "high_volatility"}
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def simulate_pnl(
@@ -122,7 +118,7 @@ def simulate_pnl(
         close = float(row["close"])
         sig = int(row["signal"])
 
-        # ── BUY ─────────────────────────────────────────────────────────────
+        # BUY
         if sig == 1:
             raw_qty = float(row["buy_qty"]) if pd.notna(row["buy_qty"]) else 0.0
             half_spread = (
@@ -176,7 +172,7 @@ def simulate_pnl(
                     close,
                 )
 
-        # ── SELL ─────────────────────────────────────────────────────────────
+        # SELL
         elif sig == -1:
             raw_qty = float(row["sell_qty"]) if pd.notna(row["sell_qty"]) else 0.0
             half_spread = (
@@ -225,7 +221,7 @@ def simulate_pnl(
                     btc,
                 )
 
-        # ── Mark-to-market at every candle (BUY, SELL, and HOLD) ────────────
+        # Mark-to-market at every candle (BUY, SELL, and HOLD)
         # The equity curve must be continuous so that drawdown and Sharpe
         # are computed correctly.  HOLD rows carry no cash flow but the
         # portfolio value still changes as the BTC price moves.
@@ -239,7 +235,7 @@ def simulate_pnl(
             }
         )
 
-    # ── Post-loop bookkeeping ────────────────────────────────────────────────
+    # Post-loop bookkeeping
     final_close = float(signals["close"].iloc[-1])
     final_equity = usdt + btc * final_close
 
@@ -251,7 +247,7 @@ def simulate_pnl(
             final_close,
         )
 
-    # ── Build DataFrames ─────────────────────────────────────────────────────
+    # Build DataFrames
     trades_df = (
         pd.DataFrame(trade_rows).set_index("timestamp")
         if trade_rows
@@ -263,13 +259,14 @@ def simulate_pnl(
     peak = equity_df["equity"].cummax()
     equity_df["drawdown_pct"] = (equity_df["equity"] - peak) / peak * 100
 
-    # ── Summary statistics ───────────────────────────────────────────────────
+    # Summary statistics
     round_trips = _pair_round_trips(trades_df, final_close)
     stats = _compute_stats(
         signals,
         equity_df,
         round_trips,
         initial_usdt,
+        initial_btc,
         final_equity,
     )
 
@@ -283,11 +280,6 @@ def simulate_pnl(
     )
 
     return trades_df, equity_df, stats
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _pair_round_trips(
@@ -419,7 +411,7 @@ def _pair_round_trips(
                     }
                 )
 
-    # ── Drain remaining open legs at session-end mark-to-market ─────────────
+    # Drain remaining open legs at session-end mark-to-market
     # Any BUY that never found a matching SELL is closed at the last close. So basically a Market Order.
     # price so that unrealized P&L is captured in the statistics.
     while open_buys:
@@ -445,6 +437,7 @@ def _compute_stats(
     equity_df: pd.DataFrame,
     round_trips: list[dict],
     initial_usdt: float,
+    initial_btc: float,
     final_equity: float,
 ) -> dict[str, Any]:
     """
@@ -459,61 +452,137 @@ def _compute_stats(
     round_trips : list[dict]
         Output of ``_pair_round_trips()``.
     initial_usdt : float
-        Starting capital.
+        Starting USDT balance (cash leg of the initial portfolio).
+    initial_btc : float
+        Starting BTC balance.  Valued at the first candle close to produce
+        ``initial_equity_total_usdt`` — the correct denominator for
+        ``total_return_pct``.  If ``initial_btc == 0`` this equals
+        ``initial_usdt`` and the result is identical to the old formula.
     final_equity : float
         Terminal portfolio value (USDT + BTC mark-to-market).
 
     Returns
     -------
     dict
-        Keys: ``total_return_pct``, ``n_round_trips``, ``win_rate_pct``,
-        ``avg_trade_pnl_usdt``, ``max_drawdown_pct``, ``sharpe_ratio``,
-        ``sortino_ratio``, ``profit_factor``, ``avg_holding_minutes``,
+        **Overall return:**
+        ``initial_usdt``, ``initial_btc_as_usdt``,
+        ``initial_equity_total_usdt``, ``final_equity_usdt``,
+        ``total_return_pct``.
+
+        **Trade-level:**
+        ``n_round_trips``, ``win_rate_pct``, ``avg_trade_pnl_usdt``,
+        ``profit_factor``, ``avg_holding_minutes``.
+
+        **Risk:**
+        ``max_drawdown_pct``, ``sharpe_ratio``, ``sortino_ratio``.
+
+        **Signal counts:**
         ``n_buy_signals``, ``n_sell_signals``,
-        ``regime_filter_hit_rate_pct``, ``vwap_filter_hit_rate_pct``,
-        ``confidence_filter_hit_rate_pct``.
+        ``n_raw_buy_candidates``, ``n_raw_sell_candidates``.
+
+        **Filter hit rates:**
+        ``confidence_filter_hit_rate_pct``,
+        ``regime_filter_hit_rate_pct``,
+        ``vwap_filter_hit_rate_pct``.
     """
-    total_return_pct = (final_equity - initial_usdt) / initial_usdt * 100
+    # Value the initial BTC leg at the first candle close so the denominator
+    # reflects the true starting portfolio, not just the cash component.
+    # Using equity_df["close"].iloc[0] keeps consistency with how final_equity
+    # uses the last close — both anchored to actual market prices in the window.
+    initial_close = float(equity_df["close"].iloc[0])
+    initial_btc_as_usdt = initial_btc * initial_close
+    initial_equity = initial_usdt + initial_btc_as_usdt
+    total_return_pct = (final_equity - initial_equity) / initial_equity * 100
 
-    # ── Per-trade metrics ────────────────────────────────────────────────────
-    n_trades = len(round_trips)
-    pnls = [rt["pnl_usdt"] for rt in round_trips]
-    n_wins = sum(1 for p in pnls if p > 0)
-    win_rate = n_wins / n_trades if n_trades > 0 else float("nan")
-    avg_pnl = float(np.mean(pnls)) if pnls else float("nan")
+    # Per-trade metrics
+    # A "round trip" is one complete BUY → SELL pair as produced by
+    # _pair_round_trips().  Each entry in round_trips carries:
+    #   entry_price / exit_price — fill prices of the opening BUY and closing SELL
+    #   quantity                 — matched BTC quantity for this leg
+    #   pnl_usdt                 — (exit_price - entry_price) × quantity  (fees embedded)
+    #   holding_minutes          — calendar minutes between BUY fill and SELL fill
+    #                              (NaN for legs closed at session-end mark-to-market)
+    n_trades = len(round_trips)  # total completed round trips
+    pnls = [rt["pnl_usdt"] for rt in round_trips]  # USDT P&L per round trip
+    n_wins = sum(1 for p in pnls if p > 0)  # round trips with positive P&L
+    win_rate = (
+        n_wins / n_trades if n_trades > 0 else float("nan")
+    )  # fraction of profitable round trips
+    avg_pnl = (
+        float(np.mean(pnls)) if pnls else float("nan")
+    )  # mean P&L per round trip (USDT)
 
-    gross_profit = sum(p for p in pnls if p > 0)
-    gross_loss = abs(sum(p for p in pnls if p < 0))
+    gross_profit = sum(p for p in pnls if p > 0)  # sum of all winning round-trip P&Ls
+    gross_loss = abs(
+        sum(p for p in pnls if p < 0)
+    )  # absolute sum of all losing round-trip P&Ls
+    # profit_factor > 1 means gross wins exceed gross losses; ∞ means no losing trades at all
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
+    # holding_minutes: time in minutes a position was open (BUY → SELL).
+    # NaN entries (session-end mark-to-market closes) are excluded so the
+    # average reflects only round trips that completed within the session.
     holdings = [
         rt["holding_minutes"]
         for rt in round_trips
         if not np.isnan(rt["holding_minutes"])
     ]
-    avg_hold = float(np.mean(holdings)) if holdings else float("nan")
+    avg_hold = (
+        float(np.mean(holdings)) if holdings else float("nan")
+    )  # mean holding period (minutes)
 
-    # ── Drawdown ─────────────────────────────────────────────────────────────
+    # Drawdown
     max_drawdown = float(equity_df["drawdown_pct"].min())
 
-    # ── Sharpe & Sortino (annualised for 24/7 crypto at 1 m resolution) ─────
-    # Aggregate equity returns to daily to reduce noise, then annualise
-    # with sqrt(365) — standard for crypto (no weekend gaps).
-    daily_equity = equity_df["equity"].resample("1D").last().dropna()
-    daily_ret = daily_equity.pct_change().dropna()
+    # Sharpe & Sortino — adaptive resampling for 24/7 crypto (no weekend gaps).
+    #
+    # Hardcoding "1D" collapses short debug windows (e.g. BACKTEST_MAX_ROWS=500
+    # ≈ 8 h) to a single data point, making pct_change() return all NaN.
+    # Instead, pick the coarsest period that still yields ≥ 2 observations:
+    #
+    #   ≥ 2 days of 1-min data  → daily buckets,  annualise × √365
+    #   ≥ 2 hours of 1-min data → hourly buckets, annualise × √(365 × 24)
+    #   shorter / debug windows → 5-min buckets,  annualise × √(365 × 24 × 12)
+    #
+    # All three conventions are self-consistent: (mean/std) × √(periods_per_year)
+    # produces a comparable Sharpe regardless of bucket size.
+    #
+    # Risk-free rate (Rf):
+    # Standard Sharpe = (mean(Rp) − Rf_per_period) / std(Rp) × √(periods_per_year)
+    # BACKTEST_RISK_FREE_RATE is annualised (default 0.0 for crypto).
+    # It is converted to a per-period rate via linear scaling:
+    #   Rf_per_period = annual_rf / periods_per_year
+    # (exact compounding would give (1+rf)^(1/n)-1, but the difference is
+    # negligible at the low rates typically used and at high frequencies.)
+    n_candles = len(equity_df)
+    if n_candles >= 2 * 1440:  # ≥ 2 full days
+        resample_freq, periods_per_year = "1D", 365
+    elif n_candles >= 2 * 60:  # ≥ 2 hours
+        resample_freq, periods_per_year = "1h", 365 * 24
+    else:  # short / debug window
+        resample_freq, periods_per_year = "5min", 365 * 24 * 12
 
-    if len(daily_ret) > 1 and daily_ret.std() > 0:
-        sharpe = float(daily_ret.mean() / daily_ret.std() * np.sqrt(365))
+    # Per-period risk-free rate (linear approximation — negligible error)
+    rf_per_period = BACKTEST_RISK_FREE_RATE / periods_per_year
+
+    sampled_equity = equity_df["equity"].resample(resample_freq).last().dropna()
+    period_ret = sampled_equity.pct_change().dropna()
+    excess_ret = period_ret - rf_per_period  # excess return over risk-free rate
+
+    if len(excess_ret) > 1 and excess_ret.std() > 0:
+        sharpe = float(excess_ret.mean() / excess_ret.std() * np.sqrt(periods_per_year))
     else:
         sharpe = float("nan")
 
-    downside_ret = daily_ret[daily_ret < 0]
+    downside_ret = excess_ret[excess_ret < 0]
     if len(downside_ret) > 1 and downside_ret.std() > 0:
-        sortino = float(daily_ret.mean() / downside_ret.std() * np.sqrt(365))
+        sortino = float(
+            excess_ret.mean() / downside_ret.std() * np.sqrt(periods_per_year)
+        )
     else:
         sortino = float("nan")
 
-    # ── Filter hit rates ─────────────────────────────────────────────────────
+    # Filter hit rates
     # raw_buy_candidates  = candles where a buy opportunity was scored
     #                       (best_buy_micro is not None/NaN).
     # confidence_blocked  = candidates suppressed because regime_confidence
@@ -593,7 +662,12 @@ def _compute_stats(
 
     return {
         # Overall return
-        "initial_equity_usdt": initial_usdt,
+        # initial_equity_total_usdt = initial_usdt + initial_btc × first_close
+        # This is the correct denominator — using initial_usdt alone would
+        # overstate the return when the portfolio starts with a BTC position.
+        "initial_usdt": initial_usdt,
+        "initial_btc_as_usdt": initial_btc_as_usdt,
+        "initial_equity_total_usdt": initial_equity,
         "final_equity_usdt": final_equity,
         "total_return_pct": total_return_pct,
         # Trade-level
@@ -606,13 +680,24 @@ def _compute_stats(
         "max_drawdown_pct": max_drawdown,
         "sharpe_ratio": sharpe,
         "sortino_ratio": sortino,
-        # Signal counts
-        "n_buy_signals": int(exec_buy),
-        "n_sell_signals": int(exec_sell),
-        "n_raw_buy_candidates": int(raw_buy),
-        "n_raw_sell_candidates": int(raw_sell),
-        # Filter hit rates
-        "regime_filter_hit_rate_pct": regime_hit_rate,
-        "vwap_filter_hit_rate_pct": vwap_hit_rate,
-        "confidence_filter_hit_rate_pct": confidence_hit_rate,
+        # Signal counts — pre-trade activity before any gate is applied
+        "n_buy_signals": int(
+            exec_buy
+        ),  # BUY  candidates that passed ALL three gates → executed
+        "n_sell_signals": int(
+            exec_sell
+        ),  # SELL candidates that passed ALL three gates → executed
+        "n_raw_buy_candidates": int(
+            raw_buy
+        ),  # BUY  opportunities scored by the pipeline (pre-gate)
+        "n_raw_sell_candidates": int(
+            raw_sell
+        ),  # SELL opportunities scored by the pipeline (pre-gate)
+        # Filter hit rates — % of raw candidates blocked by each gate (sequentially)
+        # confidence_filter: model posterior < HMM_MIN_CONFIDENCE → regime too uncertain to trade
+        # regime_filter:     passed confidence but regime direction unfavourable (e.g. trending_down blocks BUY)
+        # vwap_filter:       passed confidence + regime but micro_price did not confirm momentum
+        "confidence_filter_hit_rate_pct": confidence_hit_rate,  # % blocked by confidence gate (first gate)
+        "regime_filter_hit_rate_pct": regime_hit_rate,  # % blocked by regime direction gate (second gate)
+        "vwap_filter_hit_rate_pct": vwap_hit_rate,  # % blocked by VWAP momentum gate (third gate)
     }

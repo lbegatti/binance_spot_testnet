@@ -120,6 +120,11 @@ def print_report(
     print(f"  Candles         :  {n_candles:>10,}")
     print(f"  Initial USDT    :  {BACKTEST_INITIAL_CAPITAL:>12,.2f}  USDT")
     print(f"  Initial BTC     :  {BACKTEST_INITIAL_BTC:>12.6f}  BTC")
+    init_total = stats.get("initial_equity_total_usdt")
+    if init_total is not None:
+        print(
+            f"  Initial equity  :  {init_total:>12,.2f}  USDT  (USDT + BTC @ first close)"
+        )
     print(f"  Taker fee       :  {BACKTEST_FEE_RATE * 100:.2f} % per side")
     print(
         "  Slippage        :  (high − low) / 2  per candle"
@@ -187,8 +192,9 @@ def print_report(
     print(f"  Sharpe ratio    :  {fmt(sharpe, '.4f')}")
     print(f"  Sortino ratio   :  {fmt(sortino, '.4f')}")
     print(
-        "  Note: Sharpe / Sortino annualised with √365 "
-        "(crypto trades 24/7; no weekend gaps)"
+        "  Note: Sharpe / Sortino adaptively annualised "
+        "(√365 daily, √8760 hourly, √105120 5-min — "
+        "crypto trades 24/7; Rf = BACKTEST_RISK_FREE_RATE)"
     )
 
     # ── 5. Trade log preview ──────────────────────────────────────────────

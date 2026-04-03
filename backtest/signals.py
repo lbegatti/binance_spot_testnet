@@ -112,7 +112,7 @@ def run_signals() -> pd.DataFrame:
     klines = fetch_klines()
     features_df = _add_hmm_features(klines)
     if BACKTEST_MAX_ROWS is not None:
-        features_df = features_df.iloc[: HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS]
+        features_df = features_df.iloc[-(HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS) :]
         logging.info(
             "Debug mode: capped at %d rows (%d replay candles).",
             len(features_df),
@@ -216,6 +216,8 @@ def run_signals() -> pd.DataFrame:
         # StandardScaler are handled INSIDE select_hmm_model() /
         # predict_current_regime() — see regime_director.py for details.
         # In brief: oldest HMM_TRAIN_ROWS (80) rows → fit; all 120 → predict.
+
+        # we want to catch 1m regime changes on a 120 rolling window
         rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
         if hist_iteration % REFIT_EVERY == 0:
             rd.select_hmm_model()  # full BIC re-fit

@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-02)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-03)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -69,7 +69,7 @@ FILES
     HMM_MIN_COVAR        = 1e-3   # regularisation floor for covariance matrices
     HMM_TRAIN_ROWS       = 80     # in-sample rows for fit(); remaining ~40 rows are out-of-sample
                                   # scaler is fit_transform'd on [:HMM_TRAIN_ROWS], transform'd on full window
-    HMM_MIN_CONFIDENCE   = 0.65  # min posterior probability (predict_proba) to allow an order;
+    HMM_MIN_CONFIDENCE   = 0.70  # min posterior probability (predict_proba) to allow an order;
                                   # below this threshold both BUY and SELL are skipped
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
@@ -81,9 +81,13 @@ FILES
     REFIT_EVERY          = 5      # HMM_REFIT_INTERVAL // HIST_INTERVAL — backtest refit cadence
     BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 30-day run)
     # Backtesting P&L (Step 4)
-    BACKTEST_INITIAL_CAPITAL = 10_000.0  # starting USDT balance for the P&L simulation
-    BACKTEST_INITIAL_BTC     = 0.0       # starting BTC balance (set > 0 to simulate existing position)
+    BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
+    BACKTEST_INITIAL_BTC     = 0.0735    # starting BTC balance (set > 0 to simulate existing position)
     BACKTEST_FEE_RATE        = 0.001     # 0.10 % taker fee per side (Binance Spot standard)
+    BACKTEST_RISK_FREE_RATE  = 0.0       # annualised risk-free rate for Sharpe/Sortino
+                                         # 0.0 = no adjustment (standard in crypto);
+                                         # set to e.g. 0.04 for a 4% T-bill proxy.
+                                         # Converted to per-period rate automatically.
     # Slippage = (high - low) / 2 per candle — computed dynamically in
     # synthetic_book.py; no separate constant needed.
 
@@ -210,7 +214,7 @@ FILES
         regime_confidence under _regime_lock:
 
         GATE 1 — CONFIDENCE (evaluated first):
-          If regime_confidence < HMM_MIN_CONFIDENCE (0.65):
+          If regime_confidence < HMM_MIN_CONFIDENCE (0.70):
             Skip BOTH BUY and SELL — model is uncertain (e.g. 55/45 split).
           If regime_confidence is None (before first historical run): transparent.
 
@@ -356,7 +360,7 @@ FILES
 
   REGIME GATES in low_latency_analysis (applied sequentially):
     GATE 1 — CONFIDENCE:
-      Skip both BUY and SELL if regime_confidence < HMM_MIN_CONFIDENCE (0.65).
+      Skip both BUY and SELL if regime_confidence < HMM_MIN_CONFIDENCE (0.70).
       None (warm-up) → transparent.
     GATE 2 — DIRECTION (only if Gate 1 passed):
       BUY  suppressed if regime ∈ {"trending_down", "high_volatility"}
@@ -557,9 +561,15 @@ FILES
                                     (including HOLDs) to produce a continuous
                                     equity curve.  Outputs: trades_df, equity_df,
                                     and a stats dict with Step 5 metrics (total
-                                    return, win rate, max drawdown, Sharpe √365,
+                                    return, win rate, max drawdown, Sharpe,
                                     Sortino, profit factor, avg holding period,
                                     regime/VWAP filter hit rates).
+                                    Sharpe and Sortino use excess returns over
+                                    BACKTEST_RISK_FREE_RATE (default 0.0) and
+                                    adaptive annualisation: √365 daily, √8760
+                                    hourly, or √105120 5-min depending on window
+                                    length.  Total return denominator includes
+                                    initial BTC valued at first-candle close.
                                     _pair_round_trips(): exhaustive FIFO BUY→SELL
                                     matching via collections.deque — supports
                                     scaling-in, layering, and pyramiding (multiple

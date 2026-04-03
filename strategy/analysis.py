@@ -196,7 +196,7 @@ class AnalysisEngine:
         7. **Regime confidence gate** — reads ``regime_director.regime_confidence``
            (posterior probability from ``predict_proba()``) under ``_regime_lock``:
            - Skip **both** sides if ``regime_confidence < HMM_MIN_CONFIDENCE``
-             (default 0.65).  A sub-threshold score means the model cannot
+             (default 0.70).  A sub-threshold score means the model cannot
              distinguish the current state clearly enough to justify an order.
            - When ``regime_confidence`` is ``None`` (before the first
              ``historical_analysis`` run) the gate is transparent.

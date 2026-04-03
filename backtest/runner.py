@@ -42,11 +42,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def run_backtest(
     export_csv: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
@@ -89,13 +84,13 @@ def run_backtest(
     )
     log.info(HEAVY)
 
-    # ── Steps 1–3: fetch klines → synthetic books → signals ──────────────
+    # Steps 1–3: fetch klines → synthetic books → signals
     signals = run_signals()
 
-    # ── Step 4: simulate P&L ─────────────────────────────────────────────
+    # Step 4: simulate P&L
     trades, equity, stats = simulate_pnl(signals)
 
-    # ── Step 5: print summary report ─────────────────────────────────────
+    # Step 5: print summary report
     print_report(signals, trades, equity, stats)
 
     if export_csv:
@@ -103,10 +98,6 @@ def run_backtest(
 
     return signals, trades, equity, stats
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     run_backtest(export_csv=False)

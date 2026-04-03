@@ -37,6 +37,14 @@ REFIT_EVERY = 5  # HMM_REFIT_INTERVAL // HIST_INTERVAL = 300 // 60
 BACKTEST_INITIAL_CAPITAL = 5000.0  # starting USDT balance for the simulation
 BACKTEST_INITIAL_BTC = 0.0735  # starting BTC balance for the simulation
 BACKTEST_FEE_RATE = 0.001  # 0.10 % taker fee per side (Binance Spot standard)
+# Annualised risk-free rate used in the Sharpe / Sortino denominator.
+# Sharpe = (mean(Rp) - Rf_per_period) / std(Rp) × √(periods_per_year)
+# For crypto there is no direct risk-free equivalent; 0.0 is the most common
+# choice in academic crypto research.  To use a T-bill proxy (e.g. 4 % p.a.)
+# set this to 0.04 — pnl.py converts it to the correct per-period rate
+# automatically regardless of the adaptive resampling bucket chosen.
+# TODO maybe the Rf rate should be equal to US Treasury bills (4 - 5 %)
+BACKTEST_RISK_FREE_RATE = 0.0  # annualized (0.0 = no risk-free rate adjustment)
 # Slippage is NOT a fixed constant — it equals half the candle range:
 #   half_spread = (high - low) / 2
 # This quantity is computed per-candle in synthetic_book.py and stored in
@@ -70,7 +78,7 @@ HMM_TRAIN_ROWS = 80
 # Minimum posterior probability the model must assign to the predicted regime
 # before an order is allowed.  When predict_proba()[-1][current_regime] < this
 # threshold the regime is treated as "uncertain" and the iteration is skipped.
-# 0.65 means at least 65 % probability mass on the winning state — a coin-flip
+# 0.70 means at least 70 % probability mass on the winning state — a coin-flip
 # (0.50 for 2 states) would always be rejected, a clear signal (0.80+) passes
 # comfortably.  Raise to 0.75–0.80 for more conservative gating.
 HMM_MIN_CONFIDENCE = 0.70

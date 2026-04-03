@@ -117,7 +117,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_LOOKBACK` | `"2 hours ago UTC"` | Kline history window (~120 rows at 1 m — captures recent intra-day regime without being stale) |
 | **HMM** | `HMM_MIN_COVAR` | `1e-3` | Regularisation floor for covariance matrices — prevents positive-definite errors |
 | **HMM** | `HMM_TRAIN_ROWS` | `80` | Number of kline rows used to **fit** the model (~⅔ of the 120-row window).  The remaining ~40 rows are genuinely out-of-sample during training — `predict()` / `predict_proba()` run on the full window |
-| **HMM** | `HMM_MIN_CONFIDENCE` | `0.65` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
+| **HMM** | `HMM_MIN_CONFIDENCE` | `0.70` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
 | **Backtesting** | `BACKTEST_LOOKBACK` | `"30 days ago UTC"` | How far back to fetch klines for the backtest dataset (~43 200 candles at 1 m) |
@@ -125,10 +125,10 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
 | **Backtesting** | `REFIT_EVERY` | `5` | Iterations between full HMM BIC re-fits during the backtest signal loop (`HMM_REFIT_INTERVAL / HIST_INTERVAL`) |
-| **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `10_000.0` | Starting USDT balance for the simulation |
-| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
+| **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `5_000.0` | Starting USDT balance for the simulation |
+| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %) |
-| **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side |
+| **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full 30-day run) |
 
 **Imported by:**
@@ -141,7 +141,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 - `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `HMM_MIN_CONFIDENCE`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
-- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `HMM_MIN_CONFIDENCE`
+- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `HMM_MIN_CONFIDENCE`
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
@@ -258,7 +258,7 @@ Binance REST API                   Binance WebSocket (production)
    - **SELL**: execute only if `_bid_vwap is None` (first ~1 min) **or** `micro_price < bid_vwap` (downward momentum confirmed).
    - This logic may be inverted for a buy-the-dip / mean-reversion strategy — see the *Historical VWAP & Momentum Filter* section.
 7. **Real-time balance tracking (no listenKey)** — `OrderExecutor` owns the single `SpotWebsocketAPIClient` connection (`wss://testnet.binance.vision/ws-api/v3`).  On socket open (`on_open` callback) it sends a signed `session.logon` frame.  On success it immediately sends `userDataStream.subscribe`.  Once confirmed, Binance pushes `outboundAccountPosition` events on the **same** connection whenever a balance changes (e.g. after an order fill).  `handle_order_response` routes these push events (frames with no `"id"` field) to `_handle_balance_update`, which writes to `state.balance_status` under `thread_balance_lock`.  If the testnet doesn't support `session.logon` or `userDataStream.subscribe`, the executor falls back silently to the REST snapshot taken at session startup.
-8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` and `regime_confidence` are never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration applies a **two-speed** update: cheap Viterbi prediction (`predict_current_regime()`) on most iterations, full model re-fit (`select_hmm_model()`) every `HMM_REFIT_INTERVAL` (300 s, i.e. every 5th iteration).  Features are **z-score scaled** via `StandardScaler` before every `fit()` / `predict()` / `predict_proba()` call — the scaler is fitted on the first `HMM_TRAIN_ROWS` (80) rows only (in-sample) and applied to the full window (out-of-sample) to avoid data leakage.  `assign_regime_labels()` runs inside `_regime_lock` on every iteration.  `low_latency_analysis` reads both `regime_label` and `regime_confidence` under `_regime_lock` and applies **two sequential gates** before any order: (a) **confidence gate** — if `regime_confidence < HMM_MIN_CONFIDENCE` (0.65), both BUY and SELL are skipped regardless of label (the model is uncertain); (b) **direction gate** — BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
+8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` and `regime_confidence` are never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration applies a **two-speed** update: cheap Viterbi prediction (`predict_current_regime()`) on most iterations, full model re-fit (`select_hmm_model()`) every `HMM_REFIT_INTERVAL` (300 s, i.e. every 5th iteration).  Features are **z-score scaled** via `StandardScaler` before every `fit()` / `predict()` / `predict_proba()` call — the scaler is fitted on the first `HMM_TRAIN_ROWS` (80) rows only (in-sample) and applied to the full window (out-of-sample) to avoid data leakage.  `assign_regime_labels()` runs inside `_regime_lock` on every iteration.  `low_latency_analysis` reads both `regime_label` and `regime_confidence` under `_regime_lock` and applies **two sequential gates** before any order: (a) **confidence gate** — if `regime_confidence < HMM_MIN_CONFIDENCE` (0.70), both BUY and SELL are skipped regardless of label (the model is uncertain); (b) **direction gate** — BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
 
 ---
 
@@ -590,7 +590,7 @@ $$\text{regime\_confidence} = P(\text{state} = \text{current\_regime} \mid \text
 
 | `regime_confidence` | Interpretation |
 |---|---|
-| ≥ `HMM_MIN_CONFIDENCE` (0.65) | Model is confident — gates apply normally |
+| ≥ `HMM_MIN_CONFIDENCE` (0.70) | Model is confident — gates apply normally |
 | < `HMM_MIN_CONFIDENCE` | Model is uncertain (e.g. 55 % vs 45 %) — **both BUY and SELL are skipped** |
 | `None` (warm-up) | No model fitted yet — gate is transparent |
 
@@ -634,7 +634,7 @@ Two gates are applied **sequentially**:
 | `regime_confidence` | Result |
 |---|---|
 | `None` (before first historical run) | ✅ transparent — all orders allowed |
-| ≥ `HMM_MIN_CONFIDENCE` (0.65) | ✅ proceed to direction gate |
+| ≥ `HMM_MIN_CONFIDENCE` (0.70) | ✅ proceed to direction gate |
 | < `HMM_MIN_CONFIDENCE` | ❌ **both** BUY and SELL skipped |
 
 **Gate 2 — Direction** (evaluated only if confidence gate passed):

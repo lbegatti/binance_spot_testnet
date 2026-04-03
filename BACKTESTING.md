@@ -279,7 +279,7 @@ RegimeDirector.assign_regime_labels()
 Two gates are applied sequentially to Flow A output:
 
 1. **Confidence gate** (applied first):
-   - Both BUY and SELL are suppressed if `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.65).
+   - Both BUY and SELL are suppressed if `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.70).
    - When `regime_confidence` is `None` (warm-up) the gate is transparent.
 
 2. **Direction gate** (applied only to candidates that passed the confidence gate):
@@ -424,19 +424,37 @@ deduction is needed inside the pairing function.
 
 ## Step 5 — Performance Metrics
 
-| Metric | Formula / Description |
-|---|---|
-| **Total return** | Sum of all trade PnLs as % of starting capital |
-| **Win rate** | `n_profitable_trades / n_total_trades` |
-| **Average trade PnL** | Mean PnL per trade |
-| **Max drawdown** | Largest peak-to-trough equity decline |
-| **Sharpe ratio** | `mean(daily_return) / std(daily_return) × √365` (crypto trades 24/7 — no weekend gaps, so √365 rather than the equity-market convention of √252) |
-| **Sortino ratio** | Like Sharpe but penalises only downside volatility |
-| **Profit factor** | `gross_profit / gross_loss` |
-| **Avg holding period** | Mean number of candles between entry and exit |
-| **Confidence filter hit rate** | % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
-| **Regime filter hit rate** | % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
-| **VWAP filter hit rate** | % of raw candidates (that passed confidence + regime gates) blocked by the VWAP momentum filter |
+All metrics below are computed by `_compute_stats()` in `backtest/pnl.py`.
+Exact formulae match the code; variable names are the same as the dict keys
+returned by the function.
+
+### Initial equity
+
+The total return denominator accounts for **both** the USDT cash balance and
+any pre-existing BTC position, valued at the first candle's close:
+
+```
+initial_btc_as_usdt     = initial_btc × close[0]
+initial_equity          = initial_usdt + initial_btc_as_usdt
+```
+
+When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
+
+### Metric table
+
+| Metric | Key in `stats` dict | Formula / Description |
+|---|---|---|
+| **Total return** | `total_return_pct` | `(final_equity − initial_equity) / initial_equity × 100` |
+| **Win rate** | `win_rate_pct` | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0` |
+| **Average trade PnL** | `avg_trade_pnl_usdt` | `mean(pnl_usdt)` over all round trips |
+| **Max drawdown** | `max_drawdown_pct` | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline |
+| **Sharpe ratio** | `sharpe_ratio` | `mean(Rp − Rf) / std(Rp − Rf) × √N` where `Rp` = period portfolio return, `Rf = BACKTEST_RISK_FREE_RATE / N` (default 0.0), and `N` = periods per year.  Bucket size is chosen **adaptively**: ≥ 2 days → daily (N = 365), ≥ 2 h → hourly (N = 8 760), otherwise 5-min (N = 105 120).  Crypto trades 24/7 so √365 (not √252) is the correct annualiser for daily buckets |
+| **Sortino ratio** | `sortino_ratio` | Same as Sharpe but `std` is computed on **downside excess returns only** (`excess_ret[excess_ret < 0]`).  Penalises only negative volatility |
+| **Profit factor** | `profit_factor` | `Σ(pnl > 0) / |Σ(pnl < 0)|`  — ratio of gross winning P&L to gross losing P&L.  `∞` when there are no losing round trips |
+| **Avg holding period** | `avg_holding_minutes` | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period) |
+| **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
+| **Regime filter hit rate** | `regime_filter_hit_rate_pct` | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
+| **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP momentum gate (third and final gate) |
 
 ---
 
