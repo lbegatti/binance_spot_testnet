@@ -15,6 +15,8 @@ Public symbols
 fmt(value, fmt, fallback)      — safe float formatter
 print_report(signals, trades, equity, stats)
                                — prints the structured backtest summary
+print_regime_validation_report(test_labels, checks, train_days, split_idx)
+                               — prints the Step 6b regime validation report
 save_csv(trades, equity)       — persists trade log & equity curve to CSV
 """
 
@@ -30,6 +32,7 @@ from config_parameters import (
     BACKTEST_FEE_RATE,
     BACKTEST_INITIAL_BTC,
     BACKTEST_INITIAL_CAPITAL,
+    HMM_MIN_CONFIDENCE,
     SYMBOL,
 )
 
@@ -234,6 +237,135 @@ def print_report(
     print("  End of report")
     print(HEAVY)
     print()
+
+
+# ---------------------------------------------------------------------------
+# Regime validation report
+# ---------------------------------------------------------------------------
+
+
+def print_regime_validation_report(
+    test_labels: pd.DataFrame,
+    checks: dict,
+    train_days: int,
+    split_idx: int,
+) -> None:
+    """
+    Print the Step 6b offline regime validation report to stdout.
+
+    Produces two sections:
+
+    1. **Per-regime statistics** — count, frequency, mean/std forward return
+       and median confidence for each label over the 3-day test set.
+    2. **Statistical tests** — one line per check with PASS / FAIL verdict.
+
+    Called by ``backtest.regime_validation.run_validation()`` at the end of
+    the pipeline.  Separated here so all console formatting lives in one place.
+
+    Parameters
+    ----------
+    test_labels : pd.DataFrame
+        Output of ``_rolling_predict()`` — must contain columns
+        ``regime_label``, ``regime_confidence``, ``close``.
+    checks : dict
+        Output of ``_run_checks()`` — keys are check names, values are
+        ``{"pass": bool, "detail": str}``.
+    train_days : int
+        Number of training days used (e.g. 7).
+    split_idx : int
+        Row index where the train/test split occurs (e.g. 10,080).
+    """
+    # Re-compute forward return for the statistics table.
+    tl = test_labels.copy()
+    tl["fwd_return"] = tl["close"].pct_change().shift(-1)
+    tl.dropna(subset=["fwd_return"], inplace=True)
+
+    n_total = len(tl)
+    counts = tl["regime_label"].value_counts()
+    freq_pct = counts / n_total * 100
+    mean_fwd = tl.groupby("regime_label")["fwd_return"].mean()
+    std_fwd = tl.groupby("regime_label")["fwd_return"].std()
+    med_conf = tl.groupby("regime_label")["regime_confidence"].median()
+
+    test_days = 10 - train_days
+
+    def verdict(ok: bool) -> str:
+        return "PASS" if ok else "FAIL"
+
+    lines = [
+        "",
+        HEAVY,
+        f" REGIME VALIDATION REPORT — {test_days}-day test set ({n_total:,} candles)",
+        HEAVY,
+        "",
+        f" Train : {train_days} days  (~{split_idx:,} rows)   model frozen after initial fit",
+        f" Test  : {test_days} days   (~{n_total:,} rows)   predict_current_regime() only",
+        "",
+        LIGHT,
+        " PER-REGIME STATISTICS",
+        LIGHT,
+        f" {'Regime':<18} {'Count':>6}  {'Freq%':>6}  "
+        f"{'Mean fwd-ret':>13}  {'Std fwd-ret':>12}  {'Med conf':>9}",
+    ]
+
+    for label in ["trending_up", "trending_down", "high_volatility", "neutral"]:
+        if label not in counts:
+            continue
+        lines.append(
+            f" {label:<18} {counts[label]:>6,}  {freq_pct[label]:>5.1f}%"
+            f"  {mean_fwd[label] * 100:>+12.5f} %"
+            f"  {std_fwd[label] * 100:>10.5f} %"
+            f"  {med_conf.get(label, float('nan')):>9.2f}"
+        )
+
+    lines += ["", LIGHT, " STATISTICAL TESTS", LIGHT]
+
+    check_order = [
+        (
+            "direction_test",
+            "Check 1 — Direction test (trending_up > neutral > trending_down):",
+        ),
+        ("welch_ttest", "Check 2 — Welch's t-test (trending_up vs trending_down):"),
+        (
+            "volatility_check",
+            "Check 3 — Volatility check (high_vol mean vol > neutral mean vol):",
+        ),
+        (
+            "confidence_floor",
+            f"Check 4 — Confidence floor (all median conf ≥ {HMM_MIN_CONFIDENCE:.2f}):",
+        ),
+        ("label_frequency", "Check 5 — Label frequency (all regimes ≥ 1 %):"),
+        (
+            "hit_rate_alignment",
+            "Check 6 — Hit-rate alignment (informational — compare with runner.py):",
+        ),
+    ]
+
+    auto_checks = [k for k, _ in check_order if k != "hit_rate_alignment"]
+
+    for key, title in check_order:
+        c = checks[key]
+        lines += [f" {title}", f"   {c['detail']}"]
+        if key != "hit_rate_alignment":
+            suffix = "  (pass if p < 0.05)" if key == "welch_ttest" else ""
+            lines.append(f"   → {verdict(c['pass'])}{suffix}")
+        lines.append("")
+
+    n_pass = sum(checks[k]["pass"] for k in auto_checks)
+    n_checks = len(auto_checks)
+    overall = (
+        "  ✓ model is statistically valid"
+        if n_pass == n_checks
+        else "  ✗ review failing checks before relying on regime filter"
+    )
+    lines += [
+        LIGHT,
+        f" OVERALL: {n_pass}/{n_checks} checks passed{overall}",
+        HEAVY,
+        "",
+    ]
+
+    print("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

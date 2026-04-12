@@ -16,12 +16,14 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 # Backtesting Parameters and Features
 # ---------------------------------------------------------------------------
-# TODO maybe 30 days is too much for crypto? maybe 10 days?
-# 30 *calendar* days (including weekends) — crypto trades 24/7 so there are
+# 10 *calendar* days (including weekends) — crypto trades 24/7 so there are
 # no weekend gaps in Binance kline data.  At 1 m resolution this yields
-# 30 × 24 × 60 = 43 200 rows.  Contrast with equity markets where "30 days"
-# would mean ~30 working days (≈ 6 calendar weeks) with weekend gaps.
-BACKTEST_LOOKBACK = "30 days ago UTC"
+# 10 × 24 × 60 = 14 400 rows.  Reduced from 30 days to keep the backtest
+# runtime manageable (~45–90 s vs ~2–4 min).
+# NOTE: backtest/regime_validation.py (Step 6b) uses its own 10-day fetch and
+# bypasses BACKTEST_MAX_ROWS intentionally — this constant only affects
+# backtest/runner.py (signal replay) and is independent of regime_validation.
+BACKTEST_LOOKBACK = "10 days ago UTC"
 BACKTEST_MAX_ROWS: int | None = 500
 VOLUME_DECAY_FACTOR = (
     0.80  # each lever down the order book retains 80% of the previous level's volume
@@ -68,12 +70,14 @@ HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC s
 # 1e-3 is a safe default for normalised financial features (return,
 # volatility, obi_proxy, trade_density all sit in the [-1, +1] range).
 HMM_MIN_COVAR = 1e-3
-# Train/predict split for select_hmm_model().
-# The HMM is fitted on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
-# "in-sample" data).  Regime prediction (Viterbi) then runs on the FULL
-# window, so the most recent candles are genuinely out-of-sample for the model.
-# Rule of thumb: ~2/3 of the total rows.  At HMM_LOOKBACK="2 hours ago UTC"
-# this gives 80 training rows and ~40 out-of-sample rows.
+# Train / predict split for select_hmm_model() — walk-forward style.
+# The HMM is fitted ONLY on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
+# "in-sample" data).  Regime prediction (Viterbi) then runs ONLY on the
+# remaining rows klines_df[HMM_TRAIN_ROWS:] (most recent, out-of-sample).
+# self.current_regime / regime_confidence therefore always reflect a candle
+# the model has never seen during fit() — no look-ahead bias.
+# Rule of thumb: ~2/3 for training.  At HMM_LOOKBACK="2 hours ago UTC"
+# (≈120 rows) this gives 80 training rows and ~40 out-of-sample rows.
 HMM_TRAIN_ROWS = 80
 # Minimum posterior probability the model must assign to the predicted regime
 # before an order is allowed.  When predict_proba()[-1][current_regime] < this

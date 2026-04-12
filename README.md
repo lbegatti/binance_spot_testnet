@@ -120,7 +120,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_MIN_CONFIDENCE` | `0.70` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
-| **Backtesting** | `BACKTEST_LOOKBACK` | `"30 days ago UTC"` | How far back to fetch klines for the backtest dataset (~43 200 candles at 1 m) |
+| **Backtesting** | `BACKTEST_LOOKBACK` | `"10 days ago UTC"` | How far back to fetch klines for the backtest dataset (~14 400 candles at 1 m).  Reduced from 30 days to keep runtime manageable (~45–90 s vs ~2–4 min) |
 | **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
@@ -129,7 +129,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %) |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
-| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full 30-day run) |
+| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full 10-day run) |
 
 **Imported by:**
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
@@ -700,7 +700,21 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
 | `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, `half_spread` fill, equity curve, FIFO round-trip pairing, Step 5 metrics |
 | `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/` |
-| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`) and CSV export (`save_csv`) — AI-authored |
+| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
+| `backtest/regime_validation.py` | ✅ done | Offline long-horizon regime validation — 7-day train / 3-day test (10-day dataset, frozen HMM), six statistical checks, `python -m backtest.regime_validation` |
+
+> ⚠️ **Important — re-run after any change to `strategy/regime_director.py`**  
+> `regime_validation.py` is the **sanity check** for the HMM regime filter.  
+> Whenever `RegimeDirector` logic is modified (feature columns, BIC search range,
+> label-assignment rules, confidence threshold, etc.) the validation tool **must**
+> be re-run to confirm that the frozen model still produces statistically meaningful
+> labels on out-of-sample data.  A failing check (especially Check 1 — direction
+> test, or Check 2 — Welch's t-test) is a strong signal that the change broke the
+> regime filter's discriminative power and should be reviewed before deploying live.
+>
+> ```bash
+> python -m backtest.regime_validation
+> ```
 
 ---
 

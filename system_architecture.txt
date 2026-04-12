@@ -36,9 +36,10 @@ FILES
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
     pnl.py                            — P&L simulation: balance guard, half_spread fill, FIFO round-trip pairing, equity curve, Step 5 metrics
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
+    regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 7-day train / 3-day test, frozen HMM, six checks
     reporting/                        — Console report formatting and CSV export (AI-authored)
-      __init__.py                     — Re-exports fmt, print_report, save_csv
-      formatters.py                   — fmt(), print_report(), save_csv(), HEAVY/LIGHT/PREVIEW constants
+      __init__.py                     — Re-exports fmt, print_report, save_csv, print_regime_validation_report
+      formatters.py                   — fmt(), print_report(), save_csv(), print_regime_validation_report(), HEAVY/LIGHT/PREVIEW constants
 
 ─────────────────────────────────────────────────────────────────────────────
 1. CONFIGURATION  (config_parameters.py)
@@ -74,12 +75,13 @@ FILES
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
-    BACKTEST_LOOKBACK    = "30 days ago UTC"  # kline fetch window for backtest dataset (~43 200 candles)
+    BACKTEST_LOOKBACK    = "10 days ago UTC"  # kline fetch window for backtest dataset (~14 400 candles;
+                                               # reduced from 30 days for faster runtime ~45-90 s)
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
     VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
     REFIT_EVERY          = 5      # HMM_REFIT_INTERVAL // HIST_INTERVAL — backtest refit cadence
-    BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 30-day run)
+    BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 10-day run)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
     BACKTEST_INITIAL_BTC     = 0.0735    # starting BTC balance (set > 0 to simulate existing position)
@@ -594,10 +596,17 @@ FILES
                                     Entry point: python -m backtest.runner.
 
   backtest/reporting/            — Console report formatting and CSV export.
-    __init__.py                  — Re-exports fmt, print_report, save_csv.
+    __init__.py                  — Re-exports fmt, print_report, save_csv,
+                                   print_regime_validation_report.
     formatters.py                — print_report(): structured console report
                                     (SESSION, SIGNALS, P&L SUMMARY, RISK
                                     METRICS, TRADE LOG PREVIEW).
+                                    print_regime_validation_report(): formats
+                                    the Step 6b regime validation output
+                                    (per-regime stats, direction test, Welch's
+                                    t-test, volatility check, confidence
+                                    floor, label frequency, hit-rate
+                                    alignment).
                                     save_csv(): timestamped trades_*.csv and
                                     equity_*.csv to backtest/results/.
                                     fmt(): safe float formatter (NaN / inf safe).
@@ -605,7 +614,30 @@ FILES
                                     (GitHub Copilot / GPT-4o) — see README.md
                                     disclaimer.
 
+  backtest/regime_validation.py  — Standalone offline long-horizon regime
+                                    diagnostic.  Entry point:
+                                    python -m backtest.regime_validation.
+                                    Fetches 10 days of 1 m klines, applies a
+                                    7-day train / 3-day test split
+                                    (~10,080 / ~4,200 rows).  Fits
+                                    RegimeDirector once on the tail of the
+                                    training window, then freezes the model
+                                    and rolls predict_current_regime() over
+                                    every test candle (120-row warm-up
+                                    discarded).  Six checks computed on the
+                                    ~4,200 labelled candles:
+                                      1. Direction test (return ordering)
+                                      2. Welch's t-test (p < 0.05)
+                                      3. Volatility check
+                                      4. Confidence floor (≥ HMM_MIN_CONFIDENCE)
+                                      5. Label frequency (no regime < 1 %)
+                                      6. Hit-rate alignment (informational)
+                                    BACKTEST_MAX_ROWS intentionally bypassed.
+                                    Report printed by
+                                    reporting/formatters.print_regime_validation_report().
+
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,
+                         regime_validation.py ✅,
                          visualization.py — pending.
 """

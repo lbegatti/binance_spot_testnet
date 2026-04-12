@@ -1,8 +1,8 @@
 # Backtesting Plan — Binance Spot Testnet Strategy
 
-> **Status:** Steps 1–5 implemented (``data.py``, ``synthetic_book.py``,
-> ``signals.py``, ``pnl.py``, ``runner.py``).  Steps 6–7 (parameter grid,
-> visualisation) are pending.  See the Implementation Roadmap at the bottom
+> **Status:** Steps 1–6b implemented (``data.py``, ``synthetic_book.py``,
+> ``signals.py``, ``pnl.py``, ``runner.py``, ``regime_validation.py``).  Step 7
+> (visualisation) is pending.  See the Implementation Roadmap at the bottom
 > for a per-module progress tracker.
 
 ---
@@ -458,22 +458,55 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 
 ---
 
-## Step 6 — Regime Validation (Optional but Recommended)
+## Step 6 — Regime Validation
 
-Before accepting the regime labels as meaningful, verify the model on
-historical data:
+Two levels of regime validation are implemented:
 
-1. Fit `RegimeDirector` on the first 20 days of the 30-day dataset (training
-   set).
-2. Apply regime labels to the remaining 10 days (test set) using
-   `predict_current_regime()` only (no refit on test data).
-3. For each predicted regime, compute the forward 1-minute return.
-4. Check that:
-   - `trending_up`   candles have statistically higher forward returns than
-     `trending_down` candles.
-   - `high_volatility` candles have higher realised volatility than `neutral`
-     candles.
-5. This provides evidence that the HMM labels are not arbitrary.
+### 6a — Inline train / test split (implemented in `strategy/regime_director.py`)
+
+Every time `select_hmm_model()` is called (initial fit + every 5-minute refit
+during the live session and in the backtesting loop), the following split is
+applied to the 2-hour lookback window (`HMM_LOOKBACK = "2 hours ago UTC"`,
+≈ 120 rows at 1-minute resolution):
+
+```
+features[:HMM_TRAIN_ROWS]    → fit()  +  bic()   (80 rows, ~67 % of window)
+features[HMM_TRAIN_ROWS:]    → predict()  +  predict_proba()   (≈ 40 rows, ~33 %)
+```
+
+* The scaler (`StandardScaler`) is `fit_transform`'d on the **training rows
+  only** — mean and standard deviation from held-out candles cannot leak into
+  the model.
+* `model.predict()` and `model.predict_proba()` run on `features[HMM_TRAIN_ROWS:]`
+  only — the rows the model has **never seen** during `fit()`.
+* `self.current_regime` and `self.regime_confidence` therefore always reflect a
+  candle that was genuinely out-of-sample.  This is a direct application of the
+  Step 6 philosophy within the live 2-hour window.
+
+`predict_current_regime()` (cheap Viterbi path, used between full refits)
+applies the **same** split: it transforms `features[HMM_TRAIN_ROWS:]` with the
+already-fitted scaler and predicts only on those rows.
+
+### 6b — Offline long-horizon validation (`backtest/regime_validation.py`) ✅
+
+Fetches 10 days of 1-minute klines and applies a **7-day train / 3-day test**
+split (~10,080 / ~4,200 rows):
+
+1. Fit `RegimeDirector` on the **last 120 rows** of the 7-day training period
+   (equivalent to the live 2-hour window) — model and scaler frozen after this call.
+2. Roll the frozen model over every candle in the 3-day test set using
+   `predict_current_regime()` only — no refit.  First 120 candles skipped (warm-up).
+3. For each predicted regime, compute the forward 1-minute return and run six checks:
+   - `trending_up` candles have statistically higher forward returns than `trending_down`.
+   - `high_volatility` candles have higher realised volatility than `neutral`.
+   - No regime collapses below 1 % frequency (over-parameterisation guard).
+   - Median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE` per label.
+   - Welch's t-test (p < 0.05) between `trending_up` and `trending_down` returns.
+   - Hit-rate alignment: % blocked per side (BUY / SELL / both) for comparison with live session.
+4. Results are printed by `backtest/reporting/formatters.print_regime_validation_report()`.
+
+> `BACKTEST_MAX_ROWS` is bypassed — the full 10-day dataset is required.
+> Run with: `python -m backtest.regime_validation`
 
 ---
 
@@ -555,8 +588,31 @@ concrete file in `backtest/`.
   SUMMARY, RISK METRICS, TRADE LOG PREVIEW.  Optionally saves timestamped
   ``trades_*.csv`` and ``equity_*.csv`` to ``backtest/results/``.
   Run with ``python -m backtest.runner``.  *(Implemented.)*
-- ⬜ **Step 6 — Parameter grid** *(optional)* — Wraps the runner in a loop
-  over the sensitivity grid described in Step 7.
+- ✅ **Step 6a — Inline regime validation** (`strategy/regime_director.py`) —
+  Train/test split is applied inside every `select_hmm_model()` and
+  `predict_current_regime()` call: the model fits on `features[:HMM_TRAIN_ROWS]`
+  (first 80 rows, ~67 % of the 2-hour window) and predicts only on
+  `features[HMM_TRAIN_ROWS:]` (most-recent ~40 rows, never seen during fit).
+  `self.current_regime` and `self.regime_confidence` always reflect a genuinely
+  out-of-sample candle.  *(Implemented.)*
+- ✅ **Step 6b — Offline long-horizon regime validation** (`backtest/regime_validation.py`) —
+  Standalone diagnostic script (run with `python -m backtest.regime_validation`).
+  Fetches 10 days of 1-minute klines, splits them **7-day train / 3-day test**
+  (~10,080 / ~4,200 rows).  The HMM is fitted **once** on the last 120 rows of
+  the training period and then **frozen** — no re-fits during the test phase.
+  A rolling 120-row window is applied to every test candle using only
+  `predict_current_regime()` (cheap Viterbi, frozen model).  Six checks are
+  then computed on the ~4,200 labelled test candles:
+  1. **Direction test** — `trending_up` mean forward return > `neutral` > `trending_down`.
+  2. **Welch's t-test** — p < 0.05 between `trending_up` and `trending_down` return distributions.
+  3. **Volatility check** — mean volatility feature higher for `high_volatility` than `neutral`.
+  4. **Confidence floor** — median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE` per label.
+  5. **Label frequency** — no regime < 1 % (regime collapse guard).
+  6. **Hit-rate alignment** (informational) — % of candles blocked per side (BUY / SELL / both).
+  The formatted report is printed by
+  `backtest/reporting/formatters.print_regime_validation_report()`.
+  `BACKTEST_MAX_ROWS` is intentionally bypassed — the full 10-day dataset is
+  required for the 7/3 split to be statistically meaningful.  *(Implemented.)*
 - ⬜ **Step 7 — `backtest/visualization.py`** — Plots and charts to inspect
   backtest results visually.  Suggested panels:
   - **Equity curve** — cumulative P&L over time, with drawdown shaded below
@@ -575,5 +631,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-04-03*
+*Document last updated: 2026-04-13*
 

@@ -41,9 +41,10 @@ class RegimeDirector:
 
     A **train / predict split** is applied in ``select_hmm_model()``: the model
     is fitted only on the first ``HMM_TRAIN_ROWS`` rows of the downloaded
-    window (older, in-sample data).  Regime inference (Viterbi) then runs on
-    the **full** window, so ``current_regime`` always reflects the latest
-    candle, which was genuinely out-of-sample during training.
+    window (older, in-sample data).  Regime inference (Viterbi) and posterior
+    confidence then run on ``features[HMM_TRAIN_ROWS:]`` only — the most-recent
+    rows the model has **never seen** during training — so ``current_regime``
+    and ``regime_confidence`` always reflect a genuinely out-of-sample candle.
 
     State labels are assigned in ``assign_regime_labels()`` using a rank-based
     directional assignment and volatility thresholds.  Possible labels:
@@ -79,8 +80,9 @@ class RegimeDirector:
             ``select_hmm_model()`` is called.
         klines_df (pd.DataFrame | None): Feature DataFrame; ``None`` until
             ``get_klines_data()`` is called.
-        regimes (np.ndarray | None): Predicted state sequence for the full
-            kline window; ``None`` until ``select_hmm_model()`` is called.
+        regimes (np.ndarray | None): Predicted state sequence for the **test
+            rows only** (``klines_df[HMM_TRAIN_ROWS:]``); ``None`` until
+            ``select_hmm_model()`` is called.
         current_regime (int | None): State index of the most recent candle.
         regime_label (str | None): Human-readable label for ``current_regime``;
             ``None`` until ``assign_regime_labels()`` is called.
@@ -162,7 +164,7 @@ class RegimeDirector:
         )
         df = pd.DataFrame(
             raw_data,
-            columns=[
+            columns=[  # type: ignore[arg-type]  # pandas-stubs Axes union is too narrow for list[str]
                 "open_time",
                 "open",
                 "high",
@@ -202,10 +204,11 @@ class RegimeDirector:
           calls use only this slice.  At the default ``HMM_LOOKBACK`` of 2 h
           (≈ 120 rows) and ``HMM_TRAIN_ROWS = 80``, roughly the oldest ⅔ of
           the window is used for training.
-        * **Prediction set** — the **full** feature matrix.  After the best
-          model is selected, ``model.predict()`` runs on all rows so that
-          ``self.current_regime`` reflects the very latest candle, which was
-          genuinely out-of-sample during training.
+        * **Test set (prediction set)** — ``features[HMM_TRAIN_ROWS:]`` — the
+          most-recent ~40 rows that the model has **never seen** during
+          ``fit()``.  ``model.predict()`` and ``predict_proba()`` run on these
+          rows only, so ``self.current_regime`` and ``self.regime_confidence``
+          always reflect a candle that was genuinely out-of-sample.
 
         **Feature scaling** via ``StandardScaler`` is applied before any
         model call:
@@ -237,20 +240,24 @@ class RegimeDirector:
           ``n`` is skipped with a ``WARNING`` log and the search continues.
         * BIC is computed as ``model.bic(train_features)`` — lower is better.
 
-        The model with the lowest BIC is stored in ``self.model``.  The full
-        state sequence is predicted via ``self.model.predict(features)`` and
-        stored in ``self.regimes``.  The state of the **last candle** is stored
-        in ``self.current_regime`` as a plain ``int``.
+        The model with the lowest BIC is stored in ``self.model``.  The test
+        state sequence is predicted via ``self.model.predict(test_features_scaled)``
+        and stored in ``self.regimes``.  The state of the **last test candle** is
+        stored in ``self.current_regime`` as a plain ``int``.
 
         Requires ``get_klines_data()`` to have been called first.
 
         Raises:
-            AttributeError: if ``self.klines_df`` is ``None`` (``get_klines_data``
+            RuntimeError: if ``self.klines_df`` is ``None`` (``get_klines_data``
                 not yet called).
             RuntimeError: if every candidate ``n`` fails to produce a valid
                 covariance matrix.  Increase ``HMM_MIN_COVAR`` or decrease
                 ``HMM_MAX_REGIMES`` in ``config_parameters.py`` to resolve.
         """
+        assert self.klines_df is not None, (
+            "klines_df is None — call get_klines_data() before select_hmm_model()."
+        )
+
         features = self.klines_df[HMM_FEATURE_COLS].values
 
         # --- train / predict split ---
@@ -262,18 +269,32 @@ class RegimeDirector:
         # --- feature scaling ---
         # Fit the scaler ONLY on the training rows so that the mean and std
         # of recent (held-out) candles cannot leak into the model.
-        # transform() is then applied to the full window for prediction.
+        # transform() is then applied to the test window for prediction.
         # This is important because trade_density (num_trades / volume) can
         # be orders of magnitude larger than return or obi_proxy [-1, +1],
         # which would otherwise dominate the covariance structure.
-        self.scaler = StandardScaler()
-        train_features_scaled = self.scaler.fit_transform(train_features)
-        features_scaled = self.scaler.transform(features)
+        #
+        # A local variable is used here so that the type-checker sees a plain
+        # StandardScaler (not StandardScaler | None) for fit_transform() and
+        # transform() calls below, avoiding false "Member 'None' of …" warnings.
+        scaler = StandardScaler()
+        train_features_scaled = scaler.fit_transform(train_features)
+
+        # Scale the TEST rows using the scaler fitted on training rows only.
+        # features[HMM_TRAIN_ROWS:] are the most-recent, genuinely out-of-sample
+        # candles — the model has never seen them during fit().  Predicting only
+        # on these rows means self.current_regime and self.regime_confidence
+        # always reflect a state the model did NOT train on.
+        test_features = features[HMM_TRAIN_ROWS:]
+        test_features_scaled = scaler.transform(test_features)
+
+        # Persist the fitted scaler so predict_current_regime() can reuse it.
+        self.scaler = scaler
 
         logging.info(
-            "RegimeDirector: fitting on %d rows (train), predicting on %d rows (full)",
+            "RegimeDirector: fitting on %d rows (train), predicting on %d rows (test)",
             len(train_features),
-            len(features),
+            len(test_features),
         )
 
         best_hmm_model, best_hmm_bic = None, np.inf
@@ -307,15 +328,17 @@ class RegimeDirector:
             )
 
         self.model = best_hmm_model
-        # Predict on the FULL scaled window — out-of-sample rows included
-        self.regimes = self.model.predict(features_scaled)
+        assert self.model is not None  # guaranteed by the RuntimeError check above
+
+        # Predict on the TEST dataset - rows used for training are not included
+        self.regimes = self.model.predict(test_features_scaled)
         self.current_regime = int(self.regimes[-1])
 
         # Posterior probability of the winning state for the latest candle.
         # predict_proba() runs Forward-Backward (vs Viterbi for predict()):
         # it returns the marginal probability of each state at each time step.
         # We only need the last row [-1] and the current state's column.
-        proba = self.model.predict_proba(features_scaled)
+        proba = self.model.predict_proba(test_features_scaled)
         self.regime_confidence = float(proba[-1, self.current_regime])
 
         logging.info(
@@ -374,15 +397,26 @@ class RegimeDirector:
                 "predict_current_regime() called before select_hmm_model(). "
                 "Run the initial fit first."
             )
+        assert self.model is not None  # narrow type for static checker
+        assert self.klines_df is not None, (
+            "klines_df is None — call get_klines_data() before predict_current_regime()."
+        )
+        assert self.scaler is not None, (
+            "scaler is None — select_hmm_model() must have been called first."
+        )
         features = self.klines_df[HMM_FEATURE_COLS].values
         # Reuse the scaler fitted during select_hmm_model() so the feature
         # distribution seen by the model is identical to training time.
-        features_scaled = self.scaler.transform(features)
-        self.regimes = self.model.predict(features_scaled)
+        # Predict only on the test (out-of-sample) rows — same split as
+        # select_hmm_model(): features[HMM_TRAIN_ROWS:].
+        test_features = features[HMM_TRAIN_ROWS:]
+        test_features_scaled = self.scaler.transform(test_features)
+        self.regimes = self.model.predict(test_features_scaled)
+
         self.current_regime = int(self.regimes[-1])
 
         # Refresh the posterior confidence for the latest candle.
-        proba = self.model.predict_proba(features_scaled)
+        proba = self.model.predict_proba(test_features_scaled)
         self.regime_confidence = float(proba[-1, self.current_regime])
 
         logging.info(
@@ -440,6 +474,12 @@ class RegimeDirector:
         Returns:
             str: The regime label for the current candle.
         """
+        assert self.model is not None, (
+            "model is None — call select_hmm_model() before assign_regime_labels()."
+        )
+        assert self.current_regime is not None, (
+            "current_regime is None — call select_hmm_model() before assign_regime_labels()."
+        )
         means = pd.DataFrame(self.model.means_, columns=HMM_FEATURE_COLS)
 
         # Thresholds for secondary labels

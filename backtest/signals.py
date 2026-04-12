@@ -127,13 +127,15 @@ def run_signals() -> pd.DataFrame:
     # select_hmm_model() — no explicit split is needed here.
     # Concretely, select_hmm_model() does:
     #   train_features = klines_df[:HMM_TRAIN_ROWS]   (first 80 rows — in-sample)
-    #   scaler.fit_transform(train_features)            (scale on training rows only)
-    #   scaler.transform(klines_df)                     (apply same scale to all 120 rows)
-    #   model.fit(train_scaled)                         (EM on 80 rows)
-    #   model.predict(full_scaled)                      (Viterbi on all 120 rows)
-    #   model.predict_proba(full_scaled)                (confidence on all 120 rows)
-    # current_regime / regime_confidence reflect the LAST (most recent) row,
-    # which was genuinely out-of-sample during training.
+    #   scaler.fit_transform(train_features)            (scale fitted on training rows only;
+    #                                                    recent candles cannot leak into mean/std)
+    #   test_features  = klines_df[HMM_TRAIN_ROWS:]    (last ~40 rows — out-of-sample)
+    #   scaler.transform(test_features)                 (same scale applied to test rows)
+    #   model.fit(train_scaled)                         (EM on 80 rows only)
+    #   model.predict(test_scaled)                      (Viterbi on ~40 test rows only)
+    #   model.predict_proba(test_scaled)                (confidence on ~40 test rows only)
+    # current_regime / regime_confidence reflect the LAST of those ~40 test rows,
+    # which was genuinely out-of-sample during training (walk-forward split).
     rd = RegimeDirector()
     rd.klines_df = features_df.iloc[:HMM_LOOKBACK_ROWS]
     rd.select_hmm_model()
@@ -215,7 +217,8 @@ def run_signals() -> pd.DataFrame:
         # rd.klines_df on every iteration.  The train/predict split and
         # StandardScaler are handled INSIDE select_hmm_model() /
         # predict_current_regime() — see regime_director.py for details.
-        # In brief: oldest HMM_TRAIN_ROWS (80) rows → fit; all 120 → predict.
+        # In brief: oldest HMM_TRAIN_ROWS (80) rows → fit (in-sample);
+        #           newest ~40 rows (features[HMM_TRAIN_ROWS:]) → predict (out-of-sample).
 
         # we want to catch 1m regime changes on a 120 rolling window
         rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
