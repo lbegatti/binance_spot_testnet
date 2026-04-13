@@ -72,7 +72,7 @@ binance_spot_testnet/
 │
 ├── backtest/                          # Offline backtesting framework (see BACKTESTING.md)
 │   ├── __init__.py
-│   ├── data.py                        # Historical kline downloader (30 days, 1 m)
+│   ├── data.py                        # Historical kline downloader (10 days, 1 m)
 │   ├── synthetic_book.py              # Synthetic 50-level order book builder (per kline row)
 │   ├── signals.py                     # Signal replay loop — full pipeline + regime & VWAP filters
 │   ├── pnl.py                         # P&L simulation — balance guard, fill price, equity curve, metrics
@@ -501,7 +501,12 @@ This logic may be **inverted** in the future to implement a **buy-the-dip** / **
 
 ### Theoretical Background
 
-A **Hidden Markov Model (HMM)** is a statistical model for systems that move through a finite set of states over time, where those states are **not directly observable** — they are _hidden_.  What you _can_ observe at each time step is a signal that depends probabilistically on whichever hidden state the system is currently in.
+> 📖 **Reference:** The HMM theory is explained with examples in this paper by
+> Jurafsky, D. & Martin, J.H. — *Speech and Language Processing*, 3rd ed.,
+> Appendix A — *Hidden Markov Models*.
+> [Read online (Stanford)](https://web.stanford.edu/~jurafsky/slp3/A.pdf) **[1]**
+
+A **Hidden Markov Model (HMM)** **[1]** is a statistical model for systems that move through a finite set of states over time, where those states are **not directly observable** — they are _hidden_.  What you _can_ observe at each time step is a signal that depends probabilistically on whichever hidden state the system is currently in.
 
 In this project:
 
@@ -677,8 +682,8 @@ websocket_main.py startup
 
 ## Backtesting
 
-A backtesting framework is being built to replay the live strategy against
-30 days of historical 1-minute klines (~43 200 candles).  Because Binance does
+A backtesting framework has been built to replay the live strategy against
+10 days of historical 1-minute klines (~14 400 candles).  Because Binance does
 not expose historical Level-2 order book data, a **synthetic 50-level depth
 ladder** is reconstructed from each kline's OHLCV data and taker volume split,
 then fed through the **same production scoring pipeline** used by
@@ -925,3 +930,21 @@ historical_analysis()                       low_latency_analysis()
 `low_latency_analysis` is **never blocked** for more than a microsecond by the
 regime machinery.  The only contention point is the label write/read, which is
 effectively instantaneous.
+
+---
+
+## References
+
+**[1]** Jurafsky, D. & Martin, J.H. (2024). *Speech and Language Processing*, 3rd edition, Appendix A — *Hidden Markov Models*. Stanford University. Available at: <https://web.stanford.edu/~jurafsky/slp3/A.pdf>
+
+> This appendix provides the formal definitions of the Transition Probability
+> Matrix $A$, the Emission Probability $B$, the Initial Probability $\pi$, the
+> Baum-Welch (EM) training algorithm, and the Viterbi decoding algorithm that
+> underpin the `RegimeDirector` implementation in `strategy/regime_director.py`.
+> Recommended reading for anyone who wants to follow the HMM theory described
+> in the *HMM Regime Detection* section and in *Appendix A* of this document.
+
+---
+
+*Document last updated: 2026-04-14*
+

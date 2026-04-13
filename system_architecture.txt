@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-03)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-14)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -513,12 +513,12 @@ FILES
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
 
 ─────────────────────────────────────────────────────────────────────────────
-8. BACKTESTING  (backtest/)
+7. BACKTESTING  (backtest/)
 ─────────────────────────────────────────────────────────────────────────────
-  Offline replay of the live strategy on 30 days of historical 1-min klines.
+  Offline replay of the live strategy on 10 days of historical 1-min klines.
   Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
-  backtest/data.py            — fetch_klines(): downloads ~43 200 candles via
+  backtest/data.py            — fetch_klines(): downloads ~14 400 candles via
                                 Client.get_historical_klines() (public, no auth).
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +

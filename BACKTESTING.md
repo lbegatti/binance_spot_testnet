@@ -43,8 +43,8 @@ prices or queue position.
 ### Suggested window
 - **Instrument:** BTCUSDT
 - **Interval:** 1 minute  (matches the `HMM_INTERVAL` already used in production)
-- **Lookback:** 30 days  (~43 200 candles — enough for statistical significance;
-  short enough to be downloaded in a single session)
+- **Lookback:** 10 days  (~14 400 candles — balances statistical significance with
+  runtime (~45–90 s); crypto trades 24/7 so all 10 days are fully populated)
 
 ### Columns returned per candle
 ```
@@ -195,18 +195,18 @@ live system.  No simplified proxy rules are needed.
 
 ### Per-candle procedure
 
-The dataset contains **~43,200 rows** (30 days × 1,440 candles/day at 1 m).
+The dataset contains **~14,400 rows** (10 days × 1,440 candles/day at 1 m).
 For **each row** a fresh synthetic 50-level order book is constructed (Step 2c),
 and the full production pipeline is run on it.  This produces one signal
 decision per minute — the exact equivalent of one `low_latency_analysis()`
 iteration in the live system (which runs every 1 s, but at 1 m kline resolution
 the minimum granularity is 1 candle = 1 min).
 
-> **Memory note:** 43,200 candles × 100 rows per book (50 bids + 50 asks) = 4,320,000
+> **Memory note:** 14,400 candles × 100 rows per book (50 bids + 50 asks) = 1,440,000
 > order book rows in total — but they are **never all in memory at once**.  The loop
 > constructs one 100-row DataFrame, runs the pipeline on it, records the signal,
 > then discards it before moving to the next candle.  Peak memory at any moment is
-> one synthetic book (100 rows) plus the 43,200-row klines DataFrame — well under
+> one synthetic book (100 rows) plus the 14,400-row klines DataFrame — well under
 > 10 MB and entirely negligible.
 
 There are **three independent data flows** running in parallel at every candle
@@ -489,24 +489,202 @@ already-fitted scaler and predicts only on those rows.
 
 ### 6b — Offline long-horizon validation (`backtest/regime_validation.py`) ✅
 
-Fetches 10 days of 1-minute klines and applies a **7-day train / 3-day test**
-split (~10,080 / ~4,200 rows):
+#### Purpose
 
-1. Fit `RegimeDirector` on the **last 120 rows** of the 7-day training period
-   (equivalent to the live 2-hour window) — model and scaler frozen after this call.
-2. Roll the frozen model over every candle in the 3-day test set using
-   `predict_current_regime()` only — no refit.  First 120 candles skipped (warm-up).
-3. For each predicted regime, compute the forward 1-minute return and run six checks:
-   - `trending_up` candles have statistically higher forward returns than `trending_down`.
-   - `high_volatility` candles have higher realised volatility than `neutral`.
-   - No regime collapses below 1 % frequency (over-parameterisation guard).
-   - Median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE` per label.
-   - Welch's t-test (p < 0.05) between `trending_up` and `trending_down` returns.
-   - Hit-rate alignment: % blocked per side (BUY / SELL / both) for comparison with live session.
-4. Results are printed by `backtest/reporting/formatters.print_regime_validation_report()`.
+The inline 80/40 split inside `select_hmm_model()` (Step 6a) validates regime
+labels within a **2-hour rolling window**.  Step 6b asks a harder question:
+*are the HMM labels still meaningful over a much longer, fully out-of-sample
+horizon?*
 
-> `BACKTEST_MAX_ROWS` is bypassed — the full 10-day dataset is required.
+Specifically it answers four questions:
+- Does `trending_up` produce statistically higher forward returns than `trending_down`?
+- Does `high_volatility` produce higher realised volatility than `neutral`?
+- Are the labels stable in frequency (no regime collapse)?
+- Is `regime_confidence` consistently above `HMM_MIN_CONFIDENCE` for each label?
+
+#### Dataset
+
+`BACKTEST_LOOKBACK = "10 days ago UTC"` fetches **~14,400 rows** at 1 m
+(10 × 24 × 60 = 14,400 candles).  Reduced from 30 days to keep runtime
+manageable (~45–90 s vs ~2–4 min) — crypto trades 24/7 so all 10 days are
+fully populated with no weekend gaps.
+
+A **single walk-forward hold-out split** is used (intentionally different from
+the rolling 2 h window used in production — the goal is to measure label
+stability at a horizon the live system never observes in one shot):
+
+```
+full dataset:  ~14,400 rows   (10 days × 1,440 candles/day at 1 m)
+  ├── train set:  first 7 days  →  ~10,080 rows   (~70 %)
+  └── test  set:  last  3 days  →   ~4,320 rows   (~30 %)
+
+split_idx = 7 × 1440 = 10,080
+train_df  = features_df.iloc[:split_idx]
+test_df   = features_df.iloc[split_idx:]
+```
+
+> **`BACKTEST_MAX_ROWS` must be bypassed** — the default cap of 500 rows
+> in `config_parameters.py` collapses the split to a few hours of train data,
+> which is statistically meaningless.  `regime_validation.py` calls
+> `fetch_klines()` and `_add_hmm_features()` directly, ignoring
+> `BACKTEST_MAX_ROWS`.
+
+#### Phase 1 — One-time Training Fit (10,080 rows)
+
+1. Call `RegimeDirector.select_hmm_model()` **once** on the last 120 rows of
+   `train_df` (equivalent to the live 2-hour window).
+2. Call `assign_regime_labels()` → capture the frozen `{state_idx → label}` mapping.
+3. **Freeze** `self.model` and `self.scaler`.  They are **never re-fitted** on
+   the test set — this is the constraint that makes the test set genuinely
+   out-of-sample at the long-horizon level.
+
+#### Phase 2 — Rolling Label Assignment on Test Set (frozen model)
+
+For each candle `t` in `test_df`:
+
+1. Slice `features_df[t − HMM_LOOKBACK_ROWS : t]` — the same 2 h rolling
+   window (120 rows) that the live system uses.
+2. Assign the slice to `rd.klines_df`.
+3. Call **only** `rd.predict_current_regime()` — no `select_hmm_model()`,
+   no refit, frozen model throughout.
+4. Call `rd.assign_regime_labels()`.
+5. Record `(timestamp, regime_label, regime_confidence)`.
+
+> **Warm-up:** The first `HMM_LOOKBACK_ROWS` (120) candles of the test set
+> cannot be labelled because the rolling window would reach back into the
+> training set.  The loop starts at `t = split_idx + HMM_LOOKBACK_ROWS`
+> (effective test set ≈ 4,200 rows — negligible difference from 4,320).
+
+#### Phase 3 — Validation Checks
+
+For every labelled candle `t`, the 1-candle forward return is computed:
+
+```
+forward_return(t) = close(t+1) / close(t) − 1
+```
+
+Six checks are then run on the ~4,200 labelled test candles:
+
+**Check 1 — Direction Test** *(primary)*
+
+The mean forward return must follow the expected ordering across all three
+directional regimes:
+
+```
+mean(forward_return | trending_up)  >  mean(forward_return | neutral)
+                                    >  mean(forward_return | trending_down)
+```
+
+**Check 2 — Statistical Significance**
+
+Two-sample Welch's t-test (does not assume equal variance) between the
+`trending_up` and `trending_down` forward return distributions:
+
+```
+t, p = scipy.stats.ttest_ind(
+    forward_returns[regime == "trending_up"],
+    forward_returns[regime == "trending_down"],
+    equal_var=False,
+)
+```
+
+**Pass condition:** p-value < 0.05
+
+**Check 3 — Volatility Check**
+
+```
+mean(volatility_feature | regime == "high_volatility")
+    >
+mean(volatility_feature | regime == "neutral")
+```
+
+This should hold by construction (the label is assigned on volatility rank),
+but verifying it on out-of-sample data confirms label stability outside the
+training window.
+
+**Check 4 — Confidence Distribution**
+
+**Pass condition:** No label has a median `regime_confidence` below
+`HMM_MIN_CONFIDENCE` (0.70).  A label that is consistently uncertain suggests
+the model cannot distinguish that regime reliably on new data.
+
+**Check 5 — Label Frequency**
+
+**Pass condition:** No regime has < 1 % frequency over the ~4,200 test
+candles.  Near-zero frequency means the model is effectively collapsing to
+fewer states than `n_components` — a sign of over-parameterisation.
+
+**Check 6 — Hit-rate Alignment** *(informational, no auto PASS/FAIL)*
+
+Compare the regime-blocked percentage observed on the test set with the
+`regime_filter_hit_rate_pct` reported by `runner.py` (Step 5).  A divergence
+of more than ~5 percentage points indicates that the live 2 h rolling window
+produces systematically different label distributions compared to the longer
+out-of-sample horizon.
+
+#### Phase 4 — Output Format
+
+Results are printed by
+`backtest/reporting/formatters.print_regime_validation_report()` to stdout
+(no matplotlib required):
+
+```
+══════════════════════════════════════════════════════════════════
+ REGIME VALIDATION REPORT — 3-day test set (~4,200 candles)
+══════════════════════════════════════════════════════════════════
+
+ Train:  7 days  (~10,080 rows)   model frozen after initial fit
+ Test:   3 days  (~4,200 rows)    predict_current_regime() only
+
+──────────────────────────────────────────────────────────────────
+ PER-REGIME STATISTICS
+──────────────────────────────────────────────────────────────────
+ Regime           Count   Freq%   Mean fwd-ret   Std fwd-ret   Med confidence
+ trending_up      x,xxx   xx.x    +x.xxxxx %     x.xxxxx %     x.xx
+ trending_down    x,xxx   xx.x    −x.xxxxx %     x.xxxxx %     x.xx
+ high_volatility  x,xxx   xx.x    ±x.xxxxx %     x.xxxxx %     x.xx
+ neutral          x,xxx   xx.x    ±x.xxxxx %     x.xxxxx %     x.xx
+
+──────────────────────────────────────────────────────────────────
+ STATISTICAL TESTS
+──────────────────────────────────────────────────────────────────
+ Direction test (trending_up > neutral > trending_down):
+   trending_up mean:    +x.xxxxx %
+   neutral mean:        ±x.xxxxx %
+   trending_down mean:  −x.xxxxx %   →  [PASS / FAIL]
+
+ Welch's t-test (trending_up vs trending_down):
+   t = x.xx,  p = x.xxxxxx             →  [PASS / FAIL]
+
+ Volatility check (high_vol mean vol > neutral mean vol):
+   x.xxxxxx > x.xxxxxx                 →  [PASS / FAIL]
+
+ Label frequency (all regimes > 1 %):  →  [PASS / FAIL]
+
+ Confidence floor (all median conf ≥ 0.70): → [PASS / FAIL]
+
+ Hit-rate alignment (compare with runner.py regime_filter_hit_rate_pct):
+   BUY  blocked (trending_down|high_vol): xx.x %  (x,xxx/x,xxx)
+   SELL blocked (trending_up|high_vol):   xx.x %  (x,xxx/x,xxx)
+   Both sides blocked (high_vol only):    xx.x %  (x,xxx/x,xxx)
+   [informational — no auto PASS/FAIL]
+══════════════════════════════════════════════════════════════════
+```
+
+#### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Single 7/3 split, not rolling | Rolling refits on the test set would re-use test candles for fitting; a single split is the cleanest long-horizon OOS test |
+| Only `predict_current_regime()` on test set | No refit → model never touches test candles during training |
+| `BACKTEST_MAX_ROWS` must be bypassed | 500 rows collapses the split to a few hours of train data — statistically worthless |
+| Welch's t-test (not Student's) | Regime return distributions are unlikely to have equal variance |
+| Forward return = 1 candle | Consistent with the 1 m resolution; matches the minimum observable effect of a regime signal |
+| Standalone script, not in `runner.py` | This is a one-off diagnostic, not part of the core P&L pipeline |
+
 > Run with: `python -m backtest.regime_validation`
+> Re-run this script whenever `strategy/regime_director.py` is modified to
+> verify that the regime labels remain statistically meaningful.
 
 ---
 
@@ -556,7 +734,7 @@ catastrophically) as parameters shift away from their tuned values.
 Progress tracker for the modules described above.  Each step maps to a
 concrete file in `backtest/`.
 
-- ✅ **Step 1 — `backtest/data.py`** — Downloads 30 days of 1 m BTCUSDT
+- ✅ **Step 1 — `backtest/data.py`** — Downloads 10 days of 1 m BTCUSDT
   klines via `binance.client.Client.get_historical_klines()` and returns a
   clean `pandas.DataFrame`.  *(Implemented.)*
 - ✅ **Step 2 — `backtest/synthetic_book.py`** — Given a single kline row
@@ -597,22 +775,28 @@ concrete file in `backtest/`.
   out-of-sample candle.  *(Implemented.)*
 - ✅ **Step 6b — Offline long-horizon regime validation** (`backtest/regime_validation.py`) —
   Standalone diagnostic script (run with `python -m backtest.regime_validation`).
-  Fetches 10 days of 1-minute klines, splits them **7-day train / 3-day test**
-  (~10,080 / ~4,200 rows).  The HMM is fitted **once** on the last 120 rows of
-  the training period and then **frozen** — no re-fits during the test phase.
-  A rolling 120-row window is applied to every test candle using only
-  `predict_current_regime()` (cheap Viterbi, frozen model).  Six checks are
-  then computed on the ~4,200 labelled test candles:
-  1. **Direction test** — `trending_up` mean forward return > `neutral` > `trending_down`.
-  2. **Welch's t-test** — p < 0.05 between `trending_up` and `trending_down` return distributions.
-  3. **Volatility check** — mean volatility feature higher for `high_volatility` than `neutral`.
-  4. **Confidence floor** — median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE` per label.
+  Fetches **10 days** of 1-minute klines (~14,400 rows), applies a **7-day
+  train / 3-day test** split (`split_idx = 7 × 1440 = 10,080`).  The HMM is
+  fitted **once** on the last 120 rows of the training period (Phase 1) and
+  then **frozen** — `BACKTEST_MAX_ROWS` is intentionally bypassed.  A rolling
+  120-row window (Phase 2) is applied to every test candle — first 120 candles
+  of the test set skipped as warm-up — using only `predict_current_regime()`
+  (cheap Viterbi, frozen model, no refit).  Six checks (Phase 3) are computed
+  on the ~4,200 labelled test candles:
+  1. **Direction test** — `trending_up` mean > `neutral` mean > `trending_down`
+     mean forward 1-candle return.
+  2. **Welch's t-test** — p < 0.05 between `trending_up` and `trending_down`
+     forward return distributions (does not assume equal variance).
+  3. **Volatility check** — mean volatility feature higher for `high_volatility`
+     than `neutral`.
+  4. **Confidence floor** — median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE`
+     per label.
   5. **Label frequency** — no regime < 1 % (regime collapse guard).
-  6. **Hit-rate alignment** (informational) — % of candles blocked per side (BUY / SELL / both).
-  The formatted report is printed by
+  6. **Hit-rate alignment** *(informational, no auto PASS/FAIL)* — % of
+     candles blocked per side (BUY / SELL / both) vs. `runner.py` hit rate.
+  The formatted report (Phase 4) is printed by
   `backtest/reporting/formatters.print_regime_validation_report()`.
-  `BACKTEST_MAX_ROWS` is intentionally bypassed — the full 10-day dataset is
-  required for the 7/3 split to be statistically meaningful.  *(Implemented.)*
+  Re-run whenever `strategy/regime_director.py` is modified.  *(Implemented.)*
 - ⬜ **Step 7 — `backtest/visualization.py`** — Plots and charts to inspect
   backtest results visually.  Suggested panels:
   - **Equity curve** — cumulative P&L over time, with drawdown shaded below
@@ -631,5 +815,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-04-13*
+*Document last updated: 2026-04-14*
 
