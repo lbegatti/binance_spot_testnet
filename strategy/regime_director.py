@@ -12,6 +12,7 @@ from config_parameters import (
     HMM_LOOKBACK,
     HMM_MIN_COVAR,
     HMM_TRAIN_ROWS,
+    HMM_N_INIT,
     SYMBOL,
 )
 import logging
@@ -299,27 +300,55 @@ class RegimeDirector:
 
         best_hmm_model, best_hmm_bic = None, np.inf
         for n in range(2, self.max_states + 1):
-            m = GaussianHMM(
-                n_components=n,
-                covariance_type="full",
-                n_iter=self.n_iterations,
-                random_state=self.random_state,
-                min_covar=HMM_MIN_COVAR,  # regularisation floor — keeps covariance
-                # matrices positive-definite when a state
-                # has few observations
-            )
-            try:
-                m.fit(train_features_scaled)
-                bic = m.bic(train_features_scaled)
-            except (ValueError, np.linalg.LinAlgError) as exc:
-                # Covariance matrix became singular for this n — skip and try next
-                logging.warning(
-                    "RegimeDirector: n=%d skipped — covariance error (%s)", n, exc
+            # Try HMM_N_INIT different random seeds for this n.  The EM
+            # algorithm can converge to a degenerate solution (one state
+            # never visited → transmat row sums to 0) depending on the
+            # random initialisation.  Retrying with different seeds makes
+            # the BIC search robust to bad starting points.
+            for seed_offset in range(HMM_N_INIT):
+                m = GaussianHMM(
+                    n_components=n,
+                    covariance_type="full",
+                    n_iter=self.n_iterations,
+                    random_state=self.random_state + seed_offset,
+                    min_covar=HMM_MIN_COVAR,
                 )
-                continue
-            logging.info("RegimeDirector: n=%d  BIC=%.1f", n, bic)
-            if bic < best_hmm_bic:
-                best_hmm_bic, best_hmm_model = bic, m
+                try:
+                    m.fit(train_features_scaled)
+                    # Validate transition matrix before calling bic():
+                    # a degenerate model has at least one row summing to 0,
+                    # which makes bic() raise ValueError.  Catching this
+                    # here avoids the confusing downstream error message.
+                    row_sums = m.transmat_.sum(axis=1)
+                    if not np.allclose(row_sums, 1.0, atol=1e-3):
+                        logging.warning(
+                            "RegimeDirector: n=%d seed+%d — degenerate transmat "
+                            "(row sums %s), retrying",
+                            n,
+                            seed_offset,
+                            np.round(row_sums, 4),
+                        )
+                        continue
+                    bic = m.bic(train_features_scaled)
+                except Exception as exc:
+                    # Catch any numerical failure (ValueError, LinAlgError,
+                    # FloatingPointError, etc.) and try the next seed.
+                    logging.warning(
+                        "RegimeDirector: n=%d seed+%d skipped — fit error (%s: %s)",
+                        n,
+                        seed_offset,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+
+                # Valid, non-degenerate fit found for this n.
+                logging.info(
+                    "RegimeDirector: n=%d seed+%d  BIC=%.1f", n, seed_offset, bic
+                )
+                if bic < best_hmm_bic:
+                    best_hmm_bic, best_hmm_model = bic, m
+                break  # no need to try more seeds for this n
 
         if best_hmm_model is None:
             raise RuntimeError(

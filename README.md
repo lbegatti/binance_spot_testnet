@@ -76,7 +76,9 @@ binance_spot_testnet/
 │   ├── synthetic_book.py              # Synthetic 50-level order book builder (per kline row)
 │   ├── signals.py                     # Signal replay loop — full pipeline + regime & VWAP filters
 │   ├── pnl.py                         # P&L simulation — balance guard, fill price, equity curve, metrics
-│   ├── runner.py                      # Top-level backtest runner — chains all modules, delegates reporting
+│   ├── runner.py                      # Top-level runner — chains all modules; opt-in plot/CSV export
+│   ├── visualization.py               # Step 7 — interactive Plotly chart (6-panel); run via run_backtest(plot=True)
+│   ├── regime_validation.py           # Offline long-horizon HMM validation — python -m backtest.regime_validation
 │   └── reporting/                     # Console report formatting and CSV export (AI-authored)
 │       ├── __init__.py
 │       └── formatters.py              # fmt(), print_report(), save_csv() — public helpers
@@ -102,7 +104,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Analysis cadence** | `HFT_INTERVAL` | `1` s | Time between low-latency evaluations |
 | **Analysis cadence** | `HIST_INTERVAL` | `60` s | Time between historical analyses (1 min) |
 | **Analysis cadence** | `MIN_SNAPSHOTS` | `100` | Minimum snapshots required before historical analysis runs |
-| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `20` min | Default session length (fixed — no startup prompt) |
+| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `10` min | Default session length (fixed — no startup prompt) |
 | **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `low_latency_analysis` thread on shutdown |
 | **WebSocket session** | `HIST_JOIN_TIMEOUT` | `15` s | Max wait for `historical_analysis` thread on shutdown |
 | **Binance connection** | `RECV_WINDOW` | `5000` ms | Binance REST request validity window |
@@ -275,17 +277,17 @@ Both analysis loops in `AnalysisEngine` are designed to run indefinitely:
 
 Rather than running forever, `websocket_main.py` uses a fixed session duration set by `DEFAULT_SESSION_MINUTES` (no startup prompt).
 
-The **default of 20 minutes** is chosen deliberately:
+The **default of 10 minutes** is chosen deliberately:
 
-| Metric | Value at 20 min |
+| Metric | Value at 10 min |
 |--------|----------------|
-| Low-latency iterations (`low_latency_analysis`) | $20 \times 60 / 1 = \mathbf{1{,}200}$ |
-| Historical iterations (`historical_analysis`) | $20 \times 60 / 60 = \mathbf{20}$ |
-| Order book snapshots in history | up to $20 \times 60 \times 10 = \mathbf{12{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
+| Low-latency iterations (`low_latency_analysis`) | $10 \times 60 / 1 = \mathbf{600}$ |
+| Historical iterations (`historical_analysis`) | $10 \times 60 / 60 = \mathbf{10}$ |
+| Order book snapshots in history | up to $10 \times 60 \times 10 = \mathbf{6{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
 
 When the session duration elapses, `websocket_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
-### Thread Timeline (default 20-min session)
+### Thread Timeline (default 10-min session)
 
 ```
 t=0s      Both threads start
@@ -306,8 +308,8 @@ t=2min    low_latency iteration #120
 t=5min    low_latency iteration #300
           historical iteration #5 → deque now full (3 000 entries), true rolling window
 ...
-t=20min   low_latency iteration #1200
-          historical iteration #20 → refreshes VWAP one last time
+t=10min   low_latency iteration #600
+          historical iteration #10 → refreshes VWAP one last time
           stop_event set → both threads exit
 ```
 
@@ -321,7 +323,7 @@ The deque size is driven by the **WebSocket tick rate** (~10 entries/sec at 100 
 | 3 min | ~1 800 | 1 800 | 3rd runs (reads 1 800 entries) |
 | 5 min | ~3 000 | **3 000 (full)** | 5th runs (reads 3 000 entries) |
 | 10 min | ~6 000 sent | **3 000 (capped — oldest evicted)** | 10th runs (reads 3 000 entries) |
-| 20 min | ~12 000 sent | **3 000 (capped)** | 20th runs (reads 3 000 entries) |
+| 10 min | ~6 000 sent | **3 000 (capped)** | 10th runs (reads 3 000 entries) |
 
 After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling window** of the last ~5 minutes. Each `historical_analysis` iteration operates on whatever is currently in the window — not a fixed block.
 
@@ -333,7 +335,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 2. Connect to Binance Testnet via `binance-connector` REST client.
 3. Consolidate non-BTC/USDT balances into USDT via market sell orders.
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
-5. Session duration fixed at `DEFAULT_SESSION_MINUTES` (20 min) — no user prompt.
+5. Session duration fixed at `DEFAULT_SESSION_MINUTES` (10 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
 7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of 1-minute klines (last 2 hours), fits `GaussianHMM` models for 2–4 states, selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.
@@ -704,9 +706,26 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
 | `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, `half_spread` fill, equity curve, FIFO round-trip pairing, Step 5 metrics |
-| `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/` |
+| `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7 |
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
 | `backtest/regime_validation.py` | ✅ done | Offline long-horizon regime validation — 7-day train / 3-day test (10-day dataset, frozen HMM), six statistical checks, `python -m backtest.regime_validation` |
+| `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime |
+
+**Running the backtest:**
+
+```bash
+# Console report only (default)
+python -m backtest.runner
+
+# Console report + open interactive Plotly chart in browser
+python -c "from backtest.runner import run_backtest; run_backtest(plot=True)"
+
+# Console report + chart + save PNG (requires kaleido) or HTML fallback
+python -c "from backtest.runner import run_backtest; run_backtest(plot=True, save_png=True)"
+
+# Console report + export trade/equity CSVs
+python -c "from backtest.runner import run_backtest; run_backtest(export_csv=True)"
+```
 
 > ⚠️ **Important — re-run after any change to `strategy/regime_director.py`**  
 > `regime_validation.py` is the **sanity check** for the HMM regime filter.  

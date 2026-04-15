@@ -1,9 +1,9 @@
 """
-backtest/runner.py
+backtest/run_backtest.py
 ------------------
 Step 5 — Top-level backtest runner.
 
-Chains the four backtest modules into a single end-to-end run and prints a
+Chains the backtest modules into a single end-to-end run and prints a
 formatted summary report to the console.
 
 Pipeline
@@ -14,16 +14,22 @@ Pipeline
     simulate_pnl()      ← backtest/pnl.py                  (Step 4)
          │
          ▼
-    _print_report()     ← backtest/reporting/formatters.py (Step 5)
+    print_report()      ← backtest/reporting/formatters.py (Step 5)
+         │
+         ▼
+    plot_backtest()     ← backtest/visualization.py        (Step 7, opt-in)
 
 Usage
 -----
-    # As a script:
+    # As a script (no chart):
     python -m backtest.runner
+
+    # As a script (with interactive chart):
+    python -m backtest.runner   # then call run_backtest(plot=True) programmatically
 
     # Programmatic — returns all intermediate artefacts:
     from backtest.runner import run_backtest
-    signals, trades, equity, stats = run_backtest(save_csv=True)
+    signals, trades, equity, stats = run_backtest(export_csv=True, plot=True, save_png=True)
 """
 
 import logging
@@ -36,6 +42,8 @@ from backtest.pnl import simulate_pnl
 from backtest.reporting.formatters import HEAVY, print_report, save_csv
 from backtest.signals import run_signals
 
+from backtest.visualization import plot_backtest
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
@@ -44,6 +52,8 @@ log = logging.getLogger(__name__)
 
 def run_backtest(
     export_csv: bool = False,
+    plot: bool = False,
+    save_png: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """
     Execute the full backtest pipeline and print a summary report.
@@ -56,14 +66,26 @@ def run_backtest(
     2. ``simulate_pnl()``   — walks the signal DataFrame, executes BUY/SELL
        trades with the balance guard, and computes the equity curve and
        Step 5 metrics.
-    3. ``_print_report()``  — formats and prints the summary to stdout.
+    3. ``print_report()``   — formats and prints the summary to stdout.
        Implemented in ``backtest/reporting/formatters.py``.
+    4. ``plot_backtest()``  — (optional, Step 7) generates the interactive
+       six-panel Plotly figure.  Only runs when ``plot=True``.  For headless
+       environments pass ``show=False`` inside ``plot_backtest()`` directly.
 
     Parameters
     ----------
     export_csv : bool
         If ``True``, saves ``trades_<timestamp>.csv`` and
         ``equity_<timestamp>.csv`` to ``backtest/results/``.
+        Default ``False``.
+    plot : bool
+        If ``True``, generate the Step 7 Plotly visualisation after the
+        summary report.  Default ``False`` (opt-in so CLI runs are
+        unaffected).
+    save_png : bool
+        If ``True`` (and ``plot=True``), persist the figure as a timestamped
+        PNG in ``backtest/results/`` (requires ``kaleido``; falls back to
+        HTML if not installed).  Has no effect when ``plot=False``.
         Default ``False``.
 
     Returns
@@ -96,8 +118,12 @@ def run_backtest(
     if export_csv:
         save_csv(trades, equity)
 
+    # Step 7: plotly visualisation (optional)
+    if plot:
+        plot_backtest(signals, trades, equity, stats, save_png=save_png, show=True)
+
     return signals, trades, equity, stats
 
 
 if __name__ == "__main__":
-    run_backtest(export_csv=False)
+    run_backtest(export_csv=False, plot=True, save_png=True)

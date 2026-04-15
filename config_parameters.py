@@ -22,9 +22,9 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # runtime manageable (~45–90 s vs ~2–4 min).
 # NOTE: backtest/regime_validation.py (Step 6b) uses its own 10-day fetch and
 # bypasses BACKTEST_MAX_ROWS intentionally — this constant only affects
-# backtest/runner.py (signal replay) and is independent of regime_validation.
+# backtest/run_backtest.py (signal replay) and is independent of regime_validation.
 BACKTEST_LOOKBACK = "10 days ago UTC"
-BACKTEST_MAX_ROWS: int | None = 500
+BACKTEST_MAX_ROWS: int | None = None
 VOLUME_DECAY_FACTOR = (
     0.80  # each lever down the order book retains 80% of the previous level's volume
 )
@@ -67,9 +67,23 @@ HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC s
 # Regularisation floor added to the diagonal of every state's covariance
 # matrix.  Prevents "covars must be symmetric, positive-definite" errors
 # when a hidden state has few observations relative to the feature count.
-# 1e-3 is a safe default for normalised financial features (return,
-# volatility, obi_proxy, trade_density all sit in the [-1, +1] range).
-HMM_MIN_COVAR = 1e-3
+# Raised from 1e-3 → 1e-2 → 1e-1: with BACKTEST_MAX_ROWS=None the full
+# 14,400-row dataset is processed and some 120-row windows contain
+# near-constant features (e.g. flat volatility during overnight low-activity
+# periods).  1e-1 is the recommended safe default for normalised financial
+# features that have been z-scored by StandardScaler (unit variance).  A
+# floor of 0.1 is 10 % of the natural scale and is still far below the
+# between-state variance that the HMM needs to distinguish regimes, so
+# regime labels are not materially affected.
+HMM_MIN_COVAR = 1e-1
+# Number of independent random-seed restarts attempted per candidate
+# n_components value inside select_hmm_model().  The EM algorithm can
+# converge to degenerate solutions (e.g. one state never visited →
+# transmat row sums to 0) depending on initialisation.  Trying HMM_N_INIT
+# different seeds and accepting the first valid, non-degenerate fit makes
+# the BIC search robust to bad starting points.  5 restarts is a good
+# balance between robustness and runtime; increase to 10 if failures persist.
+HMM_N_INIT = 5
 # Train / predict split for select_hmm_model() — walk-forward style.
 # The HMM is fitted ONLY on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
 # "in-sample" data).  Regime prediction (Viterbi) then runs ONLY on the
@@ -107,8 +121,8 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 20  # default session length
-# at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
+DEFAULT_SESSION_MINUTES = 10  # default session length
+# at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 

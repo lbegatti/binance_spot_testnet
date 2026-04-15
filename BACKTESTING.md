@@ -1,9 +1,9 @@
 # Backtesting Plan — Binance Spot Testnet Strategy
 
-> **Status:** Steps 1–6b implemented (``data.py``, ``synthetic_book.py``,
-> ``signals.py``, ``pnl.py``, ``runner.py``, ``regime_validation.py``).  Step 7
-> (visualisation) is pending.  See the Implementation Roadmap at the bottom
-> for a per-module progress tracker.
+> **Status:** Steps 1–7 implemented (``data.py``, ``synthetic_book.py``,
+> ``signals.py``, ``pnl.py``, ``run_backtest.py``, ``regime_validation.py``,
+> ``visualization.py``).  Step 8 (sensitivity analysis) is not yet implemented.
+> See the Implementation Roadmap at the bottom for a per-module progress tracker.
 
 ---
 
@@ -688,7 +688,7 @@ Results are printed by
 
 ---
 
-## Step 7 — Sensitivity Analysis
+## Step 8 — Sensitivity Analysis
 
 Run the backtest across a grid of parameter values to test robustness:
 
@@ -797,23 +797,37 @@ concrete file in `backtest/`.
   The formatted report (Phase 4) is printed by
   `backtest/reporting/formatters.print_regime_validation_report()`.
   Re-run whenever `strategy/regime_director.py` is modified.  *(Implemented.)*
-- ⬜ **Step 7 — `backtest/visualization.py`** — Plots and charts to inspect
-  backtest results visually.  Suggested panels:
-  - **Equity curve** — cumulative P&L over time, with drawdown shaded below
-    the peak.
-  - **Signal overlay** — BUY (`+1`) and SELL (`−1`) markers on top of the
-    BTCUSDT close price series.
-  - **Regime timeline** — colour-coded horizontal bands showing the HMM
-    regime label per candle (`trending_up`, `trending_down`,
-    `high_volatility`, `neutral`).
-  - **VWAP vs micro-price** — `bid_vwap`, `ask_vwap`, and `best_buy_micro` /
-    `best_sell_micro` plotted together to visualise the momentum filter in
-    action.
-  - **Signal distribution** — bar chart of BUY / SELL / flat counts, and a
-    breakdown by regime label to understand how often each filter (regime,
-    VWAP) is responsible for blocking a raw signal.
+- ✅ **Step 7 — `backtest/visualization.py`** — Interactive six-row Plotly
+  figure generated from the four artefacts returned by ``run_backtest()``.
+  Uses ``plotly`` (already in ``requirements.txt``); opt-in via
+  ``run_backtest(plot=True, save_png=True)``; no effect on headless runs
+  when ``plot=False`` (default).  Panels:
+  1. **Equity curve** — continuous portfolio value with initial-equity dashed
+     reference.
+  2. **Drawdown (%)** — red ``tozeroy`` fill (shared x-axis with equity).
+  3. **BTC close + BUY ▲ / SELL ▼** — fill-price markers and rolling
+     ``bid_vwap`` / ``ask_vwap`` dashed lines.
+  4. **Regime timeline + confidence** — colour-coded ``vrect`` bands per HMM
+     label (pale green / red / orange / grey) with ``regime_confidence``
+     overlay and dashed ``HMM_MIN_CONFIDENCE`` threshold.
+  5. **VWAP vs micro-price** — four series with grey dot (●) near-miss markers
+     where the VWAP gate specifically blocked a candidate.
+  6a. **Signal funnel** (stacked horizontal bar) — per-side breakdown:
+      executed / confidence-blocked / regime-blocked / VWAP-blocked.
+  6b. **Signals by regime** (stacked vertical bar) — BUY / SELL / HOLD per HMM
+      label.
+  All rows 1–5 share a synchronised datetime x-axis (zoom on one → all move).
+  PNG export requires ``pip install kaleido``; without it an interactive HTML
+  file is saved instead.  *(Implemented.)*
+
+- ⬜ **Step 8 — Sensitivity Analysis** — Grid search over key parameters to
+  test strategy robustness: `HMM_LOOKBACK` (1 h / 2 h / 4 h), `HMM_MAX_REGIMES`
+  (3 / 4), VWAP window (2 / 5 / 10 min), OBI score threshold (0.05 / 0.10 /
+  0.20), and fee assumption (0.05 % / 0.10 % / 0.15 %).  The strategy is
+  considered robust if performance degrades gracefully — not catastrophically —
+  as parameters shift away from their tuned values.  *(Not yet implemented.)*
 
 ---
 
-*Document last updated: 2026-04-14*
+*Document last updated: 2026-04-15*
 

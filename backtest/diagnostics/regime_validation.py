@@ -1,6 +1,6 @@
 """
-backtest/regime_validation.py
------------------------------
+backtest/diagnostics/regime_validation.py
+-----------------------------------------
 Step 6b — Offline Long-Horizon Regime Validation.
 
 Standalone diagnostic script that tests whether the HMM regime labels
@@ -8,15 +8,30 @@ produced by ``RegimeDirector`` remain statistically meaningful over a
 **fully out-of-sample** horizon (3-day test set, model frozen after a
 one-time fit on the preceding 7 days).
 
-**Not wired into ``runner.py``** — run manually with:
+**Not wired into ``run_backtest.py``** — this is a standalone diagnostic tool.
+Run manually with:
 
-    python -m backtest.regime_validation
+    python -m backtest.diagnostics.regime_validation
 
-See ``backtest/REGIME_VALIDATION_PLAN.md`` for the full rationale.
+Why is this in ``backtest/diagnostics/`` and not ``backtest/``?
+    All files directly in ``backtest/`` (``signals.py``, ``pnl.py``,
+    ``run_backtest.py``, etc.) form the main pipeline orchestrated by
+    ``run_backtest()``.  This script is a separate, one-off health check
+    for the HMM model and must be invoked independently.
+
+See ``BACKTESTING.md`` (Step 6b) for the full rationale, dataset split,
+and interpretation guidance.
 
 NOTE: This script **bypasses** ``BACKTEST_MAX_ROWS`` intentionally.
 The full ~14,400-row dataset (10 days at 1 m) is required for the
 7-day / 3-day split to be statistically meaningful.
+
+When to re-run
+--------------
+Re-run this tool whenever ``strategy/regime_director.py`` is modified
+(feature columns, BIC search range, label-assignment rules, confidence
+threshold, etc.) to confirm the frozen model still produces statistically
+meaningful labels on out-of-sample data.
 
 Written with the assistance of AI models — results should be reviewed
 critically before drawing conclusions.
@@ -105,7 +120,7 @@ def _train_model(features_df: pd.DataFrame) -> RegimeDirector:
     rd = RegimeDirector()
     # Pass only the last HMM_LOOKBACK_ROWS (120) rows of the train period.
     # select_hmm_model() internally splits these into:
-    #   fit   → rows[:HMM_TRAIN_ROWS]   (first 80 — in-sample)
+    #   fit     → rows[:HMM_TRAIN_ROWS]  (first 80 — in-sample)
     #   predict → rows[HMM_TRAIN_ROWS:]  (last ~40 — out-of-sample)
     # The 7-day boundary guarantees no test-set candle leaks into the model;
     # within the train period we use the most recent 2 h window, identical
@@ -229,8 +244,8 @@ def _run_checks(
     features_df: pd.DataFrame,
 ) -> dict:
     """
-    Run the six statistical validation checks defined in
-    ``REGIME_VALIDATION_PLAN.md`` Phase 3.
+    Run the six statistical validation checks defined in Step 6b of
+    ``BACKTESTING.md``.
 
     **Check 1 — Direction test:**
         ``mean(fwd_return | trending_up) > mean(fwd_return | neutral)
@@ -253,7 +268,7 @@ def _run_checks(
     **Check 6 — Hit-rate alignment:**
         Percentage of test candles where regime ∈ {``trending_down``,
         ``high_volatility``} (i.e. blocked).  Reported for comparison
-        with ``runner.py``'s ``regime_filter_hit_rate_pct``.
+        with ``run_backtest.py``'s ``regime_filter_hit_rate_pct``.
 
     Args:
         test_labels: DataFrame from ``_rolling_predict`` (indexed by
@@ -285,7 +300,6 @@ def _run_checks(
     td = mean_fwd.get("trending_down", np.nan)
     ne = mean_fwd.get("neutral", np.nan)
 
-    # Expected ordering: trending_up > neutral > trending_down
     ordering_ok = True
     if not np.isnan(tu) and not np.isnan(ne):
         ordering_ok = ordering_ok and (tu > ne)
@@ -337,7 +351,7 @@ def _run_checks(
     else:
         results["volatility_check"] = {
             "pass": False,
-            "detail": (f"Missing regime: high_volatility={vol_hv}, neutral={vol_ne}"),
+            "detail": f"Missing regime: high_volatility={vol_hv}, neutral={vol_ne}",
         }
 
     # ── Check 4 — Confidence floor ───────────────────────────────────────
@@ -361,8 +375,6 @@ def _run_checks(
     # Mirrors the gating logic in analysis.py:
     #   BUY  blocked when regime ∈ {trending_down, high_volatility}
     #   SELL blocked when regime ∈ {trending_up,   high_volatility}
-    # trending_up therefore also blocks trades (the SELL side), so all
-    # three non-neutral regimes are included — just on different sides.
     n = len(test_labels)
     buy_blocked = (
         test_labels["regime_label"].isin({"trending_down", "high_volatility"}).sum()
@@ -370,11 +382,9 @@ def _run_checks(
     sell_blocked = (
         test_labels["regime_label"].isin({"trending_up", "high_volatility"}).sum()
     )
-    both_blocked = (
-        test_labels["regime_label"].isin({"high_volatility"}).sum()
-    )  # blocks both sides
+    both_blocked = test_labels["regime_label"].isin({"high_volatility"}).sum()
     results["hit_rate_alignment"] = {
-        "pass": True,  # informational — no automatic pass/fail; compare with runner.py output
+        "pass": True,  # informational — compare with run_backtest.py regime_filter_hit_rate_pct
         "detail": (
             f"BUY  blocked (trending_down|high_vol): {buy_blocked / n * 100:.1f}%  ({buy_blocked}/{n})  |  "
             f"SELL blocked (trending_up|high_vol):   {sell_blocked / n * 100:.1f}%  ({sell_blocked}/{n})  |  "

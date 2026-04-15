@@ -54,7 +54,7 @@ FILES
     HFT_INTERVAL         = 1       # seconds between low-latency evaluations
     HIST_INTERVAL        = 60      # seconds between historical analyses (1 min)
     MIN_SNAPSHOTS        = 100     # warm-up guard for historical loop
-    DEFAULT_SESSION_MINUTES = 20   # default session length (fixed, no prompt)
+    DEFAULT_SESSION_MINUTES = 10   # default session length (fixed, no prompt)
     HTF_JOIN_TIMEOUT     = 10      # shutdown wait for low-latency thread (s)
     HIST_JOIN_TIMEOUT    = 15      # shutdown wait for historical thread (s)
     RECV_WINDOW          = 5000    # Binance REST validity window (ms)
@@ -397,8 +397,8 @@ FILES
                 (single pass, each symbol attempted once).
               • Re-fetch balances if any sale succeeded.
               • Guard: raise if both USDT and BTC balances are zero.
-  Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (20 min).
-              • 20 min → ~1200 low-latency iterations, ~20 historical analyses.
+  Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (10 min).
+              • 10 min → ~600 low-latency iterations, ~10 historical analyses.
   Step 4 — Seed local_book from REST snapshot (depth=100).
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
@@ -587,12 +587,18 @@ FILES
 
   backtest/runner.py             — run_backtest(): top-level orchestrator.
                                     Chains run_signals() → simulate_pnl() →
-                                    print_report().  Report formatting and CSV
-                                    export are delegated to
+                                    print_report() → (opt-in) plot_backtest().
+                                    Parameters:
+                                      export_csv (bool, default False) — saves
+                                        trades_*.csv + equity_*.csv.
+                                      plot (bool, default False) — generates the
+                                        Step 7 Plotly figure; imported lazily so
+                                        headless runs carry zero overhead.
+                                      save_png (bool, default False) — persists
+                                        figure as PNG (kaleido) or HTML fallback.
+                                    Report formatting and CSV export delegated to
                                     backtest/reporting/formatters.py (public
                                     helpers: fmt, print_report, save_csv).
-                                    Parameter renamed: save_csv → export_csv
-                                    to avoid shadowing the imported function.
                                     Entry point: python -m backtest.runner.
 
   backtest/reporting/            — Console report formatting and CSV export.
@@ -636,8 +642,31 @@ FILES
                                     Report printed by
                                     reporting/formatters.print_regime_validation_report().
 
+  backtest/visualization.py     — Step 7: plot_backtest() generates an
+                                    interactive six-panel Plotly figure from the
+                                    four artefacts returned by run_backtest().
+                                    Panels (all rows 1-5 share a synchronised
+                                    datetime x-axis):
+                                      Row 1a: equity curve + initial reference.
+                                      Row 1b: drawdown % (red tozeroy fill).
+                                      Row 2:  BTC close + BUY ▲ / SELL ▼ markers
+                                              at fill price + bid/ask VWAP lines.
+                                      Row 3:  HMM regime vrect bands + confidence
+                                              overlay + HMM_MIN_CONFIDENCE dash.
+                                      Row 4:  VWAP vs micro-price + grey dot
+                                              near-miss markers where VWAP gate
+                                              specifically blocked a candidate.
+                                      Row 5a: stacked horizontal funnel bar
+                                              (executed / conf-blocked /
+                                              regime-blocked / VWAP-blocked).
+                                      Row 5b: stacked vertical bar — BUY/SELL/HOLD
+                                              count per HMM regime label.
+                                    Opt-in: run_backtest(plot=True, save_png=True).
+                                    save_png uses kaleido; falls back to HTML.
+                                    Regime bands drawn with add_vrect per
+                                    transition only — O(transitions), not O(rows).
+
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,
-                         regime_validation.py ✅,
-                         visualization.py — pending.
+                         regime_validation.py ✅, visualization.py ✅.
 """
