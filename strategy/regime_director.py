@@ -137,6 +137,7 @@ class RegimeDirector:
         self.regime_label: str | None = None
         self.scaler: StandardScaler | None = None
         self.regime_confidence: float | None = None
+        self.state_labels: dict[int, str] = {}  # populated by assign_regime_labels()
 
     def get_klines_data(self):
         """
@@ -558,6 +559,11 @@ class RegimeDirector:
                 td,
                 direction_score[state],
             )
+
+        # Store the full {state_index: label} mapping so external tools
+        # (e.g. regime_validation.py vectorised predict) can read it without
+        # re-running the label-assignment logic.
+        self.state_labels: dict[int, str] = labels
 
         self.regime_label = labels[self.current_regime]
         logging.info(

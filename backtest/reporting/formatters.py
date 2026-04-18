@@ -287,7 +287,8 @@ def print_regime_validation_report(
     std_fwd = tl.groupby("regime_label")["fwd_return"].std()
     med_conf = tl.groupby("regime_label")["regime_confidence"].median()
 
-    test_days = 10 - train_days
+    _CANDLES_PER_DAY = 1440
+    test_days = round(n_total / _CANDLES_PER_DAY)  # derived from actual test candles, not hardcoded total
 
     def verdict(ok: bool) -> str:
         return "PASS" if ok else "FAIL"
@@ -299,7 +300,7 @@ def print_regime_validation_report(
         HEAVY,
         "",
         f" Train : {train_days} days  (~{split_idx:,} rows)   model frozen after initial fit",
-        f" Test  : {test_days} days   (~{n_total:,} rows)   predict_current_regime() only",
+        f" Test  : {test_days} days   (~{n_total:,} rows)   vectorised single Viterbi pass (frozen model)",
         "",
         LIGHT,
         " PER-REGIME STATISTICS",

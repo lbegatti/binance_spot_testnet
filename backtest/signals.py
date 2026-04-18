@@ -223,7 +223,21 @@ def run_signals() -> pd.DataFrame:
         # we want to catch 1m regime changes on a 120 rolling window
         rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
         if hist_iteration % REFIT_EVERY == 0:
-            rd.select_hmm_model()  # full BIC re-fit
+            try:
+                rd.select_hmm_model()  # full BIC re-fit
+            except RuntimeError as exc:
+                # All HMM fits failed for this window (e.g. flat/low-variance
+                # overnight period).  Keep the previous model and continue —
+                # same behaviour as the live system which never halts on a
+                # refit failure.
+                logging.warning(
+                    "signals: HMM refit failed at iteration %d — keeping "
+                    "previous model. (%s)",
+                    hist_iteration, exc,
+                )
+                if rd.model is None:
+                    # No model at all yet — skip this candle entirely
+                    continue
         else:
             rd.predict_current_regime()  # cheap Viterbi pass
         rd.assign_regime_labels()

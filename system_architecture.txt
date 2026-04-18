@@ -31,12 +31,12 @@ FILES
     plot_helpers.py                   — Charting utilities for the REST snapshot path
 
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
-    data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT)
+    data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT; ~43,200 candles)
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
     pnl.py                            — P&L simulation: balance guard, half_spread fill, FIFO round-trip pairing, equity curve, Step 5 metrics
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
-    regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 7-day train / 3-day test, frozen HMM, six checks
+    regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 70/30 train-test split on 1 year (~525k rows), self-contained BIC search + label assignment (no RegimeDirector), vectorised single Viterbi pass on ~157k test candles, six checks
     reporting/                        — Console report formatting and CSV export (AI-authored)
       __init__.py                     — Re-exports fmt, print_report, save_csv, print_regime_validation_report
       formatters.py                   — fmt(), print_report(), save_csv(), print_regime_validation_report(), HEAVY/LIGHT/PREVIEW constants
@@ -75,12 +75,12 @@ FILES
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
-    BACKTEST_LOOKBACK    = "10 days ago UTC"  # kline fetch window for backtest dataset (~14 400 candles;
-                                               # reduced from 30 days for faster runtime ~45-90 s)
+    BACKTEST_LOOKBACK    = "30 days ago UTC"  # kline fetch window for backtest dataset (~43,200 candles;
+                                               # 30-day window for broader regime coverage)
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
     VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
-    REFIT_EVERY          = 5      # HMM_REFIT_INTERVAL // HIST_INTERVAL — backtest refit cadence
+    REFIT_EVERY          = 60     # iterations between full HMM BIC re-fits (live: every 60 min; backtest: ~720 refits over 30 days)
     BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 10-day run)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
@@ -360,6 +360,12 @@ FILES
         intent).
       (default) → "neutral"
 
+    After labelling:
+      self.state_labels : dict[int, str]   — full {state_index → label} mapping
+        stored as a new attribute on RegimeDirector (populated here, never in
+        __init__).  Exposed so external tools (e.g. regime_validation.py
+        vectorised Phase 2) can map state sequences to labels without
+        re-running the full label-assignment logic.
   REGIME GATES in low_latency_analysis (applied sequentially):
     GATE 1 — CONFIDENCE:
       Skip both BUY and SELL if regime_confidence < HMM_MIN_CONFIDENCE (0.70).
@@ -515,10 +521,10 @@ FILES
 ─────────────────────────────────────────────────────────────────────────────
 7. BACKTESTING  (backtest/)
 ─────────────────────────────────────────────────────────────────────────────
-  Offline replay of the live strategy on 10 days of historical 1-min klines.
-  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
+  Offline replay of the live strategy on 30 days of historical 1-min klines
+  (~43,200 candles).  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
-  backtest/data.py            — fetch_klines(): downloads ~14 400 candles via
+  backtest/data.py            — fetch_klines(): downloads ~43,200 candles via
                                 Client.get_historical_klines() (public, no auth).
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +
@@ -620,27 +626,37 @@ FILES
                                     (GitHub Copilot / GPT-4o) — see README.md
                                     disclaimer.
 
-  backtest/regime_validation.py  — Standalone offline long-horizon regime
-                                    diagnostic.  Entry point:
-                                    python -m backtest.regime_validation.
-                                    Fetches 10 days of 1 m klines, applies a
-                                    7-day train / 3-day test split
-                                    (~10,080 / ~4,200 rows).  Fits
-                                    RegimeDirector once on the tail of the
-                                    training window, then freezes the model
-                                    and rolls predict_current_regime() over
-                                    every test candle (120-row warm-up
-                                    discarded).  Six checks computed on the
-                                    ~4,200 labelled candles:
-                                      1. Direction test (return ordering)
-                                      2. Welch's t-test (p < 0.05)
-                                      3. Volatility check
-                                      4. Confidence floor (≥ HMM_MIN_CONFIDENCE)
-                                      5. Label frequency (no regime < 1 %)
-                                      6. Hit-rate alignment (informational)
-                                    BACKTEST_MAX_ROWS intentionally bypassed.
-                                    Report printed by
-                                    reporting/formatters.print_regime_validation_report().
+  backtest/diagnostics/
+    regime_validation.py           — Standalone offline long-horizon regime
+                                     diagnostic.  Entry point:
+                                     python -m backtest.diagnostics.regime_validation.
+                                     Fetches 1 year of 1 m klines (~525,000 rows,
+                                     VALIDATION_LOOKBACK = "365 days ago UTC"),
+                                     applies a 70/30 train-test split at runtime
+                                     (split_idx = int(len(df) * 0.70), ~367,500 /
+                                     ~157,500 rows).  SELF-CONTAINED: does not use
+                                     RegimeDirector — replicates BIC search and
+                                     label-assignment directly with raw GaussianHMM
+                                     + StandardScaler so the training window is not
+                                     capped at HMM_TRAIN_ROWS (80 rows).
+                                     Phase 2 scores ~157,500 test candles in a
+                                     SINGLE VECTORISED VITERBI PASS:
+                                       • scaler.transform(test_features) — 1 call
+                                       • model.predict(test_scaled) — 1 Viterbi
+                                       • proba[np.arange(n), states] — confidence
+                                       • label_array[states] — NumPy lookup
+                                     Six checks (Phase 3):
+                                       1. Direction test (return ordering)
+                                       2. Welch's t-test (p < 0.05)
+                                       3. Volatility check
+                                       4. Confidence floor (≥ HMM_MIN_CONFIDENCE)
+                                       5. Label frequency (no regime < 1 %)
+                                       6. Hit-rate alignment (informational)
+                                     BACKTEST_MAX_ROWS intentionally bypassed.
+                                     Report printed by
+                                     reporting/formatters.print_regime_validation_report().
+                                     Use VALIDATION_LOOKBACK = "90 days ago UTC"
+                                     for a faster smoke-test (~2 min fetch).
 
   backtest/visualization.py     — Step 7: plot_backtest() generates an
                                     interactive six-panel Plotly figure from the

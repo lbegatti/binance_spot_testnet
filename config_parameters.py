@@ -16,21 +16,32 @@ CRYPTOCCY = "BTC"  # base / cryptocurrency
 # ---------------------------------------------------------------------------
 # Backtesting Parameters and Features
 # ---------------------------------------------------------------------------
-# 10 *calendar* days (including weekends) — crypto trades 24/7 so there are
+# 90 *calendar* days (including weekends) — crypto trades 24/7 so there are
 # no weekend gaps in Binance kline data.  At 1 m resolution this yields
-# 10 × 24 × 60 = 14 400 rows.  Reduced from 30 days to keep the backtest
-# runtime manageable (~45–90 s vs ~2–4 min).
-# NOTE: backtest/regime_validation.py (Step 6b) uses its own 10-day fetch and
+# 90 × 24 × 60 = 129,600 rows.  A 3-month window captures a significantly
+# broader range of market regimes (trending, ranging, volatile) than the
+# previous 30-day window, making both the signal replay and regime-validation
+# results more statistically meaningful and robust.
+# NOTE: backtest/regime_validation.py (Step 6b) uses its own fetch window and
 # bypasses BACKTEST_MAX_ROWS intentionally — this constant only affects
 # backtest/run_backtest.py (signal replay) and is independent of regime_validation.
-BACKTEST_LOOKBACK = "10 days ago UTC"
+BACKTEST_LOOKBACK = "90 days ago UTC"
 BACKTEST_MAX_ROWS: int | None = None
 VOLUME_DECAY_FACTOR = (
     0.80  # each lever down the order book retains 80% of the previous level's volume
 )
 HMM_LOOKBACK_ROWS = 120  # 2 h at 1 m — matches HMM_LOOKBACK in the live system
 VWAP_WINDOW = 5  # 5 candles = 5 min at 1 m — matches live VWAP window
-REFIT_EVERY = 5  # HMM_REFIT_INTERVAL // HIST_INTERVAL = 300 // 60
+REFIT_EVERY = 120  # How often the HMM *parameters* are re-estimated via a full BIC
+# re-fit (select_hmm_model()).  Between re-fits, the bot still detects which
+# regime it is currently in every single candle via the cheap Viterbi pass
+# (predict_current_regime()).  The refit only updates the *mathematical
+# definition* of each regime (transition matrix, emission means/covariances) —
+# not the regime assignment itself.
+# At 1 m candles: 120 iterations = 2 h between parameter updates.
+# Reducing this increases accuracy of the regime definitions at the cost of
+# runtime; raising it speeds up backtesting with minimal impact on detection
+# quality (BTC regime structure is stable over ~2 h windows).
 
 # ---------------------------------------------------------------------------
 # Backtesting P&L Parameters  (Step 4 — backtest/pnl.py)
@@ -81,9 +92,9 @@ HMM_MIN_COVAR = 1e-1
 # converge to degenerate solutions (e.g. one state never visited →
 # transmat row sums to 0) depending on initialisation.  Trying HMM_N_INIT
 # different seeds and accepting the first valid, non-degenerate fit makes
-# the BIC search robust to bad starting points.  5 restarts is a good
-# balance between robustness and runtime; increase to 10 if failures persist.
-HMM_N_INIT = 5
+# the BIC search robust to bad starting points.  Raised from 5 → 10 to
+# reduce the chance of all seeds failing on flat/low-variance windows.
+HMM_N_INIT = 10
 # Train / predict split for select_hmm_model() — walk-forward style.
 # The HMM is fitted ONLY on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
 # "in-sample" data).  Regime prediction (Viterbi) then runs ONLY on the

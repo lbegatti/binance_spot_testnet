@@ -43,8 +43,8 @@ prices or queue position.
 ### Suggested window
 - **Instrument:** BTCUSDT
 - **Interval:** 1 minute  (matches the `HMM_INTERVAL` already used in production)
-- **Lookback:** 10 days  (~14 400 candles — balances statistical significance with
-  runtime (~45–90 s); crypto trades 24/7 so all 10 days are fully populated)
+- **Lookback:** 30 days  (~43,200 candles — captures a broader range of market
+  regimes; crypto trades 24/7 so all 30 days are fully populated with no weekend gaps)
 
 ### Columns returned per candle
 ```
@@ -195,19 +195,19 @@ live system.  No simplified proxy rules are needed.
 
 ### Per-candle procedure
 
-The dataset contains **~14,400 rows** (10 days × 1,440 candles/day at 1 m).
+The dataset contains **~43,200 rows** (30 days × 1,440 candles/day at 1 m).
 For **each row** a fresh synthetic 50-level order book is constructed (Step 2c),
 and the full production pipeline is run on it.  This produces one signal
 decision per minute — the exact equivalent of one `low_latency_analysis()`
 iteration in the live system (which runs every 1 s, but at 1 m kline resolution
 the minimum granularity is 1 candle = 1 min).
 
-> **Memory note:** 14,400 candles × 100 rows per book (50 bids + 50 asks) = 1,440,000
+> **Memory note:** 43,200 candles × 100 rows per book (50 bids + 50 asks) = 4,320,000
 > order book rows in total — but they are **never all in memory at once**.  The loop
 > constructs one 100-row DataFrame, runs the pipeline on it, records the signal,
 > then discards it before moving to the next candle.  Peak memory at any moment is
-> one synthetic book (100 rows) plus the 14,400-row klines DataFrame — well under
-> 10 MB and entirely negligible.
+> one synthetic book (100 rows) plus the 43,200-row klines DataFrame — well under
+> 50 MB and entirely negligible.
 
 There are **three independent data flows** running in parallel at every candle
 `t`.  They use completely different input shapes and are then combined into a
@@ -487,7 +487,7 @@ features[HMM_TRAIN_ROWS:]    → predict()  +  predict_proba()   (≈ 40 rows, ~
 applies the **same** split: it transforms `features[HMM_TRAIN_ROWS:]` with the
 already-fitted scaler and predicts only on those rows.
 
-### 6b — Offline long-horizon validation (`backtest/regime_validation.py`) ✅
+### 6b — Offline long-horizon validation (`backtest/diagnostics/regime_validation.py`) ✅
 
 #### Purpose
 
@@ -504,56 +504,63 @@ Specifically it answers four questions:
 
 #### Dataset
 
-`BACKTEST_LOOKBACK = "10 days ago UTC"` fetches **~14,400 rows** at 1 m
-(10 × 24 × 60 = 14,400 candles).  Reduced from 30 days to keep runtime
-manageable (~45–90 s vs ~2–4 min) — crypto trades 24/7 so all 10 days are
-fully populated with no weekend gaps.
+`VALIDATION_LOOKBACK = "365 days ago UTC"` fetches **~525,000 rows** at 1 m
+(365 × 24 × 60 = 525,600 candles).  One year of BTC data captures multiple full
+market cycle turns (trending, ranging, volatile), giving the HMM the broadest
+possible basis for regime learning.  Crypto trades 24/7 so all days are fully
+populated with no weekend gaps.
 
-A **single walk-forward hold-out split** is used (intentionally different from
-the rolling 2 h window used in production — the goal is to measure label
-stability at a horizon the live system never observes in one shot):
+A **70 / 30 train-test split** is used.  `split_idx` is derived at runtime
+from `int(len(features_df) * 0.70)` so the ratio stays exact regardless of
+the actual number of rows Binance returns:
 
 ```
-full dataset:  ~14,400 rows   (10 days × 1,440 candles/day at 1 m)
-  ├── train set:  first 7 days  →  ~10,080 rows   (~70 %)
-  └── test  set:  last  3 days  →   ~4,320 rows   (~30 %)
+full dataset:  ~525,000 rows   (365 days × 1,440 candles/day at 1 m)
+  ├── train set:  first 70 %  →  ~367,500 rows   (~255 days, ~8.5 months)
+  └── test  set:  last  30 %  →  ~157,500 rows   (~109 days, ~3.6 months)
 
-split_idx = 7 × 1440 = 10,080
+split_idx = int(len(features_df) * 0.70)
 train_df  = features_df.iloc[:split_idx]
 test_df   = features_df.iloc[split_idx:]
 ```
 
-> **`BACKTEST_MAX_ROWS` must be bypassed** — the default cap of 500 rows
-> in `config_parameters.py` collapses the split to a few hours of train data,
-> which is statistically meaningless.  `regime_validation.py` calls
-> `fetch_klines()` and `_add_hmm_features()` directly, ignoring
-> `BACKTEST_MAX_ROWS`.
+> **`BACKTEST_MAX_ROWS` is intentionally bypassed.**  `regime_validation.py`
+> calls `fetch_klines()` and `_add_hmm_features()` directly.
+> Use `VALIDATION_LOOKBACK = "90 days ago UTC"` for a faster smoke-test run.
 
-#### Phase 1 — One-time Training Fit (10,080 rows)
+#### Phase 1 — Training Fit on Full Train Set (~367,500 rows)
 
-1. Call `RegimeDirector.select_hmm_model()` **once** on the last 120 rows of
-   `train_df` (equivalent to the live 2-hour window).
-2. Call `assign_regime_labels()` → capture the frozen `{state_idx → label}` mapping.
-3. **Freeze** `self.model` and `self.scaler`.  They are **never re-fitted** on
-   the test set — this is the constraint that makes the test set genuinely
-   out-of-sample at the long-horizon level.
+This module is **self-contained** — it does **not** use `RegimeDirector`.
+It replicates the BIC search and label-assignment logic directly using raw
+`GaussianHMM` + `StandardScaler` so that the training window is not
+artificially capped at `HMM_TRAIN_ROWS` (80 rows):
 
-#### Phase 2 — Rolling Label Assignment on Test Set (frozen model)
+1. `StandardScaler.fit_transform(train_features)` — learn mean/std from
+   train rows only.  Test rows are never seen by the scaler during fitting.
+2. `_fit_best_hmm(train_scaled)` — BIC search over `n = 2 … HMM_MAX_REGIMES`.
+   Same retry logic as `RegimeDirector` (`HMM_N_INIT` seeds per n).
+3. `_assign_labels(model)` — rank-based directional assignment identical to
+   `RegimeDirector.assign_regime_labels()`.
 
-For each candle `t` in `test_df`:
+#### Phase 2 — Vectorised Label Assignment on Test Set
 
-1. Slice `features_df[t − HMM_LOOKBACK_ROWS : t]` — the same 2 h rolling
-   window (120 rows) that the live system uses.
-2. Assign the slice to `rd.klines_df`.
-3. Call **only** `rd.predict_current_regime()` — no `select_hmm_model()`,
-   no refit, frozen model throughout.
-4. Call `rd.assign_regime_labels()`.
-5. Record `(timestamp, regime_label, regime_confidence)`.
+The entire test set is scored in **four bulk operations** (no per-candle loop):
 
-> **Warm-up:** The first `HMM_LOOKBACK_ROWS` (120) candles of the test set
-> cannot be labelled because the rolling window would reach back into the
-> training set.  The loop starts at `t = split_idx + HMM_LOOKBACK_ROWS`
-> (effective test set ≈ 4,200 rows — negligible difference from 4,320).
+1. `scaler.transform(test_features)` — scale all ~157,500 test rows at once.
+2. `model.predict(test_scaled)` — single Viterbi pass (hmmlearn C extension).
+3. `model.predict_proba(test_scaled)` — Forward–Backward pass;
+   `proba[np.arange(n), states]` extracts per-candle confidence via NumPy
+   advanced indexing.
+4. `label_array[states]` — maps state indices to labels with a NumPy lookup
+   array (no Python loop).
+
+| Approach | Viterbi calls | Estimated Phase 2 time |
+|---|---|---|
+| Per-candle loop | ~157,500 | hours |
+| Vectorised (current) | **1** | **seconds** |
+
+Total runtime is dominated by the **Binance paginated fetch** (~8–10 min for
+1 year at 1 m resolution).
 
 #### Phase 3 — Validation Checks
 
@@ -630,11 +637,11 @@ Results are printed by
 
 ```
 ══════════════════════════════════════════════════════════════════
- REGIME VALIDATION REPORT — 3-day test set (~4,200 candles)
+ REGIME VALIDATION REPORT — 8-day test set (~11,520 candles)
 ══════════════════════════════════════════════════════════════════
 
- Train:  7 days  (~10,080 rows)   model frozen after initial fit
- Test:   3 days  (~4,200 rows)    predict_current_regime() only
+ Train:  22 days  (~31,680 rows)   model frozen after initial fit
+ Test:    8 days  (~11,520 rows)   vectorised single Viterbi pass
 
 ──────────────────────────────────────────────────────────────────
  PER-REGIME STATISTICS
@@ -734,9 +741,9 @@ catastrophically) as parameters shift away from their tuned values.
 Progress tracker for the modules described above.  Each step maps to a
 concrete file in `backtest/`.
 
-- ✅ **Step 1 — `backtest/data.py`** — Downloads 10 days of 1 m BTCUSDT
+- ✅ **Step 1 — `backtest/data.py`** — Downloads 30 days of 1 m BTCUSDT
   klines via `binance.client.Client.get_historical_klines()` and returns a
-  clean `pandas.DataFrame`.  *(Implemented.)*
+  clean `pandas.DataFrame` (~43,200 rows).  *(Implemented.)*
 - ✅ **Step 2 — `backtest/synthetic_book.py`** — Given a single kline row
   (`pd.Series`), constructs a 50-level synthetic order book with exponential
   volume decay and OBI asymmetry injection.  Returns a
@@ -773,16 +780,17 @@ concrete file in `backtest/`.
   `features[HMM_TRAIN_ROWS:]` (most-recent ~40 rows, never seen during fit).
   `self.current_regime` and `self.regime_confidence` always reflect a genuinely
   out-of-sample candle.  *(Implemented.)*
-- ✅ **Step 6b — Offline long-horizon regime validation** (`backtest/regime_validation.py`) —
-  Standalone diagnostic script (run with `python -m backtest.regime_validation`).
-  Fetches **10 days** of 1-minute klines (~14,400 rows), applies a **7-day
-  train / 3-day test** split (`split_idx = 7 × 1440 = 10,080`).  The HMM is
-  fitted **once** on the last 120 rows of the training period (Phase 1) and
-  then **frozen** — `BACKTEST_MAX_ROWS` is intentionally bypassed.  A rolling
-  120-row window (Phase 2) is applied to every test candle — first 120 candles
-  of the test set skipped as warm-up — using only `predict_current_regime()`
-  (cheap Viterbi, frozen model, no refit).  Six checks (Phase 3) are computed
-  on the ~4,200 labelled test candles:
+- ✅ **Step 6b — Offline long-horizon regime validation** (`backtest/diagnostics/regime_validation.py`) —
+  Standalone diagnostic script (run with `python -m backtest.diagnostics.regime_validation`).
+  Fetches **1 year** of 1-minute klines (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`),
+  applies a **70/30 train-test split** at runtime (`split_idx = int(len(df) * 0.70)`).
+  **Self-contained** — does not use `RegimeDirector`; replicates BIC search and label
+  assignment directly with raw `GaussianHMM` + `StandardScaler` so the training window
+  is not capped at 80 rows.  Phase 2 scores all ~157,500 test candles in a
+  **single vectorised Viterbi pass** with NumPy advanced indexing for confidence
+  extraction (`proba[np.arange(n), states]`) and a lookup-array for label mapping
+  (`label_array[states]`).  `BACKTEST_MAX_ROWS` is intentionally bypassed.
+  Six checks (Phase 3) are computed on the labelled test candles:
   1. **Direction test** — `trending_up` mean > `neutral` mean > `trending_down`
      mean forward 1-candle return.
   2. **Welch's t-test** — p < 0.05 between `trending_up` and `trending_down`
