@@ -122,7 +122,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_MIN_CONFIDENCE` | `0.70` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
-| **Backtesting** | `BACKTEST_LOOKBACK` | `"30 days ago UTC"` | How far back to fetch klines for the backtest dataset (~43,200 candles at 1 m).  A 30-day window captures a broader range of market regimes and makes both signal replay and regime-validation results more statistically meaningful |
+| **Backtesting** | `BACKTEST_LOOKBACK` | `"180 days ago UTC"` | How far back to fetch klines for the backtest dataset (~259,200 candles at 1 m).  A 180-day window captures a broad range of market regimes, making both signal replay and regime-validation results more statistically meaningful. |
 | **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
@@ -685,7 +685,7 @@ websocket_main.py startup
 ## Backtesting
 
 A backtesting framework has been built to replay the live strategy against
-30 days of historical 1-minute klines (~43,200 candles).  Because Binance does
+180 days of historical 1-minute klines (~259,200 candles).  Because Binance does
 not expose historical Level-2 order book data, a **synthetic 50-level depth
 ladder** is reconstructed from each kline's OHLCV data and taker volume split,
 then fed through the **same production scoring pipeline** used by
@@ -705,7 +705,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/data.py` | ✅ done | Download historical klines |
 | `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
-| `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, `half_spread` fill, equity curve, FIFO round-trip pairing, Step 5 metrics |
+| `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, bps-based `half_spread` fill model (`BACKTEST_FILL_SPREAD_BPS`), per-trade position cap (`BACKTEST_MAX_POSITION_PCT`), equity curve, FIFO round-trip pairing, Step 5 metrics |
 | `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7 |
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`

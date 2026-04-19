@@ -9,140 +9,38 @@ from binance.client import Client
 # ---------------------------------------------------------------------------
 # Symbol configuration
 # ---------------------------------------------------------------------------
-SYMBOL = "BTCUSDT"  # trading pair
-CCY = "USDT"  # quote currency
-CRYPTOCCY = "BTC"  # base / cryptocurrency
+SYMBOL = "BTCUSDT"   # trading pair
+CCY = "USDT"         # quote currency
+CRYPTOCCY = "BTC"    # base / cryptocurrency
 
-# ---------------------------------------------------------------------------
-# Backtesting Parameters and Features
-# ---------------------------------------------------------------------------
-# 90 *calendar* days (including weekends) — crypto trades 24/7 so there are
-# no weekend gaps in Binance kline data.  At 1 m resolution this yields
-# 90 × 24 × 60 = 129,600 rows.  A 3-month window captures a significantly
-# broader range of market regimes (trending, ranging, volatile) than the
-# previous 30-day window, making both the signal replay and regime-validation
-# results more statistically meaningful and robust.
-# NOTE: backtest/regime_validation.py (Step 6b) uses its own fetch window and
-# bypasses BACKTEST_MAX_ROWS intentionally — this constant only affects
-# backtest/run_backtest.py (signal replay) and is independent of regime_validation.
-BACKTEST_LOOKBACK = "90 days ago UTC"
-BACKTEST_MAX_ROWS: int | None = None
-VOLUME_DECAY_FACTOR = (
-    0.80  # each lever down the order book retains 80% of the previous level's volume
-)
-HMM_LOOKBACK_ROWS = 120  # 2 h at 1 m — matches HMM_LOOKBACK in the live system
-VWAP_WINDOW = 5  # 5 candles = 5 min at 1 m — matches live VWAP window
-REFIT_EVERY = 120  # How often the HMM *parameters* are re-estimated via a full BIC
-# re-fit (select_hmm_model()).  Between re-fits, the bot still detects which
-# regime it is currently in every single candle via the cheap Viterbi pass
-# (predict_current_regime()).  The refit only updates the *mathematical
-# definition* of each regime (transition matrix, emission means/covariances) —
-# not the regime assignment itself.
-# At 1 m candles: 120 iterations = 2 h between parameter updates.
-# Reducing this increases accuracy of the regime definitions at the cost of
-# runtime; raising it speeds up backtesting with minimal impact on detection
-# quality (BTC regime structure is stable over ~2 h windows).
-
-# ---------------------------------------------------------------------------
-# Backtesting P&L Parameters  (Step 4 — backtest/pnl.py)
-# ---------------------------------------------------------------------------
-# TOTAL AMOUNT = USD + BTC = 10,000$ (assuming BTC is 68,000)
-BACKTEST_INITIAL_CAPITAL = 5000.0  # starting USDT balance for the simulation
-BACKTEST_INITIAL_BTC = 0.0735  # starting BTC balance for the simulation
-BACKTEST_FEE_RATE = 0.001  # 0.10 % taker fee per side (Binance Spot standard)
-# Annualised risk-free rate used in the Sharpe / Sortino denominator.
-# Sharpe = (mean(Rp) - Rf_per_period) / std(Rp) × √(periods_per_year)
-# For crypto there is no direct risk-free equivalent; 0.0 is the most common
-# choice in academic crypto research.  To use a T-bill proxy (e.g. 4 % p.a.)
-# set this to 0.04 — pnl.py converts it to the correct per-period rate
-# automatically regardless of the adaptive resampling bucket chosen.
-# TODO maybe the Rf rate should be equal to US Treasury bills (4 - 5 %)
-BACKTEST_RISK_FREE_RATE = 0.0  # annualized (0.0 = no risk-free rate adjustment)
-# Slippage is NOT a fixed constant — it equals half the candle range:
-#   half_spread = (high - low) / 2
-# This quantity is computed per-candle in synthetic_book.py and stored in
-# the signals DataFrame.  Fill prices are then:
-#   BUY  fill = close + half_spread   (you pay the synthetic ask)
-#   SELL fill = close - half_spread   (you receive the synthetic bid)
-
-# ---------------------------------------------------------------------------
-# HMM Parameters and Features
-# ---------------------------------------------------------------------------
-HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
-HMM_N_ITERATIONS = 1000
-HMM_MAX_REGIMES = len(HMM_FEATURE_COLS) - 1
-HMM_RANDOM_STATE = 46
-HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
-HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
-# while keeping enough data for stable EM convergence
-# Regularisation floor added to the diagonal of every state's covariance
-# matrix.  Prevents "covars must be symmetric, positive-definite" errors
-# when a hidden state has few observations relative to the feature count.
-# Raised from 1e-3 → 1e-2 → 1e-1: with BACKTEST_MAX_ROWS=None the full
-# 14,400-row dataset is processed and some 120-row windows contain
-# near-constant features (e.g. flat volatility during overnight low-activity
-# periods).  1e-1 is the recommended safe default for normalised financial
-# features that have been z-scored by StandardScaler (unit variance).  A
-# floor of 0.1 is 10 % of the natural scale and is still far below the
-# between-state variance that the HMM needs to distinguish regimes, so
-# regime labels are not materially affected.
-HMM_MIN_COVAR = 1e-1
-# Number of independent random-seed restarts attempted per candidate
-# n_components value inside select_hmm_model().  The EM algorithm can
-# converge to degenerate solutions (e.g. one state never visited →
-# transmat row sums to 0) depending on initialisation.  Trying HMM_N_INIT
-# different seeds and accepting the first valid, non-degenerate fit makes
-# the BIC search robust to bad starting points.  Raised from 5 → 10 to
-# reduce the chance of all seeds failing on flat/low-variance windows.
-HMM_N_INIT = 10
-# Train / predict split for select_hmm_model() — walk-forward style.
-# The HMM is fitted ONLY on the FIRST HMM_TRAIN_ROWS rows of klines_df (older,
-# "in-sample" data).  Regime prediction (Viterbi) then runs ONLY on the
-# remaining rows klines_df[HMM_TRAIN_ROWS:] (most recent, out-of-sample).
-# self.current_regime / regime_confidence therefore always reflect a candle
-# the model has never seen during fit() — no look-ahead bias.
-# Rule of thumb: ~2/3 for training.  At HMM_LOOKBACK="2 hours ago UTC"
-# (≈120 rows) this gives 80 training rows and ~40 out-of-sample rows.
-HMM_TRAIN_ROWS = 80
-# Minimum posterior probability the model must assign to the predicted regime
-# before an order is allowed.  When predict_proba()[-1][current_regime] < this
-# threshold the regime is treated as "uncertain" and the iteration is skipped.
-# 0.70 means at least 70 % probability mass on the winning state — a coin-flip
-# (0.50 for 2 states) would always be rejected, a clear signal (0.80+) passes
-# comfortably.  Raise to 0.75–0.80 for more conservative gating.
-HMM_MIN_CONFIDENCE = 0.70
-# Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
-# inside historical_analysis().  Between re-fits, only a cheap Viterbi
-# prediction (predict_current_regime()) is run on the latest kline features.
-# Must be a multiple of HIST_INTERVAL (60 s).  Default: 300 s = 5 minutes.
-HMM_REFIT_INTERVAL = 300
 # ---------------------------------------------------------------------------
 # Order book state
 # ---------------------------------------------------------------------------
 HISTORY_MAXLEN = 3000  # max snapshots in history_order_book
 # at 100 ms update intervals this covers ~5 minutes
 N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
+
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
-HFT_INTERVAL = 1  # seconds between HFT evaluations
+HFT_INTERVAL = 1    # seconds between low-latency evaluations
 HIST_INTERVAL = 60  # seconds between historical analyses (1 min)
-MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis runs
+MIN_SNAPSHOTS = 100 # minimum snapshots required before historical analysis runs
 
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
 DEFAULT_SESSION_MINUTES = 10  # default session length
 # at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
-HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
+HTF_JOIN_TIMEOUT = 10   # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 
 # ---------------------------------------------------------------------------
 # Binance REST / WebSocket connection
 # ---------------------------------------------------------------------------
-RECV_WINDOW = 5000  # ms — Binance REST request validity window
+RECV_WINDOW = 5000    # ms — Binance REST request validity window
 SNAPSHOT_DEPTH = 100  # number of order book levels in the seed snapshot
-WS_SPEED = 100  # ms — WebSocket diff-depth update interval
+WS_SPEED = 100        # ms — WebSocket diff-depth update interval
 
 # ---------------------------------------------------------------------------
 # Quote calculation throttle
@@ -159,3 +57,96 @@ QUOTE_EVERY_N_TICKS = 10
 # If the session produces more than 2 * ORDER_REPORT_LIMIT orders, the middle
 # block is collapsed to a single summary line to avoid flooding the console.
 ORDER_REPORT_LIMIT = 100
+
+# ---------------------------------------------------------------------------
+# HMM Parameters and Features
+# ---------------------------------------------------------------------------
+HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
+HMM_N_ITERATIONS = 1000
+HMM_MAX_REGIMES = len(HMM_FEATURE_COLS) - 1  # BIC search: 2 … 3 states
+HMM_RANDOM_STATE = 46
+HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
+HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
+                                   # while keeping enough data for stable EM convergence
+# Regularisation floor added to the diagonal of every state's covariance
+# matrix.  Prevents "covars must be symmetric, positive-definite" errors
+# when a hidden state has few observations relative to the feature count.
+# 1e-1 is the recommended safe default for z-scored financial features.
+HMM_MIN_COVAR = 1e-1
+# Number of independent random-seed restarts per candidate n_components value
+# inside select_hmm_model().  Higher values reduce the chance of degenerate
+# EM solutions (e.g. transmat row summing to 0) on flat/low-variance windows.
+HMM_N_INIT = 10
+# Train / predict split — walk-forward style (no look-ahead bias).
+# The HMM is fitted ONLY on the first HMM_TRAIN_ROWS rows of klines_df.
+# Viterbi prediction then runs on the remaining rows klines_df[HMM_TRAIN_ROWS:].
+# Rule of thumb: ~2/3 for training.  At 120 rows → 80 train, ~40 out-of-sample.
+HMM_TRAIN_ROWS = 80
+# Minimum posterior probability for regime gating.
+# predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE → iteration skipped.
+# 0.70 = 70 % probability mass required on the winning state.
+HMM_MIN_CONFIDENCE = 0.70
+# Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
+# inside historical_analysis().  Between re-fits only a cheap Viterbi pass
+# (predict_current_regime()) runs.  Must be a multiple of HIST_INTERVAL.
+HMM_REFIT_INTERVAL = 300  # seconds (= 5 min)
+
+# ---------------------------------------------------------------------------
+# Backtesting — all parameters used by backtest/ in one place
+# ---------------------------------------------------------------------------
+
+# -- Data window -----------------------------------------------------------
+# 180 calendar days at 1 m resolution → 259,200 rows.
+# Crypto trades 24/7 so there are no weekend gaps.
+BACKTEST_LOOKBACK = "180 days ago UTC"
+
+# Set to an integer to cap the number of replay candles for quick debug runs;
+# None = use all candles in the window (full production backtest).
+BACKTEST_MAX_ROWS: int | None = None
+
+# -- Synthetic order book (backtest/synthetic_book.py) ---------------------
+# Volume at each price level decays exponentially away from the mid.
+# Level i carries base_volume × VOLUME_DECAY_FACTOR ** i.
+# 0.80 → level 1 retains 80 % of level 0, level 2 retains 64 %, etc.
+VOLUME_DECAY_FACTOR = 0.80
+
+# -- HMM cadence inside the signal replay (backtest/signals.py) -----------
+# Mirrors the live system's HMM_LOOKBACK_ROWS / REFIT_EVERY constants so
+# the backtest uses the same rolling-window logic as websocket_main.py.
+HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 2 h at 1 m
+VWAP_WINDOW = 5          # rolling VWAP window (rows) — 5 min at 1 m
+REFIT_EVERY = 120        # full BIC re-fit every N replay candles (= 2 h at 1 m)
+
+# -- P&L simulation (backtest/pnl.py) -------------------------------------
+# Starting balances.  Total = USDT + BTC × first_close ≈ $10 000 at $68 k BTC.
+BACKTEST_INITIAL_CAPITAL = 5000.0   # starting USDT balance
+BACKTEST_INITIAL_BTC = 0.0735       # starting BTC balance
+
+# Taker fee per side (Binance Spot standard tier).
+BACKTEST_FEE_RATE = 0.001  # 0.10 %
+
+# Annualised risk-free rate for Sharpe / Sortino.
+# pnl.py converts this to a per-period rate automatically.
+# Set to 0.04–0.05 for a US T-bill proxy; 0.0 is the standard in crypto research.
+BACKTEST_RISK_FREE_RATE = 0.0  # annualised (0.0 = no risk-free rate adjustment)
+
+# Fill-cost model: simulated bid-ask half-spread in basis points.
+#   half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
+#   BUY  fill   = close + half_spread   (you pay the synthetic ask)
+#   SELL fill   = close - half_spread   (you receive the synthetic bid)
+#
+# Why NOT (high - low) / 2:
+#   A 1-min BTC candle range of $50–$300 gives half_spread $25–$150 —
+#   10–100× larger than the real Binance BTCUSDT spread of ~1–5 bps.
+#   A LIMIT order fills at or inside the spread, not at the candle extreme.
+#
+#   2  bps — tight / optimistic
+#   5  bps — realistic base case (default)
+#   10 bps — conservative / stressed
+BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
+
+# Maximum fraction of available USDT deployed per BUY trade.
+# Prevents all-in behaviour where fee + spread costs compound on 100 % of
+# the balance every round trip.  0.10 → at most 10 % risked per signal.
+# Set to 1.0 to revert to all-in behaviour.
+BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal

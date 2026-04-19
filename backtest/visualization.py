@@ -72,7 +72,7 @@ _REGIME_COLOURS: dict[str, str] = {
     "trending_up": "rgba(200, 230, 201, 0.55)",  # pale green
     "trending_down": "rgba(255, 205, 210, 0.55)",  # pale red / salmon
     "high_volatility": "rgba(255, 224, 178, 0.55)",  # pale orange
-    "neutral": "rgba(224, 224, 224, 0.55)",  # light grey
+    "neutral": "rgba(180, 180, 180, 0.40)",  # medium grey — visible on white background
 }
 
 # Opaque hex variants used for the legend dummy markers in Panel 3
@@ -436,10 +436,13 @@ def _panel_regime(fig: go.Figure, signals: pd.DataFrame) -> None:
         )
 
     if "regime_confidence" in signals.columns:
+        # regime_confidence may contain Python None (warm-up rows) — convert to
+        # float so Plotly renders gaps cleanly instead of a flat zero line.
+        conf_series = pd.to_numeric(signals["regime_confidence"], errors="coerce")
         fig.add_trace(
             go.Scatter(
                 x=signals.index,
-                y=signals["regime_confidence"],
+                y=conf_series,
                 mode="lines",
                 name="Confidence",
                 line=dict(color="navy", width=1.0),

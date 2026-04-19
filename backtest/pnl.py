@@ -52,6 +52,7 @@ from config_parameters import (
     BACKTEST_INITIAL_BTC,
     BACKTEST_INITIAL_CAPITAL,
     BACKTEST_RISK_FREE_RATE,
+    BACKTEST_MAX_POSITION_PCT,
     HMM_MIN_CONFIDENCE,
 )
 
@@ -132,8 +133,12 @@ def simulate_pnl(
 
             # Balance guard: cannot spend more USDT than available.
             # Total debit per unit = eff_price × (1 + fee_rate).
+            # Also cap at BACKTEST_MAX_POSITION_PCT of available USDT so the
+            # strategy never bets 100 % of its balance on a single signal —
+            # the old all-in behaviour caused full fee erosion over 180 days.
+            usdt_budget = usdt * BACKTEST_MAX_POSITION_PCT
             max_affordable = (
-                usdt / (eff_price * (1.0 + fee_rate)) if eff_price > 0 else 0.0
+                usdt_budget / (eff_price * (1.0 + fee_rate)) if eff_price > 0 else 0.0
             )
             qty = min(raw_qty, max_affordable)
 

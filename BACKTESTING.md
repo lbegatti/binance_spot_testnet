@@ -43,7 +43,7 @@ prices or queue position.
 ### Suggested window
 - **Instrument:** BTCUSDT
 - **Interval:** 1 minute  (matches the `HMM_INTERVAL` already used in production)
-- **Lookback:** 30 days  (~43,200 candles — captures a broader range of market
+- **Lookback:** 180 days  (~259,200 candles — captures a broad range of market
   regimes; crypto trades 24/7 so all 30 days are fully populated with no weekend gaps)
 
 ### Columns returned per candle
@@ -103,21 +103,44 @@ Kline data provides only a single OHLCV bar per candle.  To feed the existing
 scoring pipeline (`metrics.py` → `indicators.py` → `scores.py`) during a
 backtest, a synthetic depth ladder must be constructed for each candle.
 
-### Spread reconstruction
+### Spread reconstruction — synthetic book vs fill model
 
-The high-low range of a candle is used as a proxy for the full bid-ask spread
-observed during that minute:
+The high-low range of a candle is used **only** to reconstruct the synthetic
+order book depth (bid/ask level spacing).  It is **not** used as the fill-cost
+model for P&L simulation:
 
 ```
-half_spread          = (high − low) / 2
-synthetic_best_bid   = close − half_spread
-synthetic_best_ask   = close + half_spread
+synthetic_half_spread = (high − low) / 2
+synthetic_best_bid    = close − synthetic_half_spread
+synthetic_best_ask    = close + synthetic_half_spread
 ```
 
 > **Why `close` and not `(high + low) / 2`?**  The `close` is the last
 > traded price and is therefore the best single-point estimate of where the
 > market was at the end of the candle.  Using `(high + low) / 2` as mid would
 > over-smooth intra-bar direction.
+
+#### Fill-cost model for P&L (Step 4)
+
+For P&L simulation a **bps-based half-spread** is used instead of the candle
+range, because a LIMIT order fills at or inside the real spread — not at the
+candle extreme:
+
+```
+half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
+BUY  fill   = close + half_spread   (you pay the synthetic ask)
+SELL fill   = close − half_spread   (you receive the synthetic bid)
+```
+
+Default `BACKTEST_FILL_SPREAD_BPS = 5` → `half_spread ≈ $20` at $80 k BTC,
+matching the realistic Binance BTCUSDT spread of ~1–5 bps.
+
+> **Why NOT `(high − low) / 2` for fills?**
+> A 1-min candle range is typically $50–$300, giving `half_spread ≈ $25–$150`.
+> Over 1,000+ round trips this is $25,000–$150,000 in friction on a $10,000
+> portfolio — 10–100× the real exchange spread — and causes 100 % drawdown.
+> The candle range is an upper bound on intra-bar volatility, not the cost of
+> crossing the spread with a limit order.
 
 ### Generating N synthetic levels
 
@@ -195,19 +218,19 @@ live system.  No simplified proxy rules are needed.
 
 ### Per-candle procedure
 
-The dataset contains **~43,200 rows** (30 days × 1,440 candles/day at 1 m).
+The dataset contains **~259,200 rows** (180 days × 1,440 candles/day at 1 m).
 For **each row** a fresh synthetic 50-level order book is constructed (Step 2c),
 and the full production pipeline is run on it.  This produces one signal
 decision per minute — the exact equivalent of one `low_latency_analysis()`
 iteration in the live system (which runs every 1 s, but at 1 m kline resolution
 the minimum granularity is 1 candle = 1 min).
 
-> **Memory note:** 43,200 candles × 100 rows per book (50 bids + 50 asks) = 4,320,000
+> **Memory note:** 259,200 candles × 100 rows per book (50 bids + 50 asks) = 25,920,000
 > order book rows in total — but they are **never all in memory at once**.  The loop
 > constructs one 100-row DataFrame, runs the pipeline on it, records the signal,
 > then discards it before moving to the next candle.  Peak memory at any moment is
-> one synthetic book (100 rows) plus the 43,200-row klines DataFrame — well under
-> 50 MB and entirely negligible.
+> one synthetic book (100 rows) plus the 259,200-row klines DataFrame — well under
+> 200 MB and entirely manageable.
 
 There are **three independent data flows** running in parallel at every candle
 `t`.  They use completely different input shapes and are then combined into a
@@ -351,18 +374,20 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
 ## Step 4 — Simulated P&L
 
 ### Fill assumption
-- Fill prices are derived from ``half_spread = (high − low) / 2``, the same
-  quantity used in Step 2c to place ``synthetic_best_bid`` and
-  ``synthetic_best_ask``.  This ensures fill prices are **consistent with
-  the synthetic order book** the signals were generated from:
+- Fill prices use a **bps-based half-spread** (`BACKTEST_FILL_SPREAD_BPS`), not
+  the candle high-low range.  A LIMIT order fills at or inside the real spread
+  — not at the candle extreme:
   ```
-  BUY  fill = close + half_spread   (≡ synthetic_best_ask — you cross the spread)
-  SELL fill = close - half_spread   (≡ synthetic_best_bid — you receive the bid)
+  half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
+  BUY  fill   = close + half_spread   (you pay the synthetic ask)
+  SELL fill   = close − half_spread   (you receive the synthetic bid)
   ```
-- `half_spread = (high − low) / 2` **is** the slippage — it is computed
-  per-candle in `synthetic_book.py` and stored in the signal DataFrame.
-  No separate fixed `BACKTEST_SLIPPAGE` constant is used; the spread cost
-  is already fully embedded in the fill price.
+  Default `BACKTEST_FILL_SPREAD_BPS = 5` bps → `half_spread ≈ $20` at $80 k
+  BTC, matching the realistic Binance BTCUSDT spread.
+
+  > **Why NOT `(high − low) / 2`?**  A 1-min candle range gives
+  > `half_spread ≈ $25–$150` per trade — 10–100× the real exchange spread.
+  > Over 1,000+ round trips this produces 100 % drawdown on a $10,000 portfolio.
 
 ### Trade sizing
 - The candidate tuple from the production pipeline contains `bq` (bid quantity)
@@ -370,13 +395,14 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
   size LIMIT orders in the live system.
 - BUY quantity = `aq` from the best-buy candidate; SELL quantity = `bq` from
   the best-sell candidate.
-- A balance guard identical to the live code caps quantity at
-  `min(quantity, usdt_balance / micro_price)` for BUY and
+- A balance guard caps quantity at
+  `min(quantity, usdt_budget / (eff_price × (1 + fee_rate)))` for BUY and
   `min(quantity, btc_balance)` for SELL.
+- `usdt_budget = usdt × BACKTEST_MAX_POSITION_PCT` (default 10 %) so each BUY
+  risks at most 10 % of available USDT, preventing all-in fee compounding.
 
 ### Costs
-- Taker fee: 0.10 % per side (Binance Spot standard; testnet ignores fees but
-  a real backtest must account for them).
+- Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`; Binance Spot standard).
 - Slippage estimate: add half the high-low spread as a conservative proxy.
 
 ### P&L per trade and round-trip pairing
@@ -412,7 +438,7 @@ balance, but is excluded from round-trip stats.  A clearly visible WARNING box
 is printed to the console.
 
 ```
-BUY  P&L entry  = fill_price = close + half_spread
+BUY  P&L entry  = fill_price = close + half_spread    (half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000)
 SELL P&L exit   = fill_price = close - half_spread
 round_trip PnL  = (exit_fill - entry_fill) × matched_qty
 ```
@@ -741,9 +767,9 @@ catastrophically) as parameters shift away from their tuned values.
 Progress tracker for the modules described above.  Each step maps to a
 concrete file in `backtest/`.
 
-- ✅ **Step 1 — `backtest/data.py`** — Downloads 30 days of 1 m BTCUSDT
+- ✅ **Step 1 — `backtest/data.py`** — Downloads 180 days of 1 m BTCUSDT
   klines via `binance.client.Client.get_historical_klines()` and returns a
-  clean `pandas.DataFrame` (~43,200 rows).  *(Implemented.)*
+  clean `pandas.DataFrame` (~259,200 rows).  *(Implemented.)*
 - ✅ **Step 2 — `backtest/synthetic_book.py`** — Given a single kline row
   (`pd.Series`), constructs a 50-level synthetic order book with exponential
   volume decay and OBI asymmetry injection.  Returns a

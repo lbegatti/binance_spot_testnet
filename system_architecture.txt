@@ -16,7 +16,7 @@ FILES
 
   strategy/
     analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter)
-    book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity)
+    book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity) — NumPy-vectorised; shape-mismatch guard
     regime_director.py                — RegimeDirector: GaussianHMM regime detection on 1-min klines
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
     metrics.py                        — Order book depth metrics
@@ -31,10 +31,10 @@ FILES
     plot_helpers.py                   — Charting utilities for the REST snapshot path
 
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
-    data.py                           — Historical kline downloader (30 days, 1 m BTCUSDT; ~43,200 candles)
+    data.py                           — Historical kline downloader (180 days, 1 m BTCUSDT; ~259,200 candles)
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
-    pnl.py                            — P&L simulation: balance guard, half_spread fill, FIFO round-trip pairing, equity curve, Step 5 metrics
+    pnl.py                            — P&L simulation: balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), per-trade position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
     regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 70/30 train-test split on 1 year (~525k rows), self-contained BIC search + label assignment (no RegimeDirector), vectorised single Viterbi pass on ~157k test candles, six checks
     reporting/                        — Console report formatting and CSV export (AI-authored)
@@ -75,7 +75,7 @@ FILES
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
-    BACKTEST_LOOKBACK    = "30 days ago UTC"  # kline fetch window for backtest dataset (~43,200 candles;
+    BACKTEST_LOOKBACK    = "180 days ago UTC"  # kline fetch window for backtest dataset (~259,200 candles;
                                                # 30-day window for broader regime coverage)
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
@@ -90,8 +90,10 @@ FILES
                                          # 0.0 = no adjustment (standard in crypto);
                                          # set to e.g. 0.04 for a 4% T-bill proxy.
                                          # Converted to per-period rate automatically.
-    # Slippage = (high - low) / 2 per candle — computed dynamically in
-    # synthetic_book.py; no separate constant needed.
+    BACKTEST_FILL_SPREAD_BPS = 5.0       # bps-based half-spread for fill simulation.
+                                         # half_spread = close × BPS / 20 000.
+                                         # Default 5 bps → ~$20 at $80 k BTC.
+    BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -521,10 +523,10 @@ FILES
 ─────────────────────────────────────────────────────────────────────────────
 7. BACKTESTING  (backtest/)
 ─────────────────────────────────────────────────────────────────────────────
-  Offline replay of the live strategy on 30 days of historical 1-min klines
-  (~43,200 candles).  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
+  Offline replay of the live strategy on 180 days of historical 1-min klines
+  (~259,200 candles).  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
-  backtest/data.py            — fetch_klines(): downloads ~43,200 candles via
+  backtest/data.py            — fetch_klines(): downloads ~259,200 candles via
                                 Client.get_historical_klines() (public, no auth).
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +
@@ -563,8 +565,12 @@ FILES
                                     OrderExecutor.  Fill price per trade:
                                       BUY  = close + half_spread  (synthetic ask)
                                       SELL = close - half_spread  (synthetic bid)
-                                    Slippage = half_spread = (high-low)/2 and is
-                                    already embedded in the fill price above.
+                                    half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
+                                    (default 5 bps → ~$20 at $80 k BTC).
+                                    NOT (high-low)/2 — the candle range is
+                                    10-100× the real spread and causes 100% drawdown.
+                                    Per-trade position cap: BACKTEST_MAX_POSITION_PCT
+                                    (default 10 % of available USDT per BUY).
                                     Marks the portfolio to market at every candle
                                     (including HOLDs) to produce a continuous
                                     equity curve.  Outputs: trades_df, equity_df,

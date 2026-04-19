@@ -20,6 +20,7 @@ from config_parameters import (
     REFIT_EVERY,
     BACKTEST_MAX_ROWS,
     HMM_MIN_CONFIDENCE,
+    BACKTEST_FILL_SPREAD_BPS,
 )
 
 logging.basicConfig(
@@ -247,12 +248,20 @@ def run_signals() -> pd.DataFrame:
         regime_confidence = rd.regime_confidence
 
         # Fill price anchor and spread for Step-4 P&L.
-        # half_spread = (high - low) / 2 is the same quantity computed in
-        # synthetic_book.py Step 1.  It represents the natural taker cost:
-        #   BUY  fill = close + half_spread  (≡ synthetic_best_ask)
-        #   SELL fill = close - half_spread  (≡ synthetic_best_bid)
+        # half_spread: realistic bid-ask half-spread for a limit-order strategy.
+        #
+        # OLD model: (high - low) / 2  ← candle price range, NOT the real spread.
+        #   At $80 k BTC this gives $25–$150 per trade, which is 10–100× the
+        #   actual Binance BTCUSDT spread and produces 100% drawdown via fee erosion.
+        #
+        # NEW model: close × BACKTEST_FILL_SPREAD_BPS / 20_000
+        #   BACKTEST_FILL_SPREAD_BPS = 5 → half_spread = close × 0.00025
+        #   At $80 k BTC: half_spread ≈ $20 — matches the realistic ~5 bp spread.
+        #
+        #   BUY  fill = close + half_spread  (synthetic ask — limit order taker cost)
+        #   SELL fill = close - half_spread  (synthetic bid — limit order taker cost)
         close_price = float(row["close"])
-        half_spread = (float(row["high"]) - float(row["low"])) / 2.0
+        half_spread = close_price * BACKTEST_FILL_SPREAD_BPS / 20_000.0
 
         # Always capture raw candidate details for reporting (needed by
         # _compute_stats in pnl.py to count raw candidates and blocked rates
