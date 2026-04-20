@@ -117,6 +117,26 @@ HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 2 h at 1 m
 VWAP_WINDOW = 5          # rolling VWAP window (rows) — 5 min at 1 m
 REFIT_EVERY = 120        # full BIC re-fit every N replay candles (= 2 h at 1 m)
 
+# Speed-up override used ONLY inside backtest/sensitivity.py.
+# At 1 m candles: 480 iterations = 8 h between refits → ~90 refits per 30-day
+# run instead of ~360, giving a ~4× speedup.  The relative ranking of parameter
+# combinations is preserved; only absolute P&L numbers change slightly.
+# config_parameters.py defaults and the live system are NEVER affected.
+SENSITIVITY_REFIT_EVERY = 480
+# Data fetch window used by sensitivity.py — shorter than BACKTEST_LOOKBACK
+# (180 days) to keep each of the 6 OAT runs fast (~36–108 min total).
+# 30 days ≈ 43,200 rows at 1 m resolution.
+# IMPORTANT: this is passed as start_str to fetch_klines() inside run_signals()
+# only when called from sensitivity.py.  run_backtest.py always uses
+# BACKTEST_LOOKBACK and is completely unaffected.
+SENSITIVITY_LOOKBACK = "30 days ago UTC"
+# How many candles to skip between cheap Viterbi passes (predict_current_regime)
+# in sensitivity.py.  Between two predict calls the last known regime label is
+# reused.  1-min candles → regime changes in ≤5 min are missed, but the
+# RELATIVE ranking of parameter combinations is preserved (all runs use the
+# same cadence).  run_backtest.py always uses predict_every=1 (every candle).
+SENSITIVITY_PREDICT_EVERY = 5  # 8 h at 1 m — sensitivity-sweep override only
+
 # -- P&L simulation (backtest/pnl.py) -------------------------------------
 # Starting balances.  Total = USDT + BTC × first_close ≈ $10 000 at $68 k BTC.
 BACKTEST_INITIAL_CAPITAL = 5000.0   # starting USDT balance

@@ -2,7 +2,7 @@
 
 > **Status:** Steps 1–7 implemented (``data.py``, ``synthetic_book.py``,
 > ``signals.py``, ``pnl.py``, ``run_backtest.py``, ``regime_validation.py``,
-> ``visualization.py``).  Step 8 (sensitivity analysis) is not yet implemented.
+> ``visualization.py``).  Step 8 (sensitivity analysis, Use Case A) is implemented; Use Case B (180-day window) is deferred.
 > See the Implementation Roadmap at the bottom for a per-module progress tracker.
 
 ---
@@ -723,18 +723,179 @@ Results are printed by
 
 ## Step 8 — Sensitivity Analysis
 
-Run the backtest across a grid of parameter values to test robustness:
+### Objective
 
-| Parameter | Range to test |
+Run the full backtest pipeline (`run_signals` → `simulate_pnl` → `_compute_stats`)
+across a grid of parameter values to answer one question:
+
+> *"Does the strategy's performance degrade gracefully as each tunable parameter
+> shifts away from its current default value?"*
+
+A strategy is **robust** if total return stays positive, max drawdown does not
+spike, and win rate / profit factor follow a consistent trend as parameters
+move toward their tuned values.  A strategy is **fragile** if a small shift in
+one parameter causes a large non-monotonic swing — suggesting the default is
+over-fitted to the historical sample rather than capturing a genuine edge.
+
+---
+
+### Two Use Cases
+
+#### Use Case A — Live parameter tuning ✅ *Implemented*
+
+| Attribute | Value |
 |---|---|
-| `HMM_LOOKBACK` | 1 h, 2 h (current), 4 h |
-| `HMM_MAX_REGIMES` | 3, 4 (current) |
-| VWAP window | 2 min, 5 min (current), 10 min |
-| Score threshold (obi_proxy) | 0.05, 0.10, 0.20 |
-| Fee assumption | 0.05 %, 0.10 %, 0.15 % |
+| Window | `SENSITIVITY_LOOKBACK = "30 days ago UTC"` (~43,200 rows at 1 m) |
+| Rationale | The live HMM refits every 5 min on the latest 2 h of data. Tuning on 30 days of **recent** data is more appropriate than tuning on 6-month-old conditions. |
+| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
+| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `run_backtest.py` always predicts every candle. |
+| Runtime (OAT, 6 runs) | ~12–30 min on a laptop (after optimisations) |
+| Output | `backtest/results/best_params.json` — loaded by `websocket_main.py` at startup |
+| Run | `python -m backtest.sensitivity` |
 
-A strategy is considered robust if performance degrades gracefully (not
-catastrophically) as parameters shift away from their tuned values.
+#### Use Case B — Backtest robustness validation ⬜ *Deferred*
+
+| Attribute | Value |
+|---|---|
+| Window | Must match the main backtest (`"180 days ago UTC"`, ~259,200 rows) to avoid window-mismatch bias. A shorter window here would optimise for conditions not representative of the 180-day evaluation horizon. |
+| Runtime (OAT, 6 runs) | ~4–12 hours on a laptop — impractical without dedicated compute |
+| Status | Revisit if compute resources allow |
+
+---
+
+### Parameters
+
+All four parameters live in `config_parameters.py`.  The first value in each
+range is the **default** used by the baseline run.
+
+| # | Parameter | Constant | Default | Values tested |
+|---|---|---|---|---|
+| 1 | HMM lookback window | `HMM_LOOKBACK_ROWS` | 120 (2 h) | 60, **120**, 240 |
+| 2 | Max HMM regimes (BIC upper bound) | `HMM_MAX_REGIMES` | 3 | **3**, 2  *(4+ risks under-populated states with 4 features)* |
+| 3 | VWAP momentum window | `VWAP_WINDOW` | 5 (5 min) | **5**, 2  *(10 min excluded — too slow for 1 s cadence)* |
+| 4 | Taker fee rate | `BACKTEST_FEE_RATE` | 0.001 (0.10 %) | **0.001**, 0.0005  *(0.05 % achievable at VIP 3+)* |
+
+**Excluded from scope:**
+- Depth:delta score weights (0.70 / 0.30) — not a config constant.
+- OBI threshold — adding one would be a new feature, not a config swap.
+
+---
+
+### Execution Phases
+
+#### Phase 1 — One-At-a-Time (OAT) sweep *(default)*
+
+Hold all parameters at defaults; vary one at a time.
+- 1 baseline + 2 (lookback) + 1 (regimes) + 1 (vwap) + 1 (fee) = **6 runs**
+- Shows which parameter individually drives the most sensitivity.
+- Does **not** capture interaction effects.
+
+Run: `python -m backtest.sensitivity`
+
+#### Phase 2 — Full factorial grid *(triggered on demand)*
+
+All `3 × 2 × 2 × 2 = 24 combinations`.
+- Trigger rule: run Phase 2 only if any single OAT parameter causes `|ΔSharpe| > 0.5`.
+- Captures pairwise and higher-order interactions.
+
+Run: `python -m backtest.sensitivity --full-grid`
+
+---
+
+### Implementation (Approach A — keyword overrides)
+
+`run_signals()` accepts six optional keyword arguments that default to `None`
+(falling back to `config_parameters.py` constants when `None`).  Existing
+callers (`run_backtest.py`) require zero changes.
+
+```python
+signals = run_signals(
+    hmm_lookback_rows=60,                       # overrides HMM_LOOKBACK_ROWS
+    hmm_max_regimes=2,                          # overrides HMM_MAX_REGIMES
+    vwap_window=2,                              # overrides VWAP_WINDOW
+    refit_every=SENSITIVITY_REFIT_EVERY,        # 480 — 4× fewer refits
+    predict_every=SENSITIVITY_PREDICT_EVERY,    # 5 — 5× fewer Viterbi passes
+    lookback=SENSITIVITY_LOOKBACK,              # "30 days ago UTC" — 6× fewer rows
+)
+_, _, stats = simulate_pnl(signals, fee_rate=0.0005)  # overrides BACKTEST_FEE_RATE
+```
+
+`simulate_pnl()` already accepted `fee_rate` as a keyword argument before this
+change — no modification was needed there.
+
+**Combined speedup per OAT run (30-day window vs naïve 180-day run):**
+
+| Optimisation | Constant | Factor |
+|---|---|---|
+| Shorter fetch window | `SENSITIVITY_LOOKBACK = "30 days ago UTC"` | ~6× fewer rows |
+| Less frequent HMM refit | `SENSITIVITY_REFIT_EVERY = 480` | ~4× fewer full BIC fits |
+| Less frequent Viterbi | `SENSITIVITY_PREDICT_EVERY = 5` | ~5× fewer predict calls |
+| `itertuples()` in P&L loop | — (code change in `pnl.py`) | ~5× faster P&L walk |
+| Numpy-vectorised book build | — (code change in `synthetic_book.py`) | ~5–10× faster per candle |
+
+Total wall time: **~12–30 min** for the full OAT (6 runs) on a laptop, vs ~66–180 min without these optimisations.
+
+---
+
+### Output
+
+**Console** — sorted summary table (one row per combination):
+
+```
+════════════════════════════════════════════════════════════════════════════════════════
+  SENSITIVITY ANALYSIS — BTCUSDT  (OAT, 6 combinations)
+════════════════════════════════════════════════════════════════════════════════════════
+ lookback  max_reg  vwap   fee      total_ret%  drawdown%  sharpe  sortino  n_trips
+────────────────────────────────────────────────────────────────────────────────────────
+  120        3       5    0.001      +x.xx       -x.xx      x.xx    x.xx     xxx   ← baseline
+   60        3       5    0.001      +x.xx       -x.xx      x.xx    x.xx     xxx
+  240        3       5    0.001      +x.xx       -x.xx      x.xx    x.xx     xxx
+  120        2       5    0.001      +x.xx       -x.xx      x.xx    x.xx     xxx
+  120        3       2    0.001      +x.xx       -x.xx      x.xx    x.xx     xxx
+  120        3       5    0.0005     +x.xx       -x.xx      x.xx    x.xx     xxx
+════════════════════════════════════════════════════════════════════════════════════════
+```
+
+**Files written:**
+- `backtest/results/sensitivity_<mode>_<timestamp>.csv` — all metrics, all runs.
+- `backtest/results/best_params.json` — winning parameter set (ranked by Sharpe).
+
+---
+
+### Persisting Best Parameters (`best_params.json`)
+
+After the sweep, `sensitivity.py` writes the winning row to:
+
+```json
+{
+  "hmm_lookback_rows": 60,
+  "hmm_max_regimes": 3,
+  "vwap_window": 2,
+  "fee_rate": 0.0005,
+  "generated_at": "2026-04-19T10:00:00+00:00",
+  "source_metric": "sharpe_ratio",
+  "source_value": 1.42
+}
+```
+
+At startup `websocket_main.py` calls `_load_best_params()` which reads this
+file and overrides the relevant `config_parameters` constants.  If the file is
+absent the live system falls back silently to the defaults.
+
+> **Important:** do **not** commit `best_params.json` to git — it is
+> sample-specific.  Add `backtest/results/best_params.json` to `.gitignore`.
+> Re-run `sensitivity.py` whenever the lookback period, feature set, or market
+> conditions change significantly.
+
+---
+
+### Robustness Criteria
+
+| Verdict | Condition |
+|---|---|
+| **Robust** ✅ | `total_return_pct` positive across all tested values; Sharpe degradation < 0.5 units; max drawdown worsens < 5 pp vs baseline |
+| **Borderline** ⚠️ | Return flips sign for one extreme value — acceptable if the flip is at the edges (e.g. very long lookback) |
+| **Fragile** ❌ | Return positive only at the exact current default and negative for all others — likely over-fitted |
 
 ---
 
@@ -854,12 +1015,14 @@ concrete file in `backtest/`.
   PNG export requires ``pip install kaleido``; without it an interactive HTML
   file is saved instead.  *(Implemented.)*
 
-- ⬜ **Step 8 — Sensitivity Analysis** — Grid search over key parameters to
-  test strategy robustness: `HMM_LOOKBACK` (1 h / 2 h / 4 h), `HMM_MAX_REGIMES`
-  (3 / 4), VWAP window (2 / 5 / 10 min), OBI score threshold (0.05 / 0.10 /
-  0.20), and fee assumption (0.05 % / 0.10 % / 0.15 %).  The strategy is
-  considered robust if performance degrades gracefully — not catastrophically —
-  as parameters shift away from their tuned values.  *(Not yet implemented.)*
+- ✅ **Step 8 — `backtest/sensitivity.py`** — OAT and full-grid sensitivity
+  sweep over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and
+  `BACKTEST_FEE_RATE`.  **Use Case A (30-day live-tuning window) implemented.**
+  Run with `python -m backtest.sensitivity` (OAT, default) or
+  `python -m backtest.sensitivity --full-grid` (Phase 2, 24 combinations).
+  Writes `best_params.json` loaded by `websocket_main.py` at startup.
+  **Use Case B (180-day backtest validation) deferred** — runtime ~4–12 h for
+  OAT alone on a laptop.  *(Use Case A implemented; Use Case B deferred.)*
 
 ---
 

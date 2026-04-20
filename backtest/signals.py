@@ -19,8 +19,10 @@ from config_parameters import (
     VWAP_WINDOW,
     REFIT_EVERY,
     BACKTEST_MAX_ROWS,
+    BACKTEST_LOOKBACK,
     HMM_MIN_CONFIDENCE,
     BACKTEST_FILL_SPREAD_BPS,
+    HMM_MAX_REGIMES,
 )
 
 logging.basicConfig(
@@ -54,17 +56,60 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
         "close"
     ]
     klines_df["obi_proxy"] = (
-        klines_df["taker_buy_base_vol"] / klines_df["volume"]
-    ) * 2 - 1
+                                     klines_df["taker_buy_base_vol"] / klines_df["volume"]
+                             ) * 2 - 1
     klines_df["trade_density"] = klines_df["num_trades"] / klines_df["volume"]
     return klines_df.dropna()
 
 
-def run_signals() -> pd.DataFrame:
+def run_signals(
+        hmm_lookback_rows: int | None = None,
+        hmm_max_regimes: int | None = None,
+        vwap_window: int | None = None,
+        refit_every: int | None = None,
+        predict_every: int | None = None,
+        lookback: str | None = None,
+) -> pd.DataFrame:
     """
-    Replay the full trading pipeline on 30 days of historical 1-minute klines.
+    Replay the full trading pipeline on historical 1-minute klines.
 
-    For every candle from ``HMM_LOOKBACK_ROWS`` onward the function
+    All four optional parameters default to ``None``, in which case each falls
+    back to the module-level constant from ``config_parameters.py``.  This
+    allows ``backtest/sensitivity.py`` to override individual values per run
+    without modifying ``config_parameters.py`` or the live system.
+
+    Parameters
+    ----------
+    hmm_lookback_rows : int | None
+        Rolling window size (candles) passed to the HMM warm-up and the main
+        loop slice ``features_df.iloc[i - _lookback : i]``.
+        Defaults to ``HMM_LOOKBACK_ROWS`` (120 — 2 h at 1 m).
+    hmm_max_regimes : int | None
+        Upper bound on the BIC state search inside ``select_hmm_model()``.
+        Sets ``rd.max_states`` before each fit.
+        Defaults to ``HMM_MAX_REGIMES`` (3).
+    vwap_window : int | None
+        ``deque(maxlen=…)`` size for the rolling VWAP.
+        Defaults to ``VWAP_WINDOW`` (5 — 5 min at 1 m).
+    refit_every : int | None
+        Full BIC re-fit cadence in iterations.  Sensitivity runs pass
+        ``SENSITIVITY_REFIT_EVERY`` (480) here for a ~4× speedup; the live
+        system cadence (``REFIT_EVERY`` = 120) is used otherwise.
+        Defaults to ``REFIT_EVERY`` (120).
+    lookback : str | None
+        Data fetch window passed to ``fetch_klines()`` as ``start_str``.
+        Sensitivity runs pass ``SENSITIVITY_LOOKBACK`` ("30 days ago UTC",
+        ~43,200 rows) so each of the 6 OAT runs only processes 30 days
+        instead of the full 180-day backtest window.
+        Defaults to ``BACKTEST_LOOKBACK`` ("180 days ago UTC").
+    predict_every : int | None
+        How many candles to skip between cheap Viterbi passes
+        (``predict_current_regime()``).  1 = predict every candle (default,
+        used by ``run_backtest.py``).  Sensitivity runs may pass a higher
+        value (e.g. ``SENSITIVITY_PREDICT_EVERY = 5``) to cut Viterbi
+        overhead by ~5× while preserving relative parameter rankings.
+
+    For every candle from ``_lookback`` onward the function
     reproduces the three concurrent flows of the live system:
 
     **Flow A — Order-book scoring** (mirrors ``low_latency_analysis``):
@@ -109,11 +154,21 @@ def run_signals() -> pd.DataFrame:
             ``sell_qty`` (bid-side quantity at the best-sell level).
             ``buy_qty`` / ``sell_qty`` are ``None`` when no signal fired.
     """
+    # Resolve parameter overrides — fall back to config constants when None.
+    # This is the only place where overrides are applied; callers that pass
+    # no arguments (e.g. run_backtest.py) are completely unaffected.
+    _lookback = hmm_lookback_rows if hmm_lookback_rows is not None else HMM_LOOKBACK_ROWS
+    _max_regimes = hmm_max_regimes if hmm_max_regimes is not None else HMM_MAX_REGIMES
+    _vwap_window = vwap_window if vwap_window is not None else VWAP_WINDOW
+    _refit_every = refit_every if refit_every is not None else REFIT_EVERY
+    _predict_every = predict_every if predict_every is not None else 1
+    _fetch_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
+
     # 1. Fetch and prepare data
-    klines = fetch_klines()
+    klines = fetch_klines(start_str=_fetch_lookback)
     features_df = _add_hmm_features(klines)
     if BACKTEST_MAX_ROWS is not None:
-        features_df = features_df.iloc[-(HMM_LOOKBACK_ROWS + BACKTEST_MAX_ROWS) :]
+        features_df = features_df.iloc[-(_lookback + BACKTEST_MAX_ROWS):]
         logging.info(
             "Debug mode: capped at %d rows (%d replay candles).",
             len(features_df),
@@ -123,7 +178,7 @@ def run_signals() -> pd.DataFrame:
         "Fetched %d klines; %d rows after HMM features.", len(klines), len(features_df)
     )
 
-    # 2. Initial HMM fit on the warm-up window (first HMM_LOOKBACK_ROWS rows)
+    # 2. Initial HMM fit on the warm-up window (first _lookback rows)
     # NOTE: the train/predict split and StandardScaler are applied INSIDE
     # select_hmm_model() — no explicit split is needed here.
     # Concretely, select_hmm_model() does:
@@ -137,8 +192,8 @@ def run_signals() -> pd.DataFrame:
     #   model.predict_proba(test_scaled)                (confidence on ~40 test rows only)
     # current_regime / regime_confidence reflect the LAST of those ~40 test rows,
     # which was genuinely out-of-sample during training (walk-forward split).
-    rd = RegimeDirector()
-    rd.klines_df = features_df.iloc[:HMM_LOOKBACK_ROWS]
+    rd = RegimeDirector(max_regimes=_max_regimes)
+    rd.klines_df = features_df.iloc[:_lookback]
     rd.select_hmm_model()
     rd.assign_regime_labels()
     logging.info(
@@ -148,19 +203,38 @@ def run_signals() -> pd.DataFrame:
     )
 
     # 3. Rolling VWAP window
-    vwap_deque: deque = deque(maxlen=VWAP_WINDOW)
+    vwap_deque: deque = deque(maxlen=_vwap_window)
 
-    # 4. Main loop
+    # 4. Pre-extract feature columns as numpy arrays so the hot loop avoids
+    #    43 k pandas iloc() calls.  Dict-style row access still works for
+    #    build_synthetic_book() — passing a plain dict is ~3× faster than
+    #    passing a pd.Series because it skips the pandas Index lookup.
+    close_arr = features_df["close"].to_numpy()
+    high_arr = features_df["high"].to_numpy()
+    low_arr = features_df["low"].to_numpy()
+    vol_arr = features_df["volume"].to_numpy()
+    tbv_arr = features_df["taker_buy_base_vol"].to_numpy()
+    timestamps = features_df.index
+
+    # 5. Main loop
     records: list[dict] = []
     hist_iteration = 0  # counts iterations since warm-up (for refit cadence)
 
-    for i in range(HMM_LOOKBACK_ROWS, len(features_df)):
-        row = features_df.iloc[i]
-        timestamp = features_df.index[i]
+    for i in range(_lookback, len(features_df)):
+        timestamp = timestamps[i]
         hist_iteration += 1
 
+        # Lightweight dict — avoids pd.Series overhead inside build_synthetic_book.
+        row_dict = {
+            "high": high_arr[i],
+            "low": low_arr[i],
+            "close": close_arr[i],
+            "volume": vol_arr[i],
+            "taker_buy_base_vol": tbv_arr[i],
+        }
+
         # Flow A: synthetic book → levels → candidates → best
-        order_book = build_synthetic_book(row)
+        order_book = build_synthetic_book(row_dict)
         levels, median_depth, level_0_depth = build_levels(
             order_book["bids"], order_book["asks"]
         )
@@ -170,11 +244,11 @@ def run_signals() -> pd.DataFrame:
         best_buy = select_best_opportunity(buy_candidates, "buy", hist_iteration)
         best_sell = select_best_opportunity(sell_candidates, "sell", hist_iteration)
 
-        # Flow C: VWAP from synthetic best bid/ask
-        best_bid_price = float(max(order_book["bids"].keys(), key=float))
-        best_ask_price = float(min(order_book["asks"].keys(), key=float))
-        vol_best_bid = float(order_book["bids"][f"{best_bid_price:.2f}"])
-        vol_best_ask = float(order_book["asks"][f"{best_ask_price:.2f}"])
+        # Flow C: VWAP — use pre-computed top-of-book values (no max/min key scan)
+        best_bid_price = order_book["_best_bid"]
+        best_ask_price = order_book["_best_ask"]
+        vol_best_bid = order_book["_vol_best_bid"]
+        vol_best_ask = order_book["_vol_best_ask"]
 
         vwap_deque.append(
             {
@@ -186,22 +260,13 @@ def run_signals() -> pd.DataFrame:
         )
 
         # ── Rolling VWAP ─────────────────────────────────────────────────────
-        # deque(maxlen=VWAP_WINDOW) acts as a self-evicting rolling window:
-        # once it holds VWAP_WINDOW entries the oldest is dropped automatically
-        # on every append, so len() == VWAP_WINDOW for the rest of the loop.
+        # deque(maxlen=_vwap_window) acts as a self-evicting rolling window.
+        # The else branch (None) fires during the first _vwap_window-1 iterations
+        # while the window is still warming up.  None makes the VWAP gate
+        # transparent, mirroring the live system's warm-up behaviour.
         #
-        # The else branch (None) only fires during the first VWAP_WINDOW-1
-        # iterations while the window is still warming up.  Setting None makes
-        # the downstream VWAP gate transparent (ask_vwap is None → any
-        # micro_price passes), mirroring the live system's warm-up behaviour.
-        #
-        # VWAP formula (bid side shown; ask side is identical):
-        #   bid_vwap = Σ(best_bid[t] × vol_bid[t]) / Σ(vol_bid[t])
-        #
-        # Heavier candles (larger vol_bid) pull the average more, giving a
-        # momentum-aware reference price: if recent large volume traded at
-        # high bid prices, bid_vwap is elevated, tightening the SELL gate.
-        if len(vwap_deque) >= VWAP_WINDOW:
+        # VWAP formula: bid_vwap = Σ(best_bid[t] × vol_bid[t]) / Σ(vol_bid[t])
+        if len(vwap_deque) >= _vwap_window:
             bid_prices = np.array([s["best_bid"] for s in vwap_deque])
             bid_vols = np.array([s["vol_bid"] for s in vwap_deque])
             ask_prices = np.array([s["best_ask"] for s in vwap_deque])
@@ -209,58 +274,32 @@ def run_signals() -> pd.DataFrame:
             bid_vwap = volume_weighted_average_price(bid_prices, bid_vols)
             ask_vwap = volume_weighted_average_price(ask_prices, ask_vols)
         else:
-            # Window still filling — filter is transparent for both sides.
             bid_vwap = None
             ask_vwap = None
 
-        # Flow B: HMM regime update
-        # A rolling window of HMM_LOOKBACK_ROWS (120) candles is assigned to
-        # rd.klines_df on every iteration.  The train/predict split and
-        # StandardScaler are handled INSIDE select_hmm_model() /
-        # predict_current_regime() — see regime_director.py for details.
-        # In brief: oldest HMM_TRAIN_ROWS (80) rows → fit (in-sample);
-        #           newest ~40 rows (features[HMM_TRAIN_ROWS:]) → predict (out-of-sample).
-
-        # we want to catch 1m regime changes on a 120 rolling window
-        rd.klines_df = features_df.iloc[i - HMM_LOOKBACK_ROWS : i]
-        if hist_iteration % REFIT_EVERY == 0:
+        # Flow B: HMM regime update — two-speed refit.
+        # _predict_every lets sensitivity sweeps skip N-1 Viterbi passes
+        # between refits (reusing the previous regime label) for a speed-up
+        # proportional to _predict_every while preserving relative rankings.
+        rd.klines_df = features_df.iloc[i - _lookback: i]
+        rd.max_states = _max_regimes
+        if hist_iteration % _refit_every == 0:
             try:
                 rd.select_hmm_model()  # full BIC re-fit
             except RuntimeError as exc:
-                # All HMM fits failed for this window (e.g. flat/low-variance
-                # overnight period).  Keep the previous model and continue —
-                # same behaviour as the live system which never halts on a
-                # refit failure.
                 logging.warning(
                     "signals: HMM refit failed at iteration %d — keeping "
                     "previous model. (%s)",
                     hist_iteration, exc,
                 )
-                if rd.model is None:
-                    # No model at all yet — skip this candle entirely
-                    continue
-        else:
+        elif hist_iteration % _predict_every == 0:
             rd.predict_current_regime()  # cheap Viterbi pass
+        # else: reuse regime / confidence from the previous iteration
         rd.assign_regime_labels()
         regime = rd.regime_label
-        # Posterior probability for the predicted regime — same value that
-        # low_latency_analysis reads from rd.regime_confidence under _regime_lock.
         regime_confidence = rd.regime_confidence
 
-        # Fill price anchor and spread for Step-4 P&L.
-        # half_spread: realistic bid-ask half-spread for a limit-order strategy.
-        #
-        # OLD model: (high - low) / 2  ← candle price range, NOT the real spread.
-        #   At $80 k BTC this gives $25–$150 per trade, which is 10–100× the
-        #   actual Binance BTCUSDT spread and produces 100% drawdown via fee erosion.
-        #
-        # NEW model: close × BACKTEST_FILL_SPREAD_BPS / 20_000
-        #   BACKTEST_FILL_SPREAD_BPS = 5 → half_spread = close × 0.00025
-        #   At $80 k BTC: half_spread ≈ $20 — matches the realistic ~5 bp spread.
-        #
-        #   BUY  fill = close + half_spread  (synthetic ask — limit order taker cost)
-        #   SELL fill = close - half_spread  (synthetic bid — limit order taker cost)
-        close_price = float(row["close"])
+        close_price = close_arr[i]
         half_spread = close_price * BACKTEST_FILL_SPREAD_BPS / 20_000.0
 
         # Always capture raw candidate details for reporting (needed by
@@ -286,7 +325,7 @@ def run_signals() -> pd.DataFrame:
         # While regime_confidence is None (warm-up / before first fit) the
         # gate is transparent, matching the live system's behaviour.
         confidence_ok = (
-            regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
+                regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
         )
 
         # Combined gate (mirrors live low_latency_analysis)

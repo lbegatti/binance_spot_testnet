@@ -78,6 +78,7 @@ binance_spot_testnet/
 │   ├── pnl.py                         # P&L simulation — balance guard, fill price, equity curve, metrics
 │   ├── runner.py                      # Top-level runner — chains all modules; opt-in plot/CSV export
 │   ├── visualization.py               # Step 7 — interactive Plotly chart (6-panel); run via run_backtest(plot=True)
+│   ├── sensitivity.py                 # Step 8 — OAT / full-grid sensitivity sweep; writes best_params.json
 │   ├── regime_validation.py           # Offline long-horizon HMM validation — python -m backtest.regime_validation
 │   └── reporting/                     # Console report formatting and CSV export (AI-authored)
 │       ├── __init__.py
@@ -131,7 +132,10 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %) |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
-| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full 10-day run) |
+| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full run) |
+| **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `480` | HMM refit cadence used **only** inside `sensitivity.py` (8 h at 1 m → ~90 refits/run vs ~360 at the default, ~4× speedup). `config_parameters.py` defaults and the live system are never affected. |
+| **Sensitivity** | `SENSITIVITY_LOOKBACK` | `"30 days ago UTC"` | Data-fetch window used **only** by `sensitivity.py` (~43,200 rows). Using the full 180-day window per run would make each OAT run 6× slower than `run_backtest.py`. `run_backtest.py` always uses `BACKTEST_LOOKBACK`. |
+| **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise, cutting Viterbi overhead ~5×. `run_backtest.py` always predicts every candle. |
 
 **Imported by:**
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
@@ -140,12 +144,13 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_TRAIN_ROWS`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`
-- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `HMM_MIN_CONFIDENCE`
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
-- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `HMM_MIN_CONFIDENCE`
+- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `BACKTEST_MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
+- `backtest/sensitivity.py` — `SENSITIVITY_REFIT_EVERY`, `SENSITIVITY_LOOKBACK`, `SENSITIVITY_PREDICT_EVERY`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
 
 ---
@@ -710,6 +715,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime |
+| `backtest/sensitivity.py` | ✅ done (Use Case A) | OAT sweep (6 runs, ~36–108 min) and full-grid (24 combinations) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `BACKTEST_FEE_RATE`. Writes `best_params.json` loaded by `websocket_main.py` at startup. Use Case B (180-day window) deferred. |
 
 **Running the backtest:**
 

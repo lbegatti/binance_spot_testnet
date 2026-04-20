@@ -94,6 +94,10 @@ FILES
                                          # half_spread = close × BPS / 20 000.
                                          # Default 5 bps → ~$20 at $80 k BTC.
     BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
+    SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py ONLY.
+                                         # 480 iterations = 8 h at 1 m → ~90 refits
+                                         # per 30-day run (~4× faster than REFIT_EVERY=120).
+                                         # config_parameters defaults unchanged.
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -531,9 +535,15 @@ FILES
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +
                                 exponential volume decay + OBI asymmetry injection).
-                                Returns {"bids": {…}, "asks": {…}} matching
-                                state.local_book format → feeds _build_levels()
-                                directly.
+                                VECTORISED: price/qty arrays computed with numpy
+                                (_DECAY_FACTORS, _LEVEL_IDX pre-computed at import);
+                                no Python for-loop over 50 levels.
+                                Returns {"bids": {…}, "asks": {…},
+                                         "_best_bid": float, "_best_ask": float,
+                                         "_vol_best_bid": float, "_vol_best_ask": float}
+                                The private _best_* keys allow callers to skip the
+                                O(N_LEVELS) max/min key-scan, matching state.local_book
+                                format → feeds _build_levels() directly.
 
   Three data flows per candle (mirroring the live architecture):
     Flow A — Opportunity scoring  : synthetic book → build_levels →
@@ -551,16 +561,24 @@ FILES
                                     DataFrame with signal (+1/−1/0), regime
                                     label, bid/ask VWAP, micro-price, half_spread,
                                     and buy_qty/sell_qty details for P&L sizing.
-                                    Uses _add_hmm_features() to pre-compute HMM
-                                    features on the full kline DataFrame without
-                                    an API call.  HMM warm-up on first
-                                    HMM_LOOKBACK_ROWS (120) candles; main loop
-                                    from row 120 onward with two-speed refit
-                                    (full BIC every REFIT_EVERY iterations,
-                                    cheap Viterbi otherwise).
+                                    PERFORMANCE: feature columns pre-extracted as
+                                    numpy arrays before the loop (avoids 43 k
+                                    pandas iloc calls); _best_bid/_best_ask read
+                                    directly from synthetic_book dict (no O(50)
+                                    key scan).
+                                    Optional keyword overrides (all default None →
+                                    fall back to config constants):
+                                      hmm_lookback_rows, hmm_max_regimes,
+                                      vwap_window, refit_every, lookback,
+                                      predict_every.
+                                    predict_every: between refit calls, Viterbi is
+                                    run only every N candles; last regime reused
+                                    otherwise (sensitivity uses N=5 for ~5× speedup;
+                                    run_backtest uses N=1, every candle).
 
   backtest/pnl.py                — simulate_pnl(): walks the signal DataFrame
-                                    candle by candle, executing BUY/SELL trades
+                                    candle by candle using itertuples() (~5× faster
+                                    than iterrows()), executing BUY/SELL trades
                                     with a balance guard identical to the live
                                     OrderExecutor.  Fill price per trade:
                                       BUY  = close + half_spread  (synthetic ask)
@@ -688,7 +706,33 @@ FILES
                                     Regime bands drawn with add_vrect per
                                     transition only — O(transitions), not O(rows).
 
+  backtest/sensitivity.py       — Step 8: OAT and full-grid sensitivity sweep
+                                    over HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
+                                    VWAP_WINDOW, BACKTEST_FEE_RATE.
+                                    Overrides passed as keyword args to
+                                    run_signals() / simulate_pnl() — no changes
+                                    to config_parameters.py or the live system.
+                                    Three sensitivity-only speed-up constants
+                                    (all in config_parameters.py, no effect on
+                                    run_backtest.py or the live system):
+                                      SENSITIVITY_REFIT_EVERY = 480  (~4× fewer refits)
+                                      SENSITIVITY_LOOKBACK = "30 days ago UTC"
+                                                             (~6× fewer rows than 180d)
+                                      SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi)
+                                    Combined speedup vs naïve 180-day run:
+                                      ~12–30 min total OAT vs ~66–180 min without.
+                                    Phase 1 (OAT, 6 runs): python -m backtest.sensitivity
+                                    Phase 2 (24 combos):   python -m backtest.sensitivity --full-grid
+                                    Writes:
+                                      results/sensitivity_<mode>_<ts>.csv
+                                      results/best_params.json  ← loaded by
+                                      websocket_main._load_best_params() at
+                                      startup (falls back to defaults if absent).
+                                    Use Case B (180-day window) DEFERRED —
+                                    ~4–12 h OAT runtime on a laptop.
+
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,
-                         regime_validation.py ✅, visualization.py ✅.
+                         regime_validation.py ✅, visualization.py ✅,
+                         sensitivity.py ✅ (Use Case A; Use Case B deferred).
 """

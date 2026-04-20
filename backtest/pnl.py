@@ -115,16 +115,19 @@ def simulate_pnl(
     trade_rows: list[dict] = []
     equity_rows: list[dict] = []
 
-    for ts, row in signals.iterrows():
-        close = float(row["close"])
-        sig = int(row["signal"])
+    # itertuples() is ~5× faster than iterrows() because it yields lightweight
+    # namedtuples instead of constructing a full pd.Series per row.
+    # The 'type: ignore' comments below suppress false-positive IDE warnings —
+    # itertuples() attributes are resolved at runtime, not statically inferred.
+    for row in signals.itertuples():
+        ts = row.Index                                          # type: ignore[union-attr]
+        close = float(row.close)                               # type: ignore[union-attr]
+        sig = int(row.signal)                                  # type: ignore[union-attr]
 
         # BUY
         if sig == 1:
-            raw_qty = float(row["buy_qty"]) if pd.notna(row["buy_qty"]) else 0.0
-            half_spread = (
-                float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
-            )
+            raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0      # type: ignore[union-attr]
+            half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic ask: close + half_spread.
             # This is the natural taker cost — you cross the spread when buying.
@@ -158,7 +161,7 @@ def simulate_pnl(
                         "fee": fee,
                         "net_cost": net_cost,
                         "net_proceeds": None,
-                        "regime": row.get("regime"),
+                        "regime": getattr(row, "regime", None),
                     }
                 )
                 log.debug(
@@ -179,10 +182,8 @@ def simulate_pnl(
 
         # SELL
         elif sig == -1:
-            raw_qty = float(row["sell_qty"]) if pd.notna(row["sell_qty"]) else 0.0
-            half_spread = (
-                float(row["half_spread"]) if pd.notna(row["half_spread"]) else 0.0
-            )
+            raw_qty = float(row.sell_qty) if pd.notna(row.sell_qty) else 0.0           # type: ignore[union-attr]
+            half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic bid: close - half_spread.
             # You receive less than mid when selling — the spread is the cost.
@@ -208,7 +209,7 @@ def simulate_pnl(
                         "fee": fee,
                         "net_cost": None,
                         "net_proceeds": net_proceeds,
-                        "regime": row.get("regime"),
+                        "regime": getattr(row, "regime", None),
                     }
                 )
                 log.debug(

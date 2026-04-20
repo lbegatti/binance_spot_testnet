@@ -13,7 +13,14 @@ called here — the caller (``backtest/signals.py``) fetches the full kline
 DataFrame once and passes individual rows to ``build_synthetic_book()``.
 """
 
+import numpy as np
+
 from config_parameters import N_LEVELS, VOLUME_DECAY_FACTOR
+
+# Pre-compute module-level constants so they are not recomputed on every call.
+# At 43 k rows these would otherwise cost 43 k × 50 Python pow() calls each.
+_LEVEL_IDX: np.ndarray = np.arange(N_LEVELS, dtype=float)      # [0, 1, …, 49]
+_DECAY_FACTORS: np.ndarray = VOLUME_DECAY_FACTOR ** _LEVEL_IDX  # [1, 0.8, 0.64, …]
 
 
 def build_synthetic_book(row) -> dict:
@@ -81,10 +88,14 @@ def build_synthetic_book(row) -> dict:
     Returns
     -------
     dict
-        ``{"bids": {price_str: qty_str, …}, "asks": {price_str: qty_str, …}}``
-        Each dict contains exactly ``N_LEVELS`` entries.
+        ``{"bids": {price_str: qty_str, …}, "asks": {price_str: qty_str, …},
+           "_best_bid": float, "_best_ask": float,
+           "_vol_best_bid": float, "_vol_best_ask": float}``
+        Each side dict contains exactly ``N_LEVELS`` entries.
         String keys and values match the exact format of ``state.local_book``
         consumed by ``AnalysisEngine._build_levels()``.
+        The private ``_best_*`` keys let callers avoid an O(N_LEVELS) scan of
+        the dict to find the top-of-book price and volume.
     """
     high = float(row["high"])
     low = float(row["low"])
@@ -94,51 +105,47 @@ def build_synthetic_book(row) -> dict:
 
     # ------------------------------------------------------------------
     # Step 1 — Spread reconstruction
-    # Use the intra-bar high-low range as a proxy for the full bid-ask
-    # spread.  close is a better anchor than (high+low)/2 because it
-    # reflects where the market actually settled at candle close.
     # ------------------------------------------------------------------
     half_spread = (high - low) / 2.0
     synthetic_best_bid = close - half_spread
     synthetic_best_ask = close + half_spread
-    tick_size = high - low  # == synthetic_best_ask - synthetic_best_bid
+    tick_size = high - low
 
     # ------------------------------------------------------------------
-    # Step 2 — Symmetric depth ladder
-    # Spread base_volume evenly across levels as the starting point,
-    # then apply exponential decay so deeper levels carry less liquidity.
+    # Step 2 — Symmetric depth ladder  (vectorized — no Python for-loop)
+    # _DECAY_FACTORS and _LEVEL_IDX are pre-computed at module import time.
     # ------------------------------------------------------------------
     base_volume = volume / N_LEVELS
-    bids: dict[str, str] = {}
-    asks: dict[str, str] = {}
-
-    for i in range(N_LEVELS):
-        qty = base_volume * (VOLUME_DECAY_FACTOR**i)
-        bids[f"{synthetic_best_bid - i * tick_size:.2f}"] = f"{qty:.8f}"
-        asks[f"{synthetic_best_ask + i * tick_size:.2f}"] = f"{qty:.8f}"
+    qtys: np.ndarray = base_volume * _DECAY_FACTORS           # shape (N_LEVELS,)
+    bid_prices: np.ndarray = synthetic_best_bid - _LEVEL_IDX * tick_size
+    ask_prices: np.ndarray = synthetic_best_ask + _LEVEL_IDX * tick_size
 
     # ------------------------------------------------------------------
-    # Step 3 — OBI asymmetry injection
-    # Rescale bid and ask quantities using the taker buy/sell split so
-    # that OBI != 0 and micro_price tilts toward the thinner side.
-    # The factor of 2 preserves total volume per level after the split
-    # because: 2*buy_ratio + 2*sell_ratio = 2*(buy_ratio + sell_ratio) = 2.
-    # Falls back to a neutral 50/50 split if volume is zero.
-    #
-    # _MIN_RATIO floor: real kline data can have taker_buy_base_vol == 0
-    # (a purely sell-driven candle) or == volume (purely buy-driven).
-    # Either extreme collapses the corresponding side of the book to zero
-    # volume, which propagates NaN into the downstream VWAP calculation
-    # (numpy returns nan when summing an all-zero volume array).
-    # Clamping to [_MIN_RATIO, 1 - _MIN_RATIO] guarantees at least 0.1%
-    # liquidity on both sides while preserving the directional OBI signal.
+    # Step 3 — OBI asymmetry injection  (vectorized)
     # ------------------------------------------------------------------
     _MIN_RATIO = 1e-3
     raw_ratio = (taker_buy_base_vol / volume) if volume > 0 else 0.5
     buy_ratio = max(_MIN_RATIO, min(1.0 - _MIN_RATIO, raw_ratio))
     sell_ratio = 1.0 - buy_ratio
 
-    bids = {p: f"{float(q) * 2.0 * buy_ratio:.8f}" for p, q in bids.items()}
-    asks = {p: f"{float(q) * 2.0 * sell_ratio:.8f}" for p, q in asks.items()}
+    bid_qtys: np.ndarray = qtys * 2.0 * buy_ratio
+    ask_qtys: np.ndarray = qtys * 2.0 * sell_ratio
 
-    return {"bids": bids, "asks": asks}
+    # Build string-keyed dicts in a single dict comprehension — much faster
+    # than the original loop because all arithmetic is already done in numpy.
+    bids: dict[str, str] = {
+        f"{p:.2f}": f"{q:.8f}" for p, q in zip(bid_prices, bid_qtys)
+    }
+    asks: dict[str, str] = {
+        f"{p:.2f}": f"{q:.8f}" for p, q in zip(ask_prices, ask_qtys)
+    }
+
+    return {
+        "bids": bids,
+        "asks": asks,
+        # Pre-computed top-of-book values so callers skip O(N_LEVELS) scans.
+        "_best_bid":     synthetic_best_bid,
+        "_best_ask":     synthetic_best_ask,
+        "_vol_best_bid": float(bid_qtys[0]),
+        "_vol_best_ask": float(ask_qtys[0]),
+    }
