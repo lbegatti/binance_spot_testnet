@@ -56,19 +56,20 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
         "close"
     ]
     klines_df["obi_proxy"] = (
-                                     klines_df["taker_buy_base_vol"] / klines_df["volume"]
-                             ) * 2 - 1
+        klines_df["taker_buy_base_vol"] / klines_df["volume"]
+    ) * 2 - 1
     klines_df["trade_density"] = klines_df["num_trades"] / klines_df["volume"]
     return klines_df.dropna()
 
 
 def run_signals(
-        hmm_lookback_rows: int | None = None,
-        hmm_max_regimes: int | None = None,
-        vwap_window: int | None = None,
-        refit_every: int | None = None,
-        predict_every: int | None = None,
-        lookback: str | None = None,
+    hmm_lookback_rows: int | None = None,
+    hmm_max_regimes: int | None = None,
+    vwap_window: int | None = None,
+    refit_every: int | None = None,
+    predict_every: int | None = None,
+    lookback: str | None = None,
+    prefetched_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Replay the full trading pipeline on historical 1-minute klines.
@@ -108,6 +109,24 @@ def run_signals(
         used by ``run_backtest.py``).  Sensitivity runs may pass a higher
         value (e.g. ``SENSITIVITY_PREDICT_EVERY = 5``) to cut Viterbi
         overhead by ~5× while preserving relative parameter rankings.
+    prefetched_df : pd.DataFrame | None
+        If provided, skip ``fetch_klines()`` and ``_add_hmm_features()``
+        entirely and use this DataFrame directly.  The caller is responsible
+        for passing a features-enriched DataFrame
+        (columns: ``close``, ``high``, ``low``, ``volume``,
+        ``taker_buy_base_vol``, ``return``, ``volatility``, ``obi_proxy``,
+        ``trade_density``).
+
+        **This is the key optimisation for sensitivity sweeps**: the caller
+        pre-fetches and feature-engineers the data *once* before the grid
+        loop, then passes the same ``prefetched_df`` to every run.  Without
+        this, ``fetch_klines()`` would hit the Binance API once per
+        combination (24× for the full grid, 6× for OAT) for data that is
+        identical across all runs.
+
+        When ``None`` (default), the normal fetch path runs and the
+        ``lookback`` parameter controls the window.  Existing callers
+        (``run_backtest.py``) are completely unaffected.
 
     For every candle from ``_lookback`` onward the function
     reproduces the three concurrent flows of the live system:
@@ -157,7 +176,9 @@ def run_signals(
     # Resolve parameter overrides — fall back to config constants when None.
     # This is the only place where overrides are applied; callers that pass
     # no arguments (e.g. run_backtest.py) are completely unaffected.
-    _lookback = hmm_lookback_rows if hmm_lookback_rows is not None else HMM_LOOKBACK_ROWS
+    _lookback = (
+        hmm_lookback_rows if hmm_lookback_rows is not None else HMM_LOOKBACK_ROWS
+    )
     _max_regimes = hmm_max_regimes if hmm_max_regimes is not None else HMM_MAX_REGIMES
     _vwap_window = vwap_window if vwap_window is not None else VWAP_WINDOW
     _refit_every = refit_every if refit_every is not None else REFIT_EVERY
@@ -165,18 +186,29 @@ def run_signals(
     _fetch_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
 
     # 1. Fetch and prepare data
-    klines = fetch_klines(start_str=_fetch_lookback)
-    features_df = _add_hmm_features(klines)
-    if BACKTEST_MAX_ROWS is not None:
-        features_df = features_df.iloc[-(_lookback + BACKTEST_MAX_ROWS):]
+    if prefetched_df is not None:
+        # Caller pre-fetched the data (e.g. sensitivity.py fetches once for all
+        # runs and passes the same DataFrame to every _run_one() call).
+        # Skip fetch_klines() and _add_hmm_features() entirely.
+        features_df = prefetched_df
         logging.info(
-            "Debug mode: capped at %d rows (%d replay candles).",
-            len(features_df),
-            BACKTEST_MAX_ROWS,
+            "Using pre-fetched features_df: %d rows (no API call).", len(features_df)
         )
-    logging.info(
-        "Fetched %d klines; %d rows after HMM features.", len(klines), len(features_df)
-    )
+    else:
+        klines = fetch_klines(start_str=_fetch_lookback)
+        features_df = _add_hmm_features(klines)
+        if BACKTEST_MAX_ROWS is not None:
+            features_df = features_df.iloc[-(_lookback + BACKTEST_MAX_ROWS) :]
+            logging.info(
+                "Debug mode: capped at %d rows (%d replay candles).",
+                len(features_df),
+                BACKTEST_MAX_ROWS,
+            )
+        logging.info(
+            "Fetched %d klines; %d rows after HMM features.",
+            len(klines),
+            len(features_df),
+        )
 
     # 2. Initial HMM fit on the warm-up window (first _lookback rows)
     # NOTE: the train/predict split and StandardScaler are applied INSIDE
@@ -281,7 +313,7 @@ def run_signals(
         # _predict_every lets sensitivity sweeps skip N-1 Viterbi passes
         # between refits (reusing the previous regime label) for a speed-up
         # proportional to _predict_every while preserving relative rankings.
-        rd.klines_df = features_df.iloc[i - _lookback: i]
+        rd.klines_df = features_df.iloc[i - _lookback : i]
         rd.max_states = _max_regimes
         if hist_iteration % _refit_every == 0:
             try:
@@ -290,7 +322,8 @@ def run_signals(
                 logging.warning(
                     "signals: HMM refit failed at iteration %d — keeping "
                     "previous model. (%s)",
-                    hist_iteration, exc,
+                    hist_iteration,
+                    exc,
                 )
         elif hist_iteration % _predict_every == 0:
             rd.predict_current_regime()  # cheap Viterbi pass
@@ -325,7 +358,7 @@ def run_signals(
         # While regime_confidence is None (warm-up / before first fit) the
         # gate is transparent, matching the live system's behaviour.
         confidence_ok = (
-                regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
+            regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
         )
 
         # Combined gate (mirrors live low_latency_analysis)

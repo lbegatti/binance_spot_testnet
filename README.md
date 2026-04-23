@@ -60,6 +60,7 @@ binance_spot_testnet/
 │   ├── analysis.py                    # AnalysisEngine — low-latency (1 s) and historical (1 min) loops
 │   ├── book_utils.py                  # Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity)
 │   ├── regime_director.py             # RegimeDirector — HMM regime detection (fitted pre-session, refreshed every 1 min)
+│   ├── param_loader.py                # load_best_params() + load_best_params_for_backtest() — reads best_params.json; shared by websocket_main.py and run_backtest.py
 │   ├── best_quote_calculator.py       # Live spread printer — prints best_bid | best_ask on every tick
 │   ├── metrics.py                     # Order book metric calculations
 │   ├── indicators.py                  # Strategy-specific indicator columns
@@ -715,7 +716,17 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime |
-| `backtest/sensitivity.py` | ✅ done (Use Case A) | OAT sweep (6 runs, ~36–108 min) and full-grid (24 combinations) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `BACKTEST_FEE_RATE`. Writes `best_params.json` loaded by `websocket_main.py` at startup. Use Case B (180-day window) deferred. |
+| `backtest/sensitivity.py` | ✅ done (Use Case A) | OAT sweep (8 runs) and full-grid (54 combinations, 3×2×3×3) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `BACKTEST_FEE_RATE`. Writes `best_params.json` — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
+
+> **Parameter Flow**
+> ```
+> sensitivity.py  ──►  best_params.json  ──►  strategy/param_loader.py
+>                                                   ├── load_best_params()              → websocket_main.py  (live)
+>                                                   └── load_best_params_for_backtest() → run_backtest.py    (backtest)
+> ```
+> Both consumers fall back silently to `config_parameters.py` defaults if
+> `best_params.json` is absent.  Do **not** commit `best_params.json` to git
+> (add `backtest/results/best_params.json` to `.gitignore`).
 
 **Running the backtest:**
 

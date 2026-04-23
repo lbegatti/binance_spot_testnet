@@ -41,8 +41,8 @@ import pandas as pd
 from backtest.pnl import simulate_pnl
 from backtest.reporting.formatters import HEAVY, print_report, save_csv
 from backtest.signals import run_signals
-
 from backtest.visualization import plot_backtest
+from strategy.param_loader import load_best_params_for_backtest
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -106,11 +106,27 @@ def run_backtest(
     )
     log.info(HEAVY)
 
+    # Load tuned parameters from sensitivity.py output (falls back to
+    # config_parameters.py defaults if best_params.json is absent).
+    best = load_best_params_for_backtest()
+
     # Steps 1–3: fetch klines → synthetic books → signals
-    signals = run_signals()
+    # best.get() returns None when a key is absent → run_signals() uses its
+    # config_parameters.py default for that parameter automatically.
+    signals = run_signals(
+        hmm_lookback_rows=best.get("hmm_lookback_rows"),
+        hmm_max_regimes=best.get("hmm_max_regimes"),
+        vwap_window=best.get("vwap_window"),
+    )
 
     # Step 4: simulate P&L
-    trades, equity, stats = simulate_pnl(signals)
+    # Only pass fee_rate if best_params.json contains it; omitting the kwarg
+    # entirely lets simulate_pnl() use its BACKTEST_FEE_RATE default without
+    # receiving None (which would violate the float type annotation).
+    pnl_kwargs = {}
+    if best.get("fee_rate") is not None:
+        pnl_kwargs["fee_rate"] = best["fee_rate"]
+    trades, equity, stats = simulate_pnl(signals, **pnl_kwargs)
 
     # Step 5: print summary report
     print_report(signals, trades, equity, stats)

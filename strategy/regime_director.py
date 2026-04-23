@@ -266,7 +266,17 @@ class RegimeDirector:
         # Train only on the older in-sample rows; the most recent rows are
         # intentionally held out so that self.current_regime reflects a regime
         # that the model has never "seen" during fitting.
-        train_features = features[:HMM_TRAIN_ROWS]
+        # --- adaptive train / test split ---
+        # Normally split at HMM_TRAIN_ROWS (80).  When the window is smaller
+        # than HMM_TRAIN_ROWS + 1 (e.g. sensitivity sweep uses
+        # hmm_lookback_rows=60 < 80), features[HMM_TRAIN_ROWS:] would be empty
+        # (shape (0, 4)) and StandardScaler raises ValueError.
+        # Guard: always leave at least 1 test row for prediction regardless
+        # of window size.  The ~2/3 train / 1/3 test ratio is preserved when
+        # the window is ≥ HMM_TRAIN_ROWS + 1 (the normal live-system case).
+        n_rows = len(features)
+        train_end = min(HMM_TRAIN_ROWS, max(1, n_rows - 1))
+        train_features = features[:train_end]
 
         # --- feature scaling ---
         # Fit the scaler ONLY on the training rows so that the mean and std
@@ -283,20 +293,23 @@ class RegimeDirector:
         train_features_scaled = scaler.fit_transform(train_features)
 
         # Scale the TEST rows using the scaler fitted on training rows only.
-        # features[HMM_TRAIN_ROWS:] are the most-recent, genuinely out-of-sample
+        # features[train_end:] are the most-recent, genuinely out-of-sample
         # candles — the model has never seen them during fit().  Predicting only
         # on these rows means self.current_regime and self.regime_confidence
         # always reflect a state the model did NOT train on.
-        test_features = features[HMM_TRAIN_ROWS:]
+        test_features = features[train_end:]
         test_features_scaled = scaler.transform(test_features)
 
         # Persist the fitted scaler so predict_current_regime() can reuse it.
         self.scaler = scaler
 
         logging.info(
-            "RegimeDirector: fitting on %d rows (train), predicting on %d rows (test)",
+            "RegimeDirector: fitting on %d rows (train), predicting on %d rows (test)"
+            " [window=%d, train_end=%d]",
             len(train_features),
             len(test_features),
+            n_rows,
+            train_end,
         )
 
         best_hmm_model, best_hmm_bic = None, np.inf
@@ -437,9 +450,11 @@ class RegimeDirector:
         features = self.klines_df[HMM_FEATURE_COLS].values
         # Reuse the scaler fitted during select_hmm_model() so the feature
         # distribution seen by the model is identical to training time.
-        # Predict only on the test (out-of-sample) rows — same split as
-        # select_hmm_model(): features[HMM_TRAIN_ROWS:].
-        test_features = features[HMM_TRAIN_ROWS:]
+        # Use the same adaptive split as select_hmm_model() — always leave
+        # at least 1 test row regardless of window size.
+        n_rows = len(features)
+        train_end = min(HMM_TRAIN_ROWS, max(1, n_rows - 1))
+        test_features = features[train_end:]
         test_features_scaled = self.scaler.transform(test_features)
         self.regimes = self.model.predict(test_features_scaled)
 

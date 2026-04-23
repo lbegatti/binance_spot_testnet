@@ -721,18 +721,29 @@ FILES
                                       SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi)
                                     Combined speedup vs naïve 180-day run:
                                       ~12–30 min total OAT vs ~66–180 min without.
-                                    Phase 1 (OAT, 6 runs): python -m backtest.sensitivity
-                                    Phase 2 (24 combos):   python -m backtest.sensitivity --full-grid
-                                    Writes:
-                                      results/sensitivity_<mode>_<ts>.csv
-                                      results/best_params.json  ← loaded by
-                                      websocket_main._load_best_params() at
-                                      startup (falls back to defaults if absent).
+                                     Phase 1 (OAT, 8 runs):  python -m backtest.sensitivity --oat
+                                     Phase 2 (54 combos):    python -m backtest.sensitivity
+                                     Writes:
+                                       results/sensitivity_<mode>_<ts>.csv
+                                       results/best_params.json
+                                           └── consumed by strategy/param_loader.py
+                                                 ├── load_best_params() ← websocket_main.py
+                                                 │     called at startup before RegimeDirector();
+                                                 │     patches strategy.regime_director namespace
+                                                 │     (HMM_MAX_REGIMES, HMM_LOOKBACK);
+                                                 │     falls back to defaults if absent.
+                                                 └── load_best_params_for_backtest() ← run_backtest.py
+                                                       called at top of run_backtest() before
+                                                       run_signals(); returns dict of cast values
+                                                       passed as kwargs (hmm_lookback_rows,
+                                                       hmm_max_regimes, vwap_window, fee_rate);
+                                                       falls back to defaults if absent.
                                     Use Case B (180-day window) DEFERRED —
                                     ~4–12 h OAT runtime on a laptop.
 
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,
                          regime_validation.py ✅, visualization.py ✅,
-                         sensitivity.py ✅ (Use Case A; Use Case B deferred).
+                         sensitivity.py ✅ (Use Case A; Use Case B deferred),
+                         param_loader.py ✅ (load_best_params + load_best_params_for_backtest).
 """

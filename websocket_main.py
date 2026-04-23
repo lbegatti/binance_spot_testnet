@@ -10,6 +10,7 @@ from core.message_handler import MessageHandler
 from core.order_book_state import OrderBookState
 from execution.order_executor import OrderExecutor
 from strategy.regime_director import RegimeDirector
+from strategy.param_loader import load_best_params
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     HFT_INTERVAL,
@@ -27,6 +28,10 @@ from config_parameters import (
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True
 )
+
+# Apply best_params.json overrides to strategy.regime_director BEFORE
+# RegimeDirector() is instantiated (see strategy/param_loader.py).
+load_best_params()
 
 # ---------------------------------------------------------------------------
 # 1. Load environment variables from .env file

@@ -288,7 +288,9 @@ def print_regime_validation_report(
     med_conf = tl.groupby("regime_label")["regime_confidence"].median()
 
     _CANDLES_PER_DAY = 1440
-    test_days = round(n_total / _CANDLES_PER_DAY)  # derived from actual test candles, not hardcoded total
+    test_days = round(
+        n_total / _CANDLES_PER_DAY
+    )  # derived from actual test candles, not hardcoded total
 
     def verdict(ok: bool) -> str:
         return "PASS" if ok else "FAIL"

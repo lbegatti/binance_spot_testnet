@@ -19,8 +19,8 @@ from config_parameters import N_LEVELS, VOLUME_DECAY_FACTOR
 
 # Pre-compute module-level constants so they are not recomputed on every call.
 # At 43 k rows these would otherwise cost 43 k × 50 Python pow() calls each.
-_LEVEL_IDX: np.ndarray = np.arange(N_LEVELS, dtype=float)      # [0, 1, …, 49]
-_DECAY_FACTORS: np.ndarray = VOLUME_DECAY_FACTOR ** _LEVEL_IDX  # [1, 0.8, 0.64, …]
+_LEVEL_IDX: np.ndarray = np.arange(N_LEVELS, dtype=float)  # [0, 1, …, 49]
+_DECAY_FACTORS: np.ndarray = VOLUME_DECAY_FACTOR**_LEVEL_IDX  # [1, 0.8, 0.64, …]
 
 
 def build_synthetic_book(row) -> dict:
@@ -116,7 +116,7 @@ def build_synthetic_book(row) -> dict:
     # _DECAY_FACTORS and _LEVEL_IDX are pre-computed at module import time.
     # ------------------------------------------------------------------
     base_volume = volume / N_LEVELS
-    qtys: np.ndarray = base_volume * _DECAY_FACTORS           # shape (N_LEVELS,)
+    qtys: np.ndarray = base_volume * _DECAY_FACTORS  # shape (N_LEVELS,)
     bid_prices: np.ndarray = synthetic_best_bid - _LEVEL_IDX * tick_size
     ask_prices: np.ndarray = synthetic_best_ask + _LEVEL_IDX * tick_size
 
@@ -144,8 +144,8 @@ def build_synthetic_book(row) -> dict:
         "bids": bids,
         "asks": asks,
         # Pre-computed top-of-book values so callers skip O(N_LEVELS) scans.
-        "_best_bid":     synthetic_best_bid,
-        "_best_ask":     synthetic_best_ask,
+        "_best_bid": synthetic_best_bid,
+        "_best_ask": synthetic_best_ask,
         "_vol_best_bid": float(bid_qtys[0]),
         "_vol_best_ask": float(ask_qtys[0]),
     }

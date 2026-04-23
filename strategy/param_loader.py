@@ -1,0 +1,235 @@
+"""
+strategy/param_loader.py
+------------------------
+Loads the best parameter set produced by ``backtest/sensitivity.py`` and
+applies it to the live trading system before ``RegimeDirector()`` is
+instantiated.
+
+Why ``strategy/`` and not ``backtest/``?
+    ``backtest/`` contains the pipeline that *produces* ``best_params.json``.
+    This module is the *consumer* used by the live system — it belongs in
+    ``strategy/`` alongside the other runtime components.
+
+    ``backtest/run_backtest.py`` has its own independent loader
+    (``_load_best_params_for_backtest()``) that passes the values as kwargs
+    to ``run_signals()`` and ``simulate_pnl()`` — no module patching needed
+    there because the backtest functions accept explicit overrides.
+
+Usage
+-----
+    # In websocket_main.py — call AFTER logging.basicConfig(), BEFORE RegimeDirector():
+    from strategy.param_loader import load_best_params
+    load_best_params()
+
+How it patches the live system
+-------------------------------
+``regime_director.py`` binds its constants at import time via::
+
+    from config_parameters import HMM_MAX_REGIMES, HMM_LOOKBACK, ...
+
+Patching ``config_parameters`` *after* the module is loaded has no effect
+because Python has already copied the values into ``regime_director``'s own
+namespace.  The only correct approach is to patch
+``strategy.regime_director`` directly::
+
+    import strategy.regime_director as rd_mod
+    rd_mod.HMM_MAX_REGIMES = 2     # takes effect on the next RegimeDirector()
+
+Fields NOT overridden
+----------------------
+- ``vwap_window``  — backtest-only constant (``backtest/signals.py``).
+                     The live system does not use ``VWAP_WINDOW``.
+- ``fee_rate``     — Binance charges its own fees regardless of this value.
+                     Stored in ``best_params.json`` for reference only.
+
+HMM_LOOKBACK conversion
+------------------------
+``best_params.json`` stores ``hmm_lookback_rows`` (``int``) because
+``sensitivity.py`` is a backtest tool that counts rows.  The live system
+uses ``HMM_LOOKBACK`` (a dateutil string, e.g. ``"2 hours ago UTC"``).
+The mapping covers only the three values tested in ``sensitivity.py``;
+any unknown value is skipped with a WARNING.
+"""
+
+import json
+import logging
+import pathlib
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+BEST_PARAMS_PATH = pathlib.Path("backtest/results/best_params.json")
+
+# Maps hmm_lookback_rows (int) → HMM_LOOKBACK dateutil string used by the
+# live system.  Only values tested in sensitivity.py are included.
+ROWS_TO_LOOKBACK: dict[int, str] = {
+    60: "1 hour ago UTC",
+    120: "2 hours ago UTC",  # config_parameters.py default
+    240: "4 hours ago UTC",
+}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def load_best_params() -> None:
+    """
+    If ``best_params.json`` exists, patch ``strategy.regime_director``'s
+    module namespace with the tuned HMM parameters before
+    ``RegimeDirector()`` is instantiated.
+
+    This function is idempotent — safe to call multiple times (each call
+    simply re-reads the file and re-applies the overrides).
+
+    Call this **after** ``logging.basicConfig()`` and **before** the line::
+
+        regime_director = RegimeDirector()
+
+    Parameters overridden in ``strategy.regime_director``:
+
+    +-----------------------+-----------------------------+
+    | JSON field            | Module attribute patched    |
+    +=======================+=============================+
+    | ``hmm_max_regimes``   | ``HMM_MAX_REGIMES``         |
+    +-----------------------+-----------------------------+
+    | ``hmm_lookback_rows`` | ``HMM_LOOKBACK`` (string,   |
+    |                       | via ``ROWS_TO_LOOKBACK``)   |
+    +-----------------------+-----------------------------+
+
+    Falls back to ``config_parameters.py`` defaults silently when:
+
+    - ``best_params.json`` is absent (WARNING logged).
+    - The file cannot be parsed (WARNING logged).
+    - ``hmm_lookback_rows`` is not in ``ROWS_TO_LOOKBACK`` (WARNING logged,
+      ``HMM_LOOKBACK`` left unchanged).
+    """
+    import strategy.regime_director as rd_mod  # deferred — avoids import cycle
+
+    if not BEST_PARAMS_PATH.exists():
+        logging.warning(
+            "param_loader: no best_params.json at %s — "
+            "using config_parameters.py defaults.",
+            BEST_PARAMS_PATH,
+        )
+        return
+
+    try:
+        with BEST_PARAMS_PATH.open() as fh:
+            best = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning(
+            "param_loader: could not read %s (%s) — using defaults.",
+            BEST_PARAMS_PATH,
+            exc,
+        )
+        return
+
+    # ── Override HMM_MAX_REGIMES ──────────────────────────────────────────
+    if "hmm_max_regimes" in best:
+        rd_mod.HMM_MAX_REGIMES = int(best["hmm_max_regimes"])
+        logging.info("param_loader: HMM_MAX_REGIMES = %d", rd_mod.HMM_MAX_REGIMES)
+
+    # ── Override HMM_LOOKBACK (convert int rows → dateutil string) ────────
+    if "hmm_lookback_rows" in best:
+        rows = int(best["hmm_lookback_rows"])
+        lookback_str = ROWS_TO_LOOKBACK.get(rows)
+        if lookback_str:
+            rd_mod.HMM_LOOKBACK = lookback_str
+            logging.info(
+                "param_loader: HMM_LOOKBACK = '%s' (%d rows)",
+                lookback_str,
+                rows,
+            )
+        else:
+            logging.warning(
+                "param_loader: hmm_lookback_rows=%d not in ROWS_TO_LOOKBACK "
+                "— HMM_LOOKBACK left at config default.",
+                rows,
+            )
+
+    logging.info(
+        "param_loader: best_params applied (generated %s, %s=%.4f).",
+        best.get("generated_at", "unknown"),
+        best.get("source_metric", "?"),
+        best.get("source_value", float("nan")),
+    )
+
+
+def load_best_params_for_backtest() -> dict:
+    """
+    Load tuned parameters from ``best_params.json`` for use in the backtest.
+
+    Unlike :func:`load_best_params` (which patches ``strategy.regime_director``
+    for the live system), this function simply reads the JSON and returns the
+    relevant fields as a plain ``dict``.  The caller passes them as keyword
+    arguments to ``run_signals()`` and ``simulate_pnl()``, both of which
+    already accept ``None`` values and fall back to ``config_parameters.py``
+    defaults automatically.
+
+    No module-namespace patching is needed here because ``run_signals()``
+    already accepts explicit overrides (``hmm_lookback_rows``,
+    ``hmm_max_regimes``, ``vwap_window``) as function kwargs.
+
+    Returns
+    -------
+    dict
+        Zero or more of the following keys:
+
+        +-----------------------+----------+
+        | Key                   | Type     |
+        +=======================+==========+
+        | ``hmm_lookback_rows`` | ``int``  |
+        +-----------------------+----------+
+        | ``hmm_max_regimes``   | ``int``  |
+        +-----------------------+----------+
+        | ``vwap_window``       | ``int``  |
+        +-----------------------+----------+
+        | ``fee_rate``          | ``float``|
+        +-----------------------+----------+
+
+        Returns ``{}`` (empty dict) when ``best_params.json`` is absent or
+        unreadable — the caller's ``dict.get()`` calls will return ``None``,
+        which triggers the default-fallback path in ``run_signals()`` and
+        ``simulate_pnl()``.
+    """
+    if not BEST_PARAMS_PATH.exists():
+        logging.warning(
+            "param_loader: no best_params.json at %s — "
+            "using config_parameters.py defaults for backtest.",
+            BEST_PARAMS_PATH,
+        )
+        return {}
+
+    try:
+        with BEST_PARAMS_PATH.open() as fh:
+            best = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning(
+            "param_loader: could not read %s (%s) — using defaults.",
+            BEST_PARAMS_PATH,
+            exc,
+        )
+        return {}
+
+    logging.info(
+        "param_loader: backtest params loaded from %s  (generated %s, %s=%.4f)",
+        BEST_PARAMS_PATH,
+        best.get("generated_at", "unknown"),
+        best.get("source_metric", "?"),
+        best.get("source_value", float("nan")),
+    )
+
+    # Return only the four keys that the backtest pipeline consumes.
+    # Unknown / extra keys (e.g. generated_at) are intentionally excluded.
+    result = {}
+    for key, cast in (
+        ("hmm_lookback_rows", int),
+        ("hmm_max_regimes", int),
+        ("vwap_window", int),
+        ("fee_rate", float),
+    ):
+        if key in best:
+            result[key] = cast(best[key])
+    return result

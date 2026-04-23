@@ -9,9 +9,9 @@ from binance.client import Client
 # ---------------------------------------------------------------------------
 # Symbol configuration
 # ---------------------------------------------------------------------------
-SYMBOL = "BTCUSDT"   # trading pair
-CCY = "USDT"         # quote currency
-CRYPTOCCY = "BTC"    # base / cryptocurrency
+SYMBOL = "BTCUSDT"  # trading pair
+CCY = "USDT"  # quote currency
+CRYPTOCCY = "BTC"  # base / cryptocurrency
 
 # ---------------------------------------------------------------------------
 # Order book state
@@ -23,24 +23,24 @@ N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
-HFT_INTERVAL = 1    # seconds between low-latency evaluations
+HFT_INTERVAL = 1  # seconds between low-latency evaluations
 HIST_INTERVAL = 60  # seconds between historical analyses (1 min)
-MIN_SNAPSHOTS = 100 # minimum snapshots required before historical analysis runs
+MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis runs
 
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
 DEFAULT_SESSION_MINUTES = 10  # default session length
 # at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
-HTF_JOIN_TIMEOUT = 10   # s — max wait for low_latency_analysis thread on shutdown
+HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 
 # ---------------------------------------------------------------------------
 # Binance REST / WebSocket connection
 # ---------------------------------------------------------------------------
-RECV_WINDOW = 5000    # ms — Binance REST request validity window
+RECV_WINDOW = 5000  # ms — Binance REST request validity window
 SNAPSHOT_DEPTH = 100  # number of order book levels in the seed snapshot
-WS_SPEED = 100        # ms — WebSocket diff-depth update interval
+WS_SPEED = 100  # ms — WebSocket diff-depth update interval
 
 # ---------------------------------------------------------------------------
 # Quote calculation throttle
@@ -67,7 +67,7 @@ HMM_MAX_REGIMES = len(HMM_FEATURE_COLS) - 1  # BIC search: 2 … 3 states
 HMM_RANDOM_STATE = 46
 HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
 HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
-                                   # while keeping enough data for stable EM convergence
+# while keeping enough data for stable EM convergence
 # Regularisation floor added to the diagonal of every state's covariance
 # matrix.  Prevents "covars must be symmetric, positive-definite" errors
 # when a hidden state has few observations relative to the feature count.
@@ -114,8 +114,8 @@ VOLUME_DECAY_FACTOR = 0.80
 # Mirrors the live system's HMM_LOOKBACK_ROWS / REFIT_EVERY constants so
 # the backtest uses the same rolling-window logic as websocket_main.py.
 HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 2 h at 1 m
-VWAP_WINDOW = 5          # rolling VWAP window (rows) — 5 min at 1 m
-REFIT_EVERY = 120        # full BIC re-fit every N replay candles (= 2 h at 1 m)
+VWAP_WINDOW = 5  # rolling VWAP window (rows) — 5 min at 1 m
+REFIT_EVERY = 120  # full BIC re-fit every N replay candles (= 2 h at 1 m)
 
 # Speed-up override used ONLY inside backtest/sensitivity.py.
 # At 1 m candles: 480 iterations = 8 h between refits → ~90 refits per 30-day
@@ -139,8 +139,8 @@ SENSITIVITY_PREDICT_EVERY = 5  # 8 h at 1 m — sensitivity-sweep override only
 
 # -- P&L simulation (backtest/pnl.py) -------------------------------------
 # Starting balances.  Total = USDT + BTC × first_close ≈ $10 000 at $68 k BTC.
-BACKTEST_INITIAL_CAPITAL = 5000.0   # starting USDT balance
-BACKTEST_INITIAL_BTC = 0.0735       # starting BTC balance
+BACKTEST_INITIAL_CAPITAL = 5000.0  # starting USDT balance
+BACKTEST_INITIAL_BTC = 0.0735  # starting BTC balance
 
 # Taker fee per side (Binance Spot standard tier).
 BACKTEST_FEE_RATE = 0.001  # 0.10 %

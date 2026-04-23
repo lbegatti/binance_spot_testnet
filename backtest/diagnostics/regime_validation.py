@@ -108,6 +108,7 @@ _CANDLES_PER_DAY = 1440  # 24 h × 60 min — used for human-readable logging on
 # Phase 1 — Data Fetch
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def _fetch_and_prepare() -> tuple[pd.DataFrame, int]:
     """
     Download the 1-year kline dataset, add HMM features, and compute
@@ -156,7 +157,7 @@ def _fetch_and_prepare() -> tuple[pd.DataFrame, int]:
 
 
 def _fit_best_hmm(
-        train_scaled: np.ndarray,
+    train_scaled: np.ndarray,
 ) -> GaussianHMM:
     """
     BIC search over n=2…HMM_MAX_REGIMES, return the best model.
@@ -233,8 +234,8 @@ def _assign_labels(model: GaussianHMM) -> dict[int, str]:
 
 
 def _train_and_predict(
-        features_df: pd.DataFrame,
-        split_idx: int,
+    features_df: pd.DataFrame,
+    split_idx: int,
 ) -> pd.DataFrame:
     """
     Fit HMM on the full train set, predict labels for the full test set.
@@ -280,18 +281,21 @@ def _train_and_predict(
     # ── Step 2: fit HMM on full train set ─────────────────────────────────
     logging.info(
         "Phase 2 — fitting HMM on %d train rows (~%d days)...",
-        len(train_features), len(train_features) // _CANDLES_PER_DAY,
+        len(train_features),
+        len(train_features) // _CANDLES_PER_DAY,
     )
     model = _fit_best_hmm(train_scaled)
     state_labels = _assign_labels(model)
     logging.info(
-        "Fit complete: %d states selected by BIC.", model.n_components,
+        "Fit complete: %d states selected by BIC.",
+        model.n_components,
     )
 
     # ── Step 3: predict on full test set (one Viterbi pass) ───────────────
     logging.info(
         "Phase 2 — predicting %d test rows (~%d days) in one pass...",
-        len(test_features), len(test_features) // _CANDLES_PER_DAY,
+        len(test_features),
+        len(test_features) // _CANDLES_PER_DAY,
     )
     states = model.predict(test_scaled)
     proba = model.predict_proba(test_scaled)
@@ -321,8 +325,7 @@ def _train_and_predict(
     )
 
     logging.info(
-        "Phase 2 complete: %d test candles labelled.\n"
-        "Label distribution:\n%s",
+        "Phase 2 complete: %d test candles labelled.\nLabel distribution:\n%s",
         len(result),
         result["regime_label"].value_counts().to_string(),
     )
@@ -335,8 +338,8 @@ def _train_and_predict(
 
 
 def _run_checks(
-        test_labels: pd.DataFrame,
-        features_df: pd.DataFrame,
+    test_labels: pd.DataFrame,
+    features_df: pd.DataFrame,
 ) -> dict:
     """
     Run the six statistical validation checks defined in Step 6b of
@@ -424,7 +427,9 @@ def _run_checks(
     # so this test is now genuinely meaningful: a FAIL indicates the HMM does
     # not produce directionally differentiated forward returns out-of-sample.
     fwd_tu = test_labels.loc[test_labels["regime_label"] == "trending_up", "fwd_return"]
-    fwd_td = test_labels.loc[test_labels["regime_label"] == "trending_down", "fwd_return"]
+    fwd_td = test_labels.loc[
+        test_labels["regime_label"] == "trending_down", "fwd_return"
+    ]
 
     if len(fwd_tu) > 1 and len(fwd_td) > 1:
         t_stat, p_val = stats.ttest_ind(fwd_tu, fwd_td, equal_var=False)
@@ -505,8 +510,12 @@ def _run_checks(
     #   BUY  blocked when regime ∈ {trending_down, high_volatility}
     #   SELL blocked when regime ∈ {trending_up,   high_volatility}
     n = len(test_labels)
-    buy_blocked = test_labels["regime_label"].isin({"trending_down", "high_volatility"}).sum()
-    sell_blocked = test_labels["regime_label"].isin({"trending_up", "high_volatility"}).sum()
+    buy_blocked = (
+        test_labels["regime_label"].isin({"trending_down", "high_volatility"}).sum()
+    )
+    sell_blocked = (
+        test_labels["regime_label"].isin({"trending_up", "high_volatility"}).sum()
+    )
     both_blocked = test_labels["regime_label"].isin({"high_volatility"}).sum()
     results["hit_rate_alignment"] = {
         "pass": True,  # informational — compare with run_backtest.py regime_filter_hit_rate_pct

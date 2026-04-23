@@ -98,14 +98,16 @@ def build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple
 
     # Re-pack into the same list-of-tuples format expected by callers so the
     # public contract of build_levels() is unchanged.
-    levels = list(zip(
-        total_depth_arr.tolist(),
-        mid_price_arr.tolist(),
-        micro_price_arr.tolist(),
-        obi_arr.tolist(),
-        bq.tolist(),
-        aq.tolist(),
-    ))
+    levels = list(
+        zip(
+            total_depth_arr.tolist(),
+            mid_price_arr.tolist(),
+            micro_price_arr.tolist(),
+            obi_arr.tolist(),
+            bq.tolist(),
+            aq.tolist(),
+        )
+    )
 
     median_depth = float(np.median(total_depth_arr))
     level_0_depth = float(total_depth_arr[0])
@@ -114,7 +116,7 @@ def build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple
 
 
 def collect_candidates(
-        levels: list, median_depth: float, level_0_depth: float
+    levels: list, median_depth: float, level_0_depth: float
 ) -> tuple:
     """
     Identify potential trade opportunities from pre-computed order book levels.
@@ -207,7 +209,7 @@ def collect_candidates(
 
 
 def select_best_opportunity(
-        candidates: list, strategy_name: str, iteration: int
+    candidates: list, strategy_name: str, iteration: int
 ) -> tuple | None:
     """
     Score identified candidates and pick the best one for potential execution.
@@ -247,7 +249,14 @@ def select_best_opportunity(
         logging.info(
             "HFT #%d [%s] — single candidate at level %d | score=%.4f | delta=%.6f | depth=%.4f "
             "| order_imbalance=%.3f | micro price = %.3f",
-            iteration, strategy_name, level_idx, score, delta, depth, obi, micro_price,
+            iteration,
+            strategy_name,
+            level_idx,
+            score,
+            delta,
+            depth,
+            obi,
+            micro_price,
         )
         return level_idx, score, delta, depth, obi, micro_price, bq, aq
 
@@ -269,7 +278,11 @@ def select_best_opportunity(
         logging.warning(
             "HFT #%d [%s] — degenerate candidates (max_depth=%.6f, max_delta=%.6f); "
             "falling back to first candidate at level %d.",
-            iteration, strategy_name, max_depth, max_delta, level_idx,
+            iteration,
+            strategy_name,
+            max_depth,
+            max_delta,
+            level_idx,
         )
         return level_idx, 1.0, delta, depth, obi, micro_price, bq, aq
 
@@ -282,6 +295,13 @@ def select_best_opportunity(
     logging.info(
         "HFT #%d [%s] — level %d | score=%.4f | delta=%.6f | depth=%.4f | order_imbalance = %.3f "
         "| micro price = %.3f",
-        iteration, strategy_name, level_idx, score, delta, depth, obi, micro_price,
+        iteration,
+        strategy_name,
+        level_idx,
+        score,
+        delta,
+        depth,
+        obi,
+        micro_price,
     )
     return level_idx, score, delta, depth, obi, micro_price, bq, aq

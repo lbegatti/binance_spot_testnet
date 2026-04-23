@@ -750,7 +750,7 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `run_backtest.py` always predicts every candle. |
 | Runtime (OAT, 6 runs) | ~12–30 min on a laptop (after optimisations) |
-| Output | `backtest/results/best_params.json` — loaded by `websocket_main.py` at startup |
+| Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `run_backtest.py`) |
 | Run | `python -m backtest.sensitivity` |
 
 #### Use Case B — Backtest robustness validation ⬜ *Deferred*
@@ -864,7 +864,8 @@ Total wall time: **~12–30 min** for the full OAT (6 runs) on a laptop, vs ~66�
 
 ### Persisting Best Parameters (`best_params.json`)
 
-After the sweep, `sensitivity.py` writes the winning row to:
+After the sweep, `sensitivity.py` writes the winning row to
+`backtest/results/best_params.json`:
 
 ```json
 {
@@ -878,9 +879,49 @@ After the sweep, `sensitivity.py` writes the winning row to:
 }
 ```
 
-At startup `websocket_main.py` calls `_load_best_params()` which reads this
-file and overrides the relevant `config_parameters` constants.  If the file is
-absent the live system falls back silently to the defaults.
+#### Who loads it and how
+
+Both consumers delegate to **`strategy/param_loader.py`** — the single module
+that owns all loading logic, keeping `websocket_main.py` and `run_backtest.py`
+free of JSON / file-handling code.
+
+| Consumer | Function called | When | What is overridden | Mechanism |
+|---|---|---|---|---|
+| `websocket_main.py` | `param_loader.load_best_params()` | At startup, before `RegimeDirector()` is instantiated | `HMM_MAX_REGIMES`, `HMM_LOOKBACK` | Patches `strategy.regime_director` module namespace directly (not `config_parameters`) — necessary because `regime_director.py` binds constants at import time via `from config_parameters import`. |
+| `run_backtest.py` | `param_loader.load_best_params_for_backtest()` | At the top of `run_backtest()`, before `run_signals()` | `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, `fee_rate` | Returns a plain `dict`; values passed as keyword arguments to `run_signals()` and `simulate_pnl()`. Keys absent from `best_params.json` are simply omitted — both functions fall back to `config_parameters.py` defaults automatically. |
+
+#### Parameter Flow
+
+```
+sensitivity.py  ──►  best_params.json  ──►  strategy/param_loader.py
+                                                  ├── load_best_params()             → websocket_main.py  (live)
+                                                  └── load_best_params_for_backtest() → run_backtest.py    (backtest)
+```
+
+Both consumers fall back silently to `config_parameters.py` defaults when
+`best_params.json` is absent or unreadable.
+
+#### Notes on `VWAP_WINDOW` and `fee_rate`
+
+- `vwap_window` — backtest-only (`backtest/signals.py`).  The live system does
+  not use `VWAP_WINDOW`, so `websocket_main.py` ignores this field.
+- `fee_rate` — informational for the live system (Binance charges its own fees
+  regardless).  `run_backtest.py` does pass it to `simulate_pnl()`.
+
+#### Notes on `HMM_LOOKBACK` (live) vs `HMM_LOOKBACK_ROWS` (backtest)
+
+`best_params.json` stores `hmm_lookback_rows` (an integer, used by the
+backtest).  The live system uses `HMM_LOOKBACK` (a dateutil string such as
+`"2 hours ago UTC"`).  The live loader converts via a fixed mapping:
+
+| `hmm_lookback_rows` | `HMM_LOOKBACK` |
+|---|---|
+| 60  | `"1 hour ago UTC"` |
+| 120 | `"2 hours ago UTC"` (default) |
+| 240 | `"4 hours ago UTC"` |
+
+If the JSON contains a value not in this table, `HMM_LOOKBACK` is left at
+the `config_parameters.py` default and a `WARNING` is logged.
 
 > **Important:** do **not** commit `best_params.json` to git — it is
 > sample-specific.  Add `backtest/results/best_params.json` to `.gitignore`.
@@ -1020,7 +1061,9 @@ concrete file in `backtest/`.
   `BACKTEST_FEE_RATE`.  **Use Case A (30-day live-tuning window) implemented.**
   Run with `python -m backtest.sensitivity` (OAT, default) or
   `python -m backtest.sensitivity --full-grid` (Phase 2, 24 combinations).
-  Writes `best_params.json` loaded by `websocket_main.py` at startup.
+  Writes `best_params.json` — loaded via `strategy.param_loader`
+  (`load_best_params()` by `websocket_main.py` at startup;
+  `load_best_params_for_backtest()` by `run_backtest.py` before `run_signals()`).
   **Use Case B (180-day backtest validation) deferred** — runtime ~4–12 h for
   OAT alone on a laptop.  *(Use Case A implemented; Use Case B deferred.)*
 

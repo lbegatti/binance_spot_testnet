@@ -120,13 +120,13 @@ def simulate_pnl(
     # The 'type: ignore' comments below suppress false-positive IDE warnings —
     # itertuples() attributes are resolved at runtime, not statically inferred.
     for row in signals.itertuples():
-        ts = row.Index                                          # type: ignore[union-attr]
-        close = float(row.close)                               # type: ignore[union-attr]
-        sig = int(row.signal)                                  # type: ignore[union-attr]
+        ts = row.Index  # type: ignore[union-attr]
+        close = float(row.close)  # type: ignore[union-attr]
+        sig = int(row.signal)  # type: ignore[union-attr]
 
         # BUY
         if sig == 1:
-            raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0      # type: ignore[union-attr]
+            raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0  # type: ignore[union-attr]
             half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic ask: close + half_spread.
@@ -182,7 +182,7 @@ def simulate_pnl(
 
         # SELL
         elif sig == -1:
-            raw_qty = float(row.sell_qty) if pd.notna(row.sell_qty) else 0.0           # type: ignore[union-attr]
+            raw_qty = float(row.sell_qty) if pd.notna(row.sell_qty) else 0.0  # type: ignore[union-attr]
             half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic bid: close - half_spread.
