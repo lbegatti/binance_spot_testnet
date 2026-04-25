@@ -120,13 +120,16 @@ def run_backtest(
     )
 
     # Step 4: simulate P&L
-    # Only pass fee_rate if best_params.json contains it; omitting the kwarg
-    # entirely lets simulate_pnl() use its BACKTEST_FEE_RATE default without
-    # receiving None (which would violate the float type annotation).
-    pnl_kwargs = {}
-    if best.get("fee_rate") is not None:
-        pnl_kwargs["fee_rate"] = best["fee_rate"]
-    trades, equity, stats = simulate_pnl(signals, **pnl_kwargs)
+    # fee_rate is intentionally NOT loaded from best_params.json here.
+    # Rationale: fee_rate is a fixed exchange cost (Binance Spot taker = 0.10 %
+    # by default), NOT a tunable strategy parameter.  The sensitivity sweep
+    # includes fee_rate to find the break-even fee level, but the optimizer
+    # converging on the lowest tested value (0.00025) signals that profitability
+    # is marginal at realistic fees — it does NOT mean we should simulate with
+    # an unrealistically cheap fee.  Using 0.00025 while actually paying 0.10 %
+    # would make the backtest ~4× optimistic.
+    # simulate_pnl() always uses BACKTEST_FEE_RATE from config_parameters.py.
+    trades, equity, stats = simulate_pnl(signals)
 
     # Step 5: print summary report
     print_report(signals, trades, equity, stats)

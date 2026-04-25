@@ -1043,9 +1043,17 @@ concrete file in `backtest/`.
   2. **Drawdown (%)** — red ``tozeroy`` fill (shared x-axis with equity).
   3. **BTC close + BUY ▲ / SELL ▼** — fill-price markers and rolling
      ``bid_vwap`` / ``ask_vwap`` dashed lines.
-  4. **Regime timeline + confidence** — colour-coded ``vrect`` bands per HMM
-     label (pale green / red / orange / grey) with ``regime_confidence``
-     overlay and dashed ``HMM_MIN_CONFIDENCE`` threshold.
+   4. **Regime timeline + confidence** — three-layer panel: (a) colour-coded
+      ``vrect`` background bands per HMM label; (b) a dark-slate ``shape="hv"``
+      step-line that maps each label to an integer position via
+      ``_REGIME_NUMERIC`` (0 = ``trending_down`` → 3 = ``trending_up``) so
+      regime transitions appear as immediate vertical jumps; (c) a dotted navy
+      confidence overlay scaled ×3 to fill the [0, 3] range (hover shows the
+      real 0–1 value) with a dashed ``HMM_MIN_CONFIDENCE × 3`` threshold line.
+      Y-axis tick labels show regime names, not raw integers.
+      *Bug fixed 2026-04-25: previously only ``regime_confidence`` (0–1) was
+      plotted, which appeared as a nearly flat line — the regime step-line
+      and ×3 scaling were added to make the timeline readable.*
   5. **VWAP vs micro-price** — four series with grey dot (●) near-miss markers
      where the VWAP gate specifically blocked a candidate.
   6a. **Signal funnel** (stacked horizontal bar) — per-side breakdown:
@@ -1064,10 +1072,21 @@ concrete file in `backtest/`.
   Writes `best_params.json` — loaded via `strategy.param_loader`
   (`load_best_params()` by `websocket_main.py` at startup;
   `load_best_params_for_backtest()` by `run_backtest.py` before `run_signals()`).
+
+  > **Why patches from `param_loader` take effect on `RegimeDirector`:**
+  > `RegimeDirector.__init__` uses `None` sentinels for `lookback` and
+  > `max_regimes` instead of default parameter values.  Python evaluates default
+  > parameter expressions *once at `def` time* (import time), which would freeze
+  > the constants before `load_best_params()` can patch the module namespace.
+  > The `None` sentinel forces Python to re-read `HMM_LOOKBACK` / `HMM_MAX_REGIMES`
+  > from `strategy.regime_director`'s own namespace on every `__init__` call —
+  > after `load_best_params()` has already patched that namespace.
+  > Full explanation in `strategy/param_loader.py` docstring.
+
   **Use Case B (180-day backtest validation) deferred** — runtime ~4–12 h for
   OAT alone on a laptop.  *(Use Case A implemented; Use Case B deferred.)*
 
 ---
 
-*Document last updated: 2026-04-15*
+*Document last updated: 2026-04-25*
 

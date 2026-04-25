@@ -40,7 +40,86 @@ Fields NOT overridden
 - ``vwap_window``  — backtest-only constant (``backtest/signals.py``).
                      The live system does not use ``VWAP_WINDOW``.
 - ``fee_rate``     — Binance charges its own fees regardless of this value.
-                     Stored in ``best_params.json`` for reference only.
+                     Stored in ``best_params.json`` for *reference only* — it
+                     shows the fee level at which the sensitivity sweep was
+                     optimal, which is useful diagnostic information but should
+                     NOT be used to override the simulation fee.  The optimizer
+                     converging on the lowest tested fee (e.g. 0.00025) is a
+                     signal that strategy alpha is thin at realistic fees
+                     (0.001 = standard Binance Spot taker); simulating with the
+                     lower value produces ~4× over-optimistic P&L.
+                     ``run_backtest.py`` deliberately ignores this field and
+                     always uses ``BACKTEST_FEE_RATE`` from ``config_parameters.py``.
+
+Why patching ``config_parameters`` directly would NOT work
+-----------------------------------------------------------
+A common misconception: if ``config_parameters.HMM_LOOKBACK = "2 hours ago UTC"``
+is the source, why not just do::
+
+    import config_parameters
+    config_parameters.HMM_LOOKBACK = "1 hour ago UTC"   # ← has NO EFFECT on RegimeDirector
+
+When Python executes::
+
+    # inside regime_director.py (top of file, at import time)
+    from config_parameters import HMM_LOOKBACK
+
+it **copies** the string value ``"2 hours ago UTC"`` into a new name living
+inside the ``strategy.regime_director`` module namespace.  After that point,
+``config_parameters.HMM_LOOKBACK`` and ``strategy.regime_director.HMM_LOOKBACK``
+are **two independent variables** that happen to hold the same string.
+Patching one does not affect the other.
+
+The correct target is therefore the copy that ``regime_director.py`` actually
+reads at runtime::
+
+    import strategy.regime_director as rd_mod
+    rd_mod.HMM_LOOKBACK = "1 hour ago UTC"   # ← patches the copy RegimeDirector reads
+
+Step-by-step: how ``"2 hours ago UTC"`` becomes ``"1 hour ago UTC"``
+---------------------------------------------------------------------
+1. **At import time** — ``regime_director.py`` is first imported:
+
+   * ``from config_parameters import HMM_LOOKBACK`` runs.
+   * Python creates ``strategy.regime_director.HMM_LOOKBACK = "2 hours ago UTC"``
+     (a separate copy).
+   * ``config_parameters.HMM_LOOKBACK`` is also ``"2 hours ago UTC"`` and
+     stays that way **forever**.
+
+2. **``load_best_params()`` is called** (before ``RegimeDirector()``):
+
+   * ``import strategy.regime_director as rd_mod`` fetches the already-imported
+     module from ``sys.modules`` — no re-execution, just a reference.
+   * ``rd_mod.HMM_LOOKBACK = "1 hour ago UTC"`` overwrites the **copy**
+     inside ``strategy.regime_director``'s namespace.
+   * ``config_parameters.HMM_LOOKBACK`` is still ``"2 hours ago UTC"``.
+
+3. **``RegimeDirector()`` is instantiated**:
+
+   * ``__init__`` receives no ``lookback`` argument, so the ``None`` sentinel
+     is in effect.
+   * The body executes::
+
+         self.lookback = lookback if lookback is not None else HMM_LOOKBACK
+
+   * Python resolves the bare name ``HMM_LOOKBACK`` by looking it up in
+     ``regime_director``'s **own** module namespace (the LEGB rule: Local →
+     Enclosing → **Global** → Built-in, where "Global" means the module).
+   * That namespace now holds ``"1 hour ago UTC"`` (from step 2).
+   * Result: ``self.lookback = "1 hour ago UTC"``.
+
+Why the ``None`` sentinel matters
+----------------------------------
+If ``__init__`` were written as::
+
+    def __init__(self, lookback: str = HMM_LOOKBACK, ...):
+
+Python evaluates the default expression ``HMM_LOOKBACK`` **once, at the
+``def`` statement** (still import time).  The frozen default is
+``"2 hours ago UTC"`` and never changes — even if
+``rd_mod.HMM_LOOKBACK`` is later patched.  The ``None`` sentinel forces
+Python to re-read the module-level name **each time** ``__init__`` is called,
+making the patch visible.
 
 HMM_LOOKBACK conversion
 ------------------------

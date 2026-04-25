@@ -131,7 +131,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `REFIT_EVERY` | `60` | Iterations between full HMM BIC re-fits during the signal loop.  At 1 m resolution this means one full re-fit per hour — frequent enough to track regime shifts, cheap enough to keep backtest runtime manageable (~720 refits over 30 days vs ~8,600 at the previous value of 5) |
 | **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `5_000.0` | Starting USDT balance for the simulation |
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
-| **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %) |
+| **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full run) |
 | **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `480` | HMM refit cadence used **only** inside `sensitivity.py` (8 h at 1 m → ~90 refits/run vs ~360 at the default, ~4× speedup). `config_parameters.py` defaults and the live system are never affected. |
@@ -144,7 +144,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 - `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_TRAIN_ROWS`
-- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`
+- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`
 - `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
@@ -163,6 +163,21 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
    ```bash
    pip install binance-connector python-dotenv pandas numpy plotly
    ```
+
+   Or install everything from the lockfile:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+   > **`pip_system_certs`** (added 2026-04-25) — injects the OS/system CA bundle
+   > into `pip` and `requests` on macOS/Linux.  Required on machines where the
+   > Binance Spot Testnet self-signed certificate chain would otherwise fail
+   > standard SSL verification at the OS level.  The three-layer SSL patch in
+   > `websocket_main.py` (REST `session.verify=False`, WebSocket
+   > `sslopt={"cert_reqs": ssl.CERT_NONE}`, urllib3 warning suppression) handles
+   > the *runtime* bypass; `pip_system_certs` ensures the install step itself
+   > succeeds in restricted environments.
 
 2. **Create a `.env` file** in the project root:
 
@@ -260,7 +275,7 @@ Binance REST API                   Binance WebSocket (production)
 2. Order-book data (`local_book`, `history_order_book`) is serialised through `state.thread_lock`.  `MessageHandler.handle_depth_message` acquires it to write; `AnalysisEngine.low_latency_analysis` acquires it to take a read-only copy and releases it before any heavy computation.
 3. Balance data (`balance_status`) is serialised through the dedicated `state.thread_balance_lock`, completely independent of `thread_lock`.  This prevents the high-frequency WebSocket order-book path (every 100 ms) from blocking on the lower-frequency balance path.
 4. `MessageHandler` is the **only writer** to order-book data in `OrderBookState`.  `OrderExecutor._handle_balance_update` is the **only writer** to `balance_status`.  `AnalysisEngine` is **read-only** — it copies data under the appropriate lock and immediately releases it.
-5. `AnalysisEngine` delegates order placement to `OrderExecutor`.  When `_select_best_opportunity()` returns a non-`None` 8-element tuple `(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)`, the engine calls `executor.execute("BUY", best_buy)` or `executor.execute("SELL", best_sell)`.  `OrderExecutor` validates the strategy, checks balances under `thread_balance_lock`, computes quantity (`aq` for BUY, `bq` for SELL), and sends a LIMIT GTC order via its own `SpotWebsocketAPIClient`.  The response arrives asynchronously in `handle_order_response`.
+5. `AnalysisEngine` delegates order placement to `OrderExecutor`.  When `_select_best_opportunity()` returns a non-`None` 8-element tuple `(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)`, the engine calls `executor.execute("BUY", best_buy)` or `executor.execute("SELL", best_sell)`.  `OrderExecutor` validates the strategy, checks balances under `thread_balance_lock`, computes quantity (`aq` for BUY, `bq` for SELL), and sends a LIMIT GTC order via its own `SpotWebsocketAPIClient`.  BUY orders are capped at `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))`: dividing by price × (1 + fee) reserves the taker fee so the total debit never exceeds the available USDT balance (Binance charges the fee on top of the notional and rejects with `insufficient balance` if the full balance is committed).  The response arrives asynchronously in `handle_order_response`.
 6. **VWAP momentum-confirmation filter** — `AnalysisEngine` owns a private `_vwap_lock` plus two attributes `_bid_vwap` and `_ask_vwap` (initially `None`).  `historical_analysis` computes both VWAPs from `history_order_book` every 1 min and publishes them under `_vwap_lock`.  `low_latency_analysis` reads them under the same lock on every iteration and gates order execution:
    - **BUY**: execute only if `_ask_vwap is None` (first ~1 min) **or** `micro_price > ask_vwap` (upward momentum confirmed).
    - **SELL**: execute only if `_bid_vwap is None` (first ~1 min) **or** `micro_price < bid_vwap` (downward momentum confirmed).
@@ -337,11 +352,24 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 
 ## WebSocket Execution Flow (`websocket_main.py`)
 
+> **Testnet SSL patch** — applied once at module level, before any client is
+> created.  The Binance Spot Testnet serves a self-signed certificate chain
+> that fails standard SSL verification.  Two layers are patched:
+> 1. `urllib3.disable_warnings(InsecureRequestWarning)` — suppresses per-request noise.
+> 2. `BinanceSocketManager.create_ws_connection` is monkey-patched to pass
+>    `sslopt={"cert_reqs": ssl.CERT_NONE}` to every `websocket-client`
+>    `create_connection()` call — covers both the market-data stream
+>    (`SpotWebsocketStreamClient`) and the order/balance WebSocket
+>    (`SpotWebsocketAPIClient` inside `OrderExecutor`).
+> 3. `rest_client.session.verify = False` — disables SSL verification on the
+>    `requests.Session` used by the REST client.
+
 1. Load API keys from `.env`.
 2. Connect to Binance Testnet via `binance-connector` REST client.
 3. Consolidate non-BTC/USDT balances into USDT via market sell orders.
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
-5. Session duration fixed at `DEFAULT_SESSION_MINUTES` (10 min) — no user prompt.
+5. Snapshot `btc_start_price` via `ticker_price(symbol)` and compute `start_total_usdt = usdt_balance + btc_balance × btc_start_price` — stored for the end-of-session P&L decomposition.
+6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (10 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
 7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of 1-minute klines (last 2 hours), fits `GaussianHMM` models for 2–4 states, selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.
@@ -357,7 +385,12 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
     - Call `calculate_best_quote()` every `QUOTE_EVERY_N_TICKS` ticks (~1 s) with the updated book (prints live spread to stdout).  The local book is still updated on every tick.
 13. On each incoming `outboundAccountPosition` push event (`OrderExecutor.handle_order_response` → `_handle_balance_update`):
     - Under `state.thread_balance_lock`, update `state.balance_status` for each tracked asset (`CRYPTOCCY`, `CCY`) using the `"f"` (free) field.
-14. After `session_seconds`, set `stop_event`, stop `ws_client`, stop `executor` (closes the WS API + user-data connection), and join both analysis threads (10 s low-latency, 15 s historical).  A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
+14. After `session_seconds`, set `stop_event`, stop `ws_client`, stop `executor` (closes the WS API + user-data connection), and join both analysis threads (10 s low-latency, 15 s historical).  A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.  After threads exit, two reports are printed:
+    - **Order status report** — queries every placed order via REST (`GET /api/v3/order`) and logs fill status.
+    - **Balance report** — fetches final balances and `btc_end_price`, then prints a P&L decomposition:
+      - **Trading alpha (A)** = `Δusdt + Δbtc × end_price` — the strategy's contribution, independent of BTC price movement.
+      - **Price move (B)** = `btc_start × (end_price − start_price)` — gain/loss from the starting BTC position due to market movement.
+      - **Total P&L** = A + B (with percentage return on starting portfolio value).
 
 ## Notation
 
@@ -715,7 +748,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7 |
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
-| `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime |
+| `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands (Panel 3 rebuild: `_REGIME_NUMERIC` step-line + confidence ×3 scaling), VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
 | `backtest/sensitivity.py` | ✅ done (Use Case A) | OAT sweep (8 runs) and full-grid (54 combinations, 3×2×3×3) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `BACKTEST_FEE_RATE`. Writes `best_params.json` — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
 
 > **Parameter Flow**
@@ -813,6 +846,18 @@ engine = AnalysisEngine(
     regime_director=regime_director,           # 5. inject into AnalysisEngine
 )
 ```
+
+> **`None` sentinel for `lookback` and `max_regimes`**  
+> `RegimeDirector.__init__` accepts `lookback: str | None = None` and
+> `max_regimes: int | None = None`.  When `None`, each resolves to the
+> module-level constant (`HMM_LOOKBACK` / `HMM_MAX_REGIMES`) **at call time**.  
+> This matters because `load_best_params()` (called in `websocket_main.py`
+> *before* `RegimeDirector()`) patches `strategy.regime_director.HMM_LOOKBACK`
+> and `strategy.regime_director.HMM_MAX_REGIMES` directly.  If the parameters
+> had default values baked in (e.g. `lookback: str = HMM_LOOKBACK`), Python
+> would freeze those values at import time and the patch would have no effect.
+> The `None` sentinel forces a fresh module-namespace lookup on every
+> instantiation.  Full explanation in `strategy/param_loader.py` docstring.
 
 **Why fit before threads start?**  
 `low_latency_analysis` reads `regime_label` on its very first iteration
@@ -982,5 +1027,5 @@ effectively instantaneous.
 
 ---
 
-*Document last updated: 2026-04-14*
+*Document last updated: 2026-04-25*
 

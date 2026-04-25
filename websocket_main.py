@@ -143,6 +143,23 @@ if usdt_balance == 0 and btc_balance == 0:
         f"No {CCY} or {CRYPTOCCY} balance available. Fund your testnet account before trading."
     )
 
+# Snapshot the BTC price at session start so the end-of-session report can
+# separate trading P&L from price-appreciation P&L.
+try:
+    # noinspection PyArgumentList
+    btc_start_price = float(rest_client.ticker_price(symbol=SYMBOL)["price"])
+    start_total_usdt = usdt_balance + btc_balance * btc_start_price
+    logging.info(
+        "Portfolio snapshot at session start: %.2f %s  (BTC @ %.2f)",
+        start_total_usdt,
+        CCY,
+        btc_start_price,
+    )
+except Exception as e:
+    btc_start_price = None
+    start_total_usdt = None
+    logging.warning("Could not fetch BTC start price for P&L attribution: %s", e)
+
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
@@ -288,23 +305,86 @@ finally:
             if item["asset"] in (CCY, CRYPTOCCY)
         }
         final_usdt = final_balances.get(CCY, 0.0)
-        final_btc = final_balances.get(CRYPTOCCY, 0.0)
-        pnl_usdt = final_usdt - usdt_balance
-        pnl_btc = final_btc - btc_balance
-        logging.info(
-            "\n"
-            "========== END-OF-SESSION BALANCE REPORT ==========\n"
-            "  %-10s  start: %14.2f   end: %14.2f   Δ %+.2f\n"
-            "  %-10s  start: %14.8f   end: %14.8f   Δ %+.8f\n"
-            "====================================================",
-            CCY,
-            usdt_balance,
-            final_usdt,
-            pnl_usdt,
-            CRYPTOCCY,
-            btc_balance,
-            final_btc,
-            pnl_btc,
-        )
+        final_btc  = final_balances.get(CRYPTOCCY, 0.0)
+        d_usdt     = final_usdt - usdt_balance
+        d_btc      = final_btc  - btc_balance
+
+        # Fetch current BTC price for portfolio valuation.
+        # noinspection PyArgumentList
+        btc_end_price   = float(rest_client.ticker_price(symbol=SYMBOL)["price"])
+        end_total_usdt  = final_usdt + final_btc * btc_end_price
+
+        # ── P&L attribution ────────────────────────────────────────────────
+        # trading_pnl  = what the STRATEGY contributed.
+        #   Mark BOTH the starting and ending BTC holding at the END price so
+        #   that BTC price moves cancel out. Only the change in mix (selling
+        #   BTC for USDT at a certain price vs. buying USDT back later)
+        #   remains — that is the strategy's contribution.
+        #     trading_pnl = Δusdt + Δbtc × end_price
+        #
+        # price_pnl    = what BTC price appreciation/depreciation contributed.
+        #   The starting BTC holding changes value solely because the price moved.
+        #     price_pnl = btc_balance × (end_price − start_price)
+        #
+        # total_pnl    = end_total − start_total (includes both effects).
+        #
+        # All three are in USDT.
+
+        if btc_start_price is not None and start_total_usdt is not None:
+            trading_pnl  = d_usdt + d_btc * btc_end_price
+            price_pnl    = btc_balance * (btc_end_price - btc_start_price)
+            total_pnl    = end_total_usdt - start_total_usdt
+            pct_return   = total_pnl / start_total_usdt * 100 if start_total_usdt else 0.0
+            # Sanity-check: trading_pnl + price_pnl == total_pnl (algebraic identity).
+            # Any residual is floating-point rounding noise — shown for transparency.
+            residual = total_pnl - (trading_pnl + price_pnl)
+
+            logging.info(
+                "\n"
+                "========== END-OF-SESSION BALANCE REPORT ==========\n"
+                "  %-10s  start: %14.2f   end: %14.2f   Δ %+.2f\n"
+                "  %-10s  start: %14.8f   end: %14.8f   Δ %+.8f\n"
+                "  BTC price   start: %14.2f   end: %14.2f   Δ %+.2f\n"
+                "\n"
+                "  Portfolio value (USDT)\n"
+                "    Start  : %14.2f   (USDT + BTC × start price)\n"
+                "    End    : %14.2f   (USDT + BTC × end price)\n"
+                "\n"
+                "  P&L decomposition  [A + B = Total]\n"
+                "    A  Trading alpha : %+.2f  (Δusdt + Δbtc × end_price)\n"
+                "       Strategy bought/sold BTC; this is the net result\n"
+                "       marked at the END price — isolated from market moves.\n"
+                "    B  Price move    : %+.2f  (starting BTC × price change)\n"
+                "       Your %.8f BTC start position gained/lost value\n"
+                "       purely because BTC moved %+.2f.\n"
+                "    ─────────────────────────────────────────────────────\n"
+                "    A + B  Total P&L : %+.2f  (%+.3f %%)\n"
+                "====================================================",
+                CCY,       usdt_balance, final_usdt, d_usdt,
+                CRYPTOCCY, btc_balance,  final_btc,  d_btc,
+                btc_start_price, btc_end_price, btc_end_price - btc_start_price,
+                start_total_usdt,
+                end_total_usdt,
+                trading_pnl,
+                price_pnl, btc_balance, btc_end_price - btc_start_price,
+                total_pnl, pct_return,
+            )
+            if abs(residual) > 0.01:
+                logging.warning("P&L residual %.4f (floating-point rounding).", residual)
+        else:
+            # Fallback: no start price captured — show raw deltas only.
+            logging.info(
+                "\n"
+                "========== END-OF-SESSION BALANCE REPORT ==========\n"
+                "  %-10s  start: %14.2f   end: %14.2f   Δ %+.2f\n"
+                "  %-10s  start: %14.8f   end: %14.8f   Δ %+.8f\n"
+                "  Portfolio (USDT equiv, end price %.2f)\n"
+                "    End total : %.2f %s\n"
+                "====================================================",
+                CCY,      usdt_balance, final_usdt, d_usdt,
+                CRYPTOCCY, btc_balance, final_btc,  d_btc,
+                btc_end_price,
+                end_total_usdt, CCY,
+            )
     except Exception as e:
         logging.error("Could not fetch final balance: %s", e)

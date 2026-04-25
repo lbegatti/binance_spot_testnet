@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-14)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-25)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -98,6 +98,11 @@ FILES
                                          # 480 iterations = 8 h at 1 m → ~90 refits
                                          # per 30-day run (~4× faster than REFIT_EVERY=120).
                                          # config_parameters defaults unchanged.
+    # NOTE: BACKTEST_FEE_RATE is also imported by execution/order_executor.py
+    # for the live BUY quantity cap: usdt / (micro_price × (1 + BACKTEST_FEE_RATE)).
+    # Binance charges the taker fee on top of the order notional at fill time;
+    # the fee-adjusted divisor ensures the total debit never exceeds usdt,
+    # preventing "insufficient balance" rejections on the testnet.
 
 ─────────────────────────────────────────────────────────────────────────────
 2. SHARED STATE  (order_book_state.py — OrderBookState)
@@ -383,6 +388,10 @@ FILES
 
   LIFECYCLE (two-speed update):
     Instantiated in websocket_main.py (step 4b) before threads start.
+    __init__ uses None sentinels for lookback and max_regimes (not default
+    parameter values) so that load_best_params() patches applied to the
+    strategy.regime_director module namespace are read at call time, not
+    frozen at import time.  Full explanation: strategy/param_loader.py.
     Initial fit: get_klines_data() + select_hmm_model() + assign_regime_labels().
 
     Every HIST_INTERVAL (60 s) in historical_analysis():
@@ -401,16 +410,19 @@ FILES
   Orchestrates the full lifecycle:
 
   Step 1 — Load .env (API key / secret), instantiate testnet REST client.
-            NOTE: No listenKey is requested.  Balance tracking uses the
-            session.logon + userDataStream.subscribe flow on the OrderExecutor
-            WS API connection instead.
+             NOTE: No listenKey is requested.  Balance tracking uses the
+             session.logon + userDataStream.subscribe flow on the OrderExecutor
+             WS API connection instead.
   Step 2 — Fetch & consolidate account balance:
-              • Sell every non-USDT / non-BTC asset that has a live USDT pair
-                (single pass, each symbol attempted once).
-              • Re-fetch balances if any sale succeeded.
-              • Guard: raise if both USDT and BTC balances are zero.
+               • Sell every non-USDT / non-BTC asset that has a live USDT pair
+                 (single pass, each symbol attempted once).
+               • Re-fetch balances if any sale succeeded.
+               • Guard: raise if both USDT and BTC balances are zero.
+               • Snapshot btc_start_price = ticker_price(SYMBOL) and compute
+                 start_total_usdt = usdt_balance + btc_balance × btc_start_price
+                 — stored for the end-of-session P&L decomposition.
   Step 3 — Session duration fixed at DEFAULT_SESSION_MINUTES (10 min).
-              • 10 min → ~600 low-latency iterations, ~10 historical analyses.
+               • 10 min → ~600 low-latency iterations, ~10 historical analyses.
   Step 4 — Seed local_book from REST snapshot (depth=100).
             Seed state.balance_status from the REST-fetched balances before
             any thread starts (single-threaded at this point; no lock needed).
@@ -443,11 +455,21 @@ FILES
               • start hist_thread         (daemon=True, name="hist-analysis")
   Step 8 — Main thread blocks for session_seconds (interruptible by Ctrl-C).
   Step 9 — Shutdown:
-              • stop_event.set()
-              • ws_client.stop()
-              • executor.stop()  — closes WS API connection (orders + user data)
-              • low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
-              • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+               • stop_event.set()
+               • ws_client.stop()
+               • executor.stop()  — closes WS API connection (orders + user data)
+               • low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
+               • hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+  Step 10— End-of-session reports:
+               Order report — queries every placed order via REST (GET /api/v3/order);
+               logs fill status (FILLED / PARTIAL / OPEN / other).
+               Balance report — fetches final balances + btc_end_price, then prints
+               a three-line P&L decomposition:
+                 A  Trading alpha  = Δusdt + Δbtc × end_price
+                    (strategy contribution — isolated from BTC price movement)
+                 B  Price move     = btc_start × (end_price − start_price)
+                    (gain/loss on the starting BTC position due to market movement)
+                 A + B  Total P&L  = end_total − start_total  (%  return on start portfolio)
 
 ─────────────────────────────────────────────────────────────────────────────
 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
@@ -499,9 +521,14 @@ FILES
            (level_idx, score|None, delta, total_depth, obi, micro_price, bq, aq)
       3) BALANCE READ — acquires thread_balance_lock, reads usdt and btc.
       4) QUANTITY — aq for BUY (ask-side liquidity), bq for SELL (bid-side).
-      5) DYNAMIC QUANTITY CAP —
-           BUY:  quantity = min(aq, usdt / micro_price).
-           SELL: quantity = min(bq, btc).
+       5) DYNAMIC QUANTITY CAP —
+            BUY:  quantity = min(aq, usdt / (micro_price × (1 + BACKTEST_FEE_RATE))).
+                  Dividing by price × (1 + fee) reserves the taker fee so the total
+                  debit (notional + fee) never exceeds the available USDT balance.
+                  Without the fee adjustment, Binance charges the fee on top of the
+                  notional and rejects the order with "insufficient balance" when the
+                  full balance is committed.
+            SELL: quantity = min(bq, btc).
            If the capped quantity is > 0 but less than the requested amount,
            a logging.info message is emitted and the order proceeds at reduced
            size.  Only skipped (returns None) when quantity == 0 — i.e. the
@@ -691,8 +718,21 @@ FILES
                                       Row 1b: drawdown % (red tozeroy fill).
                                       Row 2:  BTC close + BUY ▲ / SELL ▼ markers
                                               at fill price + bid/ask VWAP lines.
-                                      Row 3:  HMM regime vrect bands + confidence
-                                              overlay + HMM_MIN_CONFIDENCE dash.
+                                       Row 3:  HMM regime timeline — three layers:
+                                               (a) colour-coded vrect bands per
+                                                   contiguous regime run; (b) dark-
+                                                   slate shape="hv" step-line via
+                                                   _REGIME_NUMERIC mapping
+                                                   (0=trending_down → 3=trending_up)
+                                                   so transitions are vertical jumps;
+                                               (c) dotted navy confidence overlay
+                                                   scaled ×3 (fills [0,3] range);
+                                                   hover shows real 0–1 value.
+                                                   HMM_MIN_CONFIDENCE×3 dashed line.
+                                               Y-axis ticks show regime names.
+                                               Bug fixed 2026-04-25: previously only
+                                               regime_confidence (0–1) was plotted,
+                                               appearing as a flat line.
                                       Row 4:  VWAP vs micro-price + grey dot
                                               near-miss markers where VWAP gate
                                               specifically blocked a candidate.
@@ -727,11 +767,13 @@ FILES
                                        results/sensitivity_<mode>_<ts>.csv
                                        results/best_params.json
                                            └── consumed by strategy/param_loader.py
-                                                 ├── load_best_params() ← websocket_main.py
-                                                 │     called at startup before RegimeDirector();
-                                                 │     patches strategy.regime_director namespace
-                                                 │     (HMM_MAX_REGIMES, HMM_LOOKBACK);
-                                                 │     falls back to defaults if absent.
+                                                  ├── load_best_params() ← websocket_main.py
+                                                  │     called at startup BEFORE RegimeDirector();
+                                                  │     patches strategy.regime_director namespace
+                                                  │     (HMM_MAX_REGIMES, HMM_LOOKBACK).
+                                                  │     Patches are visible because RegimeDirector
+                                                  │     __init__ uses None sentinels — see 4b.
+                                                  │     Falls back to defaults if absent.
                                                  └── load_best_params_for_backtest() ← run_backtest.py
                                                        called at top of run_backtest() before
                                                        run_signals(); returns dict of cast values

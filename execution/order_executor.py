@@ -3,7 +3,7 @@ import logging
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 from binance.lib.utils import websocket_api_signature, get_uuid
 from core.order_book_state import OrderBookState
-from config_parameters import SYMBOL, CRYPTOCCY, CCY, RECV_WINDOW, ORDER_REPORT_LIMIT
+from config_parameters import SYMBOL, CRYPTOCCY, CCY, RECV_WINDOW, ORDER_REPORT_LIMIT, BACKTEST_FEE_RATE
 
 
 class OrderExecutor:
@@ -333,8 +333,14 @@ class OrderExecutor:
         order-book level quantity exceeds the available balance, the quantity
         is capped to the affordable amount:
 
-        * BUY:  ``quantity = min(aq, usdt / micro_price)``
+        * BUY:  ``quantity = min(aq, usdt / (micro_price × (1 + BACKTEST_FEE_RATE)))``
         * SELL: ``quantity = min(bq, btc)``
+
+        The fee-adjusted divisor for BUY orders ensures the total debit
+        (``quantity × micro_price × (1 + fee_rate)``) never exceeds the
+        available USDT balance.  Without it, Binance deducts the taker fee
+        *on top of* the order notional and rejects the order with
+        ``insufficient balance`` when the full balance is committed.
 
         The order is only skipped (returns ``None``) when the capped quantity
         is effectively zero, meaning the balance is fully depleted for that
@@ -362,7 +368,16 @@ class OrderExecutor:
         # Dynamically cap the quantity to what the available balance can afford,
         # so the algo still trades at a reduced size rather than skipping entirely.
         if strategy == "BUY":
-            max_affordable = usdt / micro_price if micro_price > 0 else 0.0
+            # Divide by price × (1 + fee_rate) so the total debit
+            # (notional + taker fee) never exceeds the available USDT balance.
+            # Without the fee factor Binance rejects the order with
+            # "insufficient balance" because the fee is charged on top of the
+            # notional and pushes the total spend over the account balance.
+            max_affordable = (
+                usdt / (micro_price * (1.0 + BACKTEST_FEE_RATE))
+                if micro_price > 0
+                else 0.0
+            )
             quantity = min(aq, max_affordable)
             if quantity <= 0:
                 logging.warning(

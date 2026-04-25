@@ -67,6 +67,15 @@ log = logging.getLogger(__name__)
 _BUY_COLOUR = "#2ca02c"  # medium green  — executed BUY signals
 _SELL_COLOUR = "#d62728"  # medium red    — executed SELL signals
 
+# Maps regime label → integer position on the step-line y-axis in Panel 3.
+# Order (bottom→top): trending_down(0) → high_volatility(1) → neutral(2) → trending_up(3)
+_REGIME_NUMERIC: dict[str, int] = {
+    "trending_down": 0,
+    "high_volatility": 1,
+    "neutral": 2,
+    "trending_up": 3,
+}
+
 # Regime band fill colours (rgba with alpha, used for vrects)
 _REGIME_COLOURS: dict[str, str] = {
     "trending_up": "rgba(200, 230, 201, 0.55)",  # pale green
@@ -398,23 +407,50 @@ def _panel_price_signals(
 
 def _panel_regime(fig: go.Figure, signals: pd.DataFrame) -> None:
     """
-    Panel 3 — HMM regime colour bands and regime_confidence overlay (row 4).
+    Panel 3 — HMM regime step-line, colour bands, and confidence overlay (row 4).
 
-    Each contiguous run of the same regime label is drawn as a single
-    ``add_vrect`` call — O(transitions), not O(rows) — so performance is
-    fast even on 14,400-row datasets.
+    Three layers are drawn on the same subplot:
 
-    The ``regime_confidence`` posterior probability is overlaid on the same
-    y-axis (range [0, 1]).  A dashed line at ``HMM_MIN_CONFIDENCE`` marks the
-    threshold below which both BUY and SELL are suppressed by the confidence
-    gate.
+    1. **Background vrect bands** (``_draw_regime_bands``) — colour-coded fills
+       for each contiguous regime run.  Drawn first so they sit below all traces.
+    2. **Regime step-line** (dark-slate step trace) — the regime label mapped to
+       a numeric position on the y-axis (0=trending_down → 3=trending_up).  This
+       is the primary "readable" layer: regime transitions appear as vertical
+       jumps, making the timeline immediately obvious.
+    3. **Confidence dotted line** — ``regime_confidence`` (posterior probability)
+       scaled by 3 so it uses the full vertical range.  Hover shows the real
+       0–1 value.  A dashed threshold line marks ``HMM_MIN_CONFIDENCE × 3``.
 
-    Dummy scatter traces with opaque square markers are added purely to
-    provide a colour key for the four regime labels in the figure legend.
+    The y-axis tick labels show the regime names (not raw integers), and the
+    right-hand annotation on the threshold line includes the real confidence
+    value so there is no ambiguity about the scaling.
+
+    Why scale confidence by 3?
+        The regime axis range is [−0.3, 3.5].  If the confidence line were
+        plotted at its raw 0–1 value it would be squeezed into the bottom 25 %
+        of the panel and look like a flat line near zero — the original bug.
+        Multiplying by 3 spreads it across the full panel height while keeping
+        the hover tooltip accurate.
     """
     _draw_regime_bands(fig, signals, row=4)
 
-    # Legend colour swatches (no real data — square marker per regime)
+    # ── 1. Regime step-line ───────────────────────────────────────────────
+    # Map each label to an integer position; unknown / NaN → neutral (2).
+    regime_num = signals["regime"].map(_REGIME_NUMERIC).fillna(2)
+    fig.add_trace(
+        go.Scatter(
+            x=signals.index,
+            y=regime_num,
+            mode="lines",
+            name="Regime",
+            line=dict(shape="hv", color="darkslategray", width=2.5),
+            legendgroup="regime_step",
+        ),
+        row=4,
+        col=1,
+    )
+
+    # ── 2. Legend colour swatches (square marker per regime, no data) ─────
     for label, colour in _REGIME_LEGEND_COLOURS.items():
         fig.add_trace(
             go.Scatter(
@@ -435,35 +471,47 @@ def _panel_regime(fig: go.Figure, signals: pd.DataFrame) -> None:
             col=1,
         )
 
+    # ── 3. Confidence dotted overlay (scaled ×3 to fill panel height) ─────
     if "regime_confidence" in signals.columns:
-        # regime_confidence may contain Python None (warm-up rows) — convert to
-        # float so Plotly renders gaps cleanly instead of a flat zero line.
         conf_series = pd.to_numeric(signals["regime_confidence"], errors="coerce")
+        # Scale to the same [0, 3] space as the regime axis so the line is not
+        # squashed into the bottom 25 % of the panel.  Hover shows real value.
+        conf_scaled = conf_series * 3.0
         fig.add_trace(
             go.Scatter(
                 x=signals.index,
-                y=conf_series,
+                y=conf_scaled,
                 mode="lines",
-                name="Confidence",
-                line=dict(color="navy", width=1.0),
-                opacity=0.65,
+                name=f"Confidence (×3, threshold={HMM_MIN_CONFIDENCE:.2f})",
+                line=dict(color="navy", width=1.0, dash="dot"),
+                opacity=0.70,
+                customdata=conf_series,
+                hovertemplate="%{x}<br>confidence: %{customdata:.3f}<extra></extra>",
                 legendgroup="confidence",
             ),
             row=4,
             col=1,
         )
         fig.add_hline(
-            y=HMM_MIN_CONFIDENCE,
+            y=HMM_MIN_CONFIDENCE * 3.0,
             line_dash="dash",
             line_color="navy",
             line_width=0.9,
-            annotation_text=f"Min conf ({HMM_MIN_CONFIDENCE:.2f})",
+            annotation_text=f"Min conf {HMM_MIN_CONFIDENCE:.2f} (×3={HMM_MIN_CONFIDENCE * 3:.2f})",
             annotation_position="top right",
             row=4,
             col=1,
         )
 
-    fig.update_yaxes(title_text="Confidence", range=[0, 1.05], row=4, col=1)
+    # Y-axis: show regime names as tick labels, not raw integers.
+    fig.update_yaxes(
+        tickvals=[0, 1, 2, 3],
+        ticktext=["trending_down", "high_volatility", "neutral", "trending_up"],
+        range=[-0.3, 3.5],
+        title_text="Regime  ·  Confidence (×3)",
+        row=4,
+        col=1,
+    )
 
 
 def _panel_vwap(fig: go.Figure, signals: pd.DataFrame) -> None:

@@ -103,29 +103,41 @@ class RegimeDirector:
         self,
         symbol: str = SYMBOL,
         interval: str = HMM_INTERVAL,
-        lookback: str = HMM_LOOKBACK,
+        lookback: str | None = None,
         random_state: int = HMM_RANDOM_STATE,
         n_iterations: int = HMM_N_ITERATIONS,
-        max_regimes: int = HMM_MAX_REGIMES,
+        max_regimes: int | None = None,
     ):
         """
         Args:
             symbol (str): Binance trading pair to fetch klines for.
             interval (str): Kline granularity (e.g. ``Client.KLINE_INTERVAL_1MINUTE``).
                 Pulled from ``HMM_INTERVAL`` in ``config_parameters.py``.
-            lookback (str): How far back to download data
-                (e.g. ``"2 hours ago UTC"``).  Pulled from ``HMM_LOOKBACK``.
+            lookback (str | None): How far back to download data
+                (e.g. ``"2 hours ago UTC"``).  Defaults to ``None``, in which
+                case the module-level ``HMM_LOOKBACK`` is read **at call time**
+                so that ``strategy.param_loader.load_best_params()`` patches
+                take effect before ``RegimeDirector()`` is instantiated.
+                Passing a default value here would freeze it at import time and
+                make the patch invisible.
             random_state (int): Seed for ``GaussianHMM`` initialisation to
                 ensure reproducible state numbering across runs.
             n_iterations (int): Maximum number of Expectation–Maximisation
                 iterations per model.
-            max_regimes (int): Upper bound on the number of hidden states
+            max_regimes (int | None): Upper bound on the number of hidden states
                 evaluated during BIC search (states tested: 2 … max_regimes).
+                Defaults to ``None`` → reads ``HMM_MAX_REGIMES`` at call time
+                for the same reason as ``lookback``.
         """
         self.symbol = symbol
         self.interval = interval
-        self.lookback = lookback
-        self.max_states = max_regimes
+        # Read module-level names at call time (not at definition time).
+        # Python freezes default parameter values when the def statement is
+        # executed (import time).  Using None sentinels here means the module
+        # namespace is read each time __init__ is called, so patches applied
+        # by strategy.param_loader.load_best_params() are visible.
+        self.lookback = lookback if lookback is not None else HMM_LOOKBACK
+        self.max_states = max_regimes if max_regimes is not None else HMM_MAX_REGIMES
         self.random_state = random_state
         self.n_iterations = n_iterations
         self.client = Client()
