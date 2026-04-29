@@ -76,12 +76,12 @@ FILES
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
     BACKTEST_LOOKBACK    = "180 days ago UTC"  # kline fetch window for backtest dataset (~259,200 candles;
-                                               # 30-day window for broader regime coverage)
+                                               # 180-day window for broad regime coverage)
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
     VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
-    REFIT_EVERY          = 60     # iterations between full HMM BIC re-fits (live: every 60 min; backtest: ~720 refits over 30 days)
-    BACKTEST_MAX_ROWS    = 500    # max replay candles in debug mode (None for full 10-day run)
+    REFIT_EVERY          = 120    # iterations between full HMM BIC re-fits (live: every 2 h; backtest: ~1,080 refits over 180 days)
+    BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 5000 for fast debug)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
     BACKTEST_INITIAL_BTC     = 0.0735    # starting BTC balance (set > 0 to simulate existing position)
@@ -96,7 +96,7 @@ FILES
     BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
     SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py ONLY.
                                          # 480 iterations = 8 h at 1 m → ~90 refits
-                                         # per 30-day run (~4× faster than REFIT_EVERY=120).
+                                         # per 90-day run (~4× faster than REFIT_EVERY=120).
                                          # config_parameters defaults unchanged.
     # NOTE: BACKTEST_FEE_RATE is also imported by execution/order_executor.py
     # for the live BUY quantity cap: usdt / (micro_price × (1 + BACKTEST_FEE_RATE)).
@@ -756,8 +756,8 @@ FILES
                                     (all in config_parameters.py, no effect on
                                     run_backtest.py or the live system):
                                       SENSITIVITY_REFIT_EVERY = 480  (~4× fewer refits)
-                                      SENSITIVITY_LOOKBACK = "30 days ago UTC"
-                                                             (~6× fewer rows than 180d)
+                                      SENSITIVITY_LOOKBACK = "90 days ago UTC"
+                                                             (~2× fewer rows than 180d)
                                       SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi)
                                     Combined speedup vs naïve 180-day run:
                                       ~12–30 min total OAT vs ~66–180 min without.

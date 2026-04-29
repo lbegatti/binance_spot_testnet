@@ -128,14 +128,14 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of kline rows used as the HMM warm-up window in the backtest (2 h at 1 m — matches `HMM_LOOKBACK`) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in candles) for the backtest VWAP computation (5 candles = 5 min at 1 m — matches live VWAP cadence) |
-| **Backtesting** | `REFIT_EVERY` | `60` | Iterations between full HMM BIC re-fits during the signal loop.  At 1 m resolution this means one full re-fit per hour — frequent enough to track regime shifts, cheap enough to keep backtest runtime manageable (~720 refits over 30 days vs ~8,600 at the previous value of 5) |
+| **Backtesting** | `REFIT_EVERY` | `120` | Iterations between full HMM BIC re-fits during the signal loop.  At 1 m resolution this means one full re-fit every 2 hours — frequent enough to track regime shifts, cheap enough to keep backtest runtime manageable (~1,080 refits over 180 days vs ~8,640 at the previous value of 5) |
 | **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `5_000.0` | Starting USDT balance for the simulation |
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `500` | Max replay candles in debug mode (`None` for full run) |
 | **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `480` | HMM refit cadence used **only** inside `sensitivity.py` (8 h at 1 m → ~90 refits/run vs ~360 at the default, ~4× speedup). `config_parameters.py` defaults and the live system are never affected. |
-| **Sensitivity** | `SENSITIVITY_LOOKBACK` | `"30 days ago UTC"` | Data-fetch window used **only** by `sensitivity.py` (~43,200 rows). Using the full 180-day window per run would make each OAT run 6× slower than `run_backtest.py`. `run_backtest.py` always uses `BACKTEST_LOOKBACK`. |
+| **Sensitivity** | `SENSITIVITY_LOOKBACK` | `"90 days ago UTC"` | Data-fetch window used **only** by `sensitivity.py` (~129,600 rows). Using the full 180-day window per run would make each OAT run 2× slower than `run_backtest.py`. `run_backtest.py` always uses `BACKTEST_LOOKBACK`. |
 | **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise, cutting Viterbi overhead ~5×. `run_backtest.py` always predicts every candle. |
 
 **Imported by:**

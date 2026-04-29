@@ -745,8 +745,8 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 
 | Attribute | Value |
 |---|---|
-| Window | `SENSITIVITY_LOOKBACK = "30 days ago UTC"` (~43,200 rows at 1 m) |
-| Rationale | The live HMM refits every 5 min on the latest 2 h of data. Tuning on 30 days of **recent** data is more appropriate than tuning on 6-month-old conditions. |
+| Window | `SENSITIVITY_LOOKBACK = "90 days ago UTC"` (~129,600 rows at 1 m) |
+| Rationale | The live HMM refits every 5 min on the latest 2 h of data. Tuning on 90 days of **recent** data gives a broader regime sample while still being 2× faster than the full 180-day backtest window. |
 | Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `run_backtest.py` always predicts every candle. |
 | Runtime (OAT, 6 runs) | ~12–30 min on a laptop (after optimisations) |
@@ -815,7 +815,7 @@ signals = run_signals(
     vwap_window=2,                              # overrides VWAP_WINDOW
     refit_every=SENSITIVITY_REFIT_EVERY,        # 480 — 4× fewer refits
     predict_every=SENSITIVITY_PREDICT_EVERY,    # 5 — 5× fewer Viterbi passes
-    lookback=SENSITIVITY_LOOKBACK,              # "30 days ago UTC" — 6× fewer rows
+    lookback=SENSITIVITY_LOOKBACK,              # "90 days ago UTC" — 2× fewer rows
 )
 _, _, stats = simulate_pnl(signals, fee_rate=0.0005)  # overrides BACKTEST_FEE_RATE
 ```
@@ -823,11 +823,11 @@ _, _, stats = simulate_pnl(signals, fee_rate=0.0005)  # overrides BACKTEST_FEE_R
 `simulate_pnl()` already accepted `fee_rate` as a keyword argument before this
 change — no modification was needed there.
 
-**Combined speedup per OAT run (30-day window vs naïve 180-day run):**
+**Combined speedup per OAT run (90-day window vs naïve 180-day run):**
 
 | Optimisation | Constant | Factor |
 |---|---|---|
-| Shorter fetch window | `SENSITIVITY_LOOKBACK = "30 days ago UTC"` | ~6× fewer rows |
+| Shorter fetch window | `SENSITIVITY_LOOKBACK = "90 days ago UTC"` | ~2× fewer rows |
 | Less frequent HMM refit | `SENSITIVITY_REFIT_EVERY = 480` | ~4× fewer full BIC fits |
 | Less frequent Viterbi | `SENSITIVITY_PREDICT_EVERY = 5` | ~5× fewer predict calls |
 | `itertuples()` in P&L loop | — (code change in `pnl.py`) | ~5× faster P&L walk |
@@ -1066,7 +1066,7 @@ concrete file in `backtest/`.
 
 - ✅ **Step 8 — `backtest/sensitivity.py`** — OAT and full-grid sensitivity
   sweep over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and
-  `BACKTEST_FEE_RATE`.  **Use Case A (30-day live-tuning window) implemented.**
+  `BACKTEST_FEE_RATE`.  **Use Case A (90-day live-tuning window) implemented.**
   Run with `python -m backtest.sensitivity` (OAT, default) or
   `python -m backtest.sensitivity --full-grid` (Phase 2, 24 combinations).
   Writes `best_params.json` — loaded via `strategy.param_loader`

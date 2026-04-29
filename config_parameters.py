@@ -129,7 +129,7 @@ SENSITIVITY_REFIT_EVERY = 480
 # IMPORTANT: this is passed as start_str to fetch_klines() inside run_signals()
 # only when called from sensitivity.py.  run_backtest.py always uses
 # BACKTEST_LOOKBACK and is completely unaffected.
-SENSITIVITY_LOOKBACK = "30 days ago UTC"
+SENSITIVITY_LOOKBACK = "90 days ago UTC"
 # How many candles to skip between cheap Viterbi passes (predict_current_regime)
 # in sensitivity.py.  Between two predict calls the last known regime label is
 # reused.  1-min candles → regime changes in ≤5 min are missed, but the
