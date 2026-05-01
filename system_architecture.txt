@@ -746,9 +746,15 @@ FILES
                                     Regime bands drawn with add_vrect per
                                     transition only — O(transitions), not O(rows).
 
-  backtest/sensitivity.py       — Step 8: OAT and full-grid sensitivity sweep
-                                    over HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
-                                    VWAP_WINDOW, BACKTEST_FEE_RATE.
+  backtest/sensitivity.py       — Step 8: Sensitivity analysis (Use Case A).
+                                    DEFAULT mode: Bayesian optimisation via
+                                    Optuna TPE sampler (30 trials).  Also
+                                    supports --oat (8 runs) and deprecated
+                                    --full-grid.
+                                    Tunes HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
+                                    VWAP_WINDOW over a continuous search space
+                                    (_OPTUNA_SPACE).  fee_rate fixed at 0.001
+                                    (not a strategy knob).
                                     Overrides passed as keyword args to
                                     run_signals() / simulate_pnl() — no changes
                                     to config_parameters.py or the live system.
@@ -759,10 +765,24 @@ FILES
                                       SENSITIVITY_LOOKBACK = "90 days ago UTC"
                                                              (~2× fewer rows than 180d)
                                       SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi)
-                                    Combined speedup vs naïve 180-day run:
-                                      ~12–30 min total OAT vs ~66–180 min without.
-                                     Phase 1 (OAT, 8 runs):  python -m backtest.sensitivity --oat
-                                     Phase 2 (54 combos):    python -m backtest.sensitivity
+                                    --lookback flag overrides SENSITIVITY_LOOKBACK
+                                    per run (no config change needed).
+                                    _check_existing_best_params() guard: reads
+                                    best_params.json age/Sharpe/params and
+                                    prompts [y/N] before every run (all modes).
+                                    Bayesian mode:
+                                      Data pre-fetched once; _make_objective()
+                                      factory closure shares it across all trials.
+                                      Study persisted to results/optuna.db
+                                      (load_if_exists=True → auto-resume).
+                                      Optional HTML charts (--save-plots):
+                                        optuna_history_<ts>.html
+                                        optuna_importance_<ts>.html
+                                        optuna_contour_<ts>.html
+                                      ~50–100 min for 30 trials (90-day window).
+                                     Default (Bayes): python -m backtest.sensitivity
+                                     OAT (Phase 1):  python -m backtest.sensitivity --oat
+                                     Full-grid (dep): python -m backtest.sensitivity --full-grid
                                      Writes:
                                        results/sensitivity_<mode>_<ts>.csv
                                        results/best_params.json
@@ -780,6 +800,7 @@ FILES
                                                        passed as kwargs (hmm_lookback_rows,
                                                        hmm_max_regimes, vwap_window, fee_rate);
                                                        falls back to defaults if absent.
+                                       results/optuna.db  ← Bayes mode only (SQLite study)
                                     Use Case B (180-day window) DEFERRED —
                                     ~4–12 h OAT runtime on a laptop.
 

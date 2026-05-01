@@ -137,7 +137,8 @@ import pathlib
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BEST_PARAMS_PATH = pathlib.Path("backtest/results/best_params.json")
+# Fixed — always resolves relative to this file's location (strategy/)
+BEST_PARAMS_PATH = pathlib.Path(__file__).parent.parent / "backtest" / "results" / "best_params.json"
 
 # Maps hmm_lookback_rows (int) → HMM_LOOKBACK dateutil string used by the
 # live system.  Only values tested in sensitivity.py are included.

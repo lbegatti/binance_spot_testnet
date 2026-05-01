@@ -79,7 +79,7 @@ binance_spot_testnet/
 │   ├── pnl.py                         # P&L simulation — balance guard, fill price, equity curve, metrics
 │   ├── runner.py                      # Top-level runner — chains all modules; opt-in plot/CSV export
 │   ├── visualization.py               # Step 7 — interactive Plotly chart (6-panel); run via run_backtest(plot=True)
-│   ├── sensitivity.py                 # Step 8 — OAT / full-grid sensitivity sweep; writes best_params.json
+│   ├── sensitivity.py                 # Step 8 — Bayesian (Optuna TPE, default) / OAT / full-grid sweep; writes best_params.json
 │   ├── regime_validation.py           # Offline long-horizon HMM validation — python -m backtest.regime_validation
 │   └── reporting/                     # Console report formatting and CSV export (AI-authored)
 │       ├── __init__.py
@@ -749,7 +749,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands (Panel 3 rebuild: `_REGIME_NUMERIC` step-line + confidence ×3 scaling), VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
-| `backtest/sensitivity.py` | ✅ done (Use Case A) | OAT sweep (8 runs) and full-grid (54 combinations, 3×2×3×3) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `BACKTEST_FEE_RATE`. Writes `best_params.json` — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
+| `backtest/sensitivity.py` | ✅ done (Use Case A) | **Bayesian optimisation via Optuna TPE (default, 30 trials)**, OAT sweep (`--oat`, 8 runs), and deprecated full-grid (`--full-grid`) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`. `fee_rate` fixed at `BACKTEST_FEE_RATE`. `--lookback` flag overrides `SENSITIVITY_LOOKBACK` per run. `_check_existing_best_params()` guard prompts `[y/N]` before overwriting. Writes `best_params.json` and `optuna.db` (Bayes) — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
 
 > **Parameter Flow**
 > ```
@@ -760,6 +760,72 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 > Both consumers fall back silently to `config_parameters.py` defaults if
 > `best_params.json` is absent.  Do **not** commit `best_params.json` to git
 > (add `backtest/results/best_params.json` to `.gitignore`).
+
+---
+
+### Bayesian Parameter Optimisation (Optuna)
+
+`backtest/sensitivity.py` uses the **Optuna TPE (Tree-structured Parzen
+Estimator)** sampler to find the parameter combination that maximises the
+Sharpe ratio over the `SENSITIVITY_LOOKBACK` window (default: 90 days).
+
+**Why Bayesian, not full-grid?**
+
+| Approach | Combinations / Trials | Typical wall time | Search space |
+|---|---|---|---|
+| Full-grid (deprecated) | ~54 fixed combos | ~95–245 min | Discrete, narrow |
+| OAT sweep | 8 runs | ~12–30 min | One param at a time |
+| **Bayesian / Optuna (default)** | **30 trials (configurable)** | **~50–100 min** | **Continuous, wider** |
+
+The TPE sampler builds a probabilistic surrogate of the objective (Sharpe ratio)
+and focuses new trials in regions where it predicts high reward — equivalent to
+guided grid search but far more efficient in high-dimensional spaces.
+
+**Search space (`_OPTUNA_SPACE`):**
+
+| Parameter | Low | High | Step |
+|---|---|---|---|
+| `hmm_lookback_rows` | 30 | 240 | 10 |
+| `hmm_max_regimes` | 2 | 4 | 1 |
+| `vwap_window` | 2 | 15 | 1 |
+
+`fee_rate` is always fixed at `BACKTEST_FEE_RATE = 0.001` — it is a fixed
+exchange cost, not a strategy knob.
+
+**Key design details:**
+
+- Data pre-fetched **once** before the study; shared across all trials via a
+  `_make_objective(prefetched_df)` factory closure — no redundant Binance API
+  calls during the study.
+- Study persisted to `backtest/results/optuna.db` (`load_if_exists=True`) —
+  an interrupted run **resumes automatically** from the last completed trial.
+- `_check_existing_best_params()` guard inspects any existing `best_params.json`
+  (age, Sharpe, params) before every run and prompts `[y/N]` for confirmation.
+- `--lookback "180 days ago UTC"` overrides `SENSITIVITY_LOOKBACK` for a
+  single deep-calibration run without touching `config_parameters.py`.
+
+**Running the sensitivity analysis:**
+
+```bash
+# Bayesian (default) — 30 Optuna trials, ~50–100 min
+python -m backtest.sensitivity
+
+# Bayesian with custom trial count and diagnostic charts
+python -m backtest.sensitivity --bayes --n-trials 50 --save-plots
+
+# Deep-calibration run with a 180-day window
+python -m backtest.sensitivity --lookback "180 days ago UTC"
+
+# OAT sweep (Phase 1, quick sanity check)
+python -m backtest.sensitivity --oat
+
+# Full-grid (deprecated — prefer --bayes)
+python -m backtest.sensitivity --full-grid
+```
+
+> For a full description of all execution modes, the `_OPTUNA_SPACE` definition,
+> the `_check_existing_best_params()` guard logic, optional Plotly charts, and
+> step-by-step implementation notes, see **[BACKTESTING.md — Step 8](BACKTESTING.md#step-8--sensitivity-analysis)**.
 
 **Running the backtest:**
 
@@ -1027,5 +1093,5 @@ effectively instantaneous.
 
 ---
 
-*Document last updated: 2026-04-25*
+*Document last updated: 2026-05-01*
 
