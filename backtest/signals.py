@@ -141,21 +141,25 @@ def run_signals(
         updated using the cheap Viterbi path, with a full BIC re-fit every
         ``REFIT_EVERY`` iterations — identical cadence to the live system.
 
-    **Flow C — VWAP momentum filter** (mirrors ``historical_analysis`` VWAP):
+    **Flow C — VWAP dip/strength filter** (mirrors ``historical_analysis`` VWAP):
         A rolling ``deque(maxlen=VWAP_WINDOW)`` accumulates best-bid/ask
         prices and volumes from the synthetic book.  ``bid_vwap`` and
         ``ask_vwap`` are computed once the window is full; ``None`` before
-        that (filter is transparent, same as live).
+        that (filter is transparent, same as live).  Both gate conditions use
+        ``bid_vwap`` exclusively (mean-reversion strategy); ``ask_vwap`` is
+        retained in the output record for diagnostics only.
 
     **Combined gate** (mirrors the live ``low_latency_analysis`` decision):
         * ``signal = +1`` (BUY)  when ``best_buy`` exists **and**
           ``regime_confidence ≥ HMM_MIN_CONFIDENCE`` (model is certain enough)
           **and** regime ∉ {``trending_down``, ``high_volatility``}
-          **and** (``ask_vwap`` is ``None`` or ``micro_price > ask_vwap``).
+          **and** (``bid_vwap`` is ``None`` or ``micro_price < bid_vwap``)
+          (dip confirmed — price is below the historical bid average).
         * ``signal = -1`` (SELL) when ``best_sell`` exists **and**
           ``regime_confidence ≥ HMM_MIN_CONFIDENCE``
           **and** regime ∉ {``trending_up``, ``high_volatility``}
-          **and** (``bid_vwap`` is ``None`` or ``micro_price < bid_vwap``).
+          **and** (``bid_vwap`` is ``None`` or ``micro_price >= bid_vwap``)
+          (strength confirmed — price is at or above the historical bid average).
         * ``signal = 0``  otherwise (no trade).
 
     Returns:
@@ -362,16 +366,23 @@ def run_signals(
         )
 
         # Combined gate (mirrors live low_latency_analysis)
+        # VWAP strategy: mean-reversion / dip-and-strength confirmation.
+        #   BUY  → only when price has dipped BELOW the historical bid average
+        #          (bid_vwap is None or micro_price < bid_vwap).
+        #   SELL → only when price is AT or ABOVE the historical bid average
+        #          (bid_vwap is None or micro_price >= bid_vwap).
+        # Both sides use bid_vwap; ask_vwap is retained in the record for
+        # diagnostics but is no longer used by the gate logic.
         if confidence_ok:
-            if best_buy:
+            if best_buy and best_buy_micro is not None:
                 regime_ok = regime not in ("trending_down", "high_volatility")
-                vwap_ok = ask_vwap is None or best_buy_micro > ask_vwap
+                vwap_ok = bid_vwap is None or best_buy_micro < bid_vwap
                 if regime_ok and vwap_ok:
                     signal = 1
 
-            if best_sell and signal == 0:
+            if best_sell and best_sell_micro is not None and signal == 0:
                 regime_ok = regime not in ("trending_up", "high_volatility")
-                vwap_ok = bid_vwap is None or best_sell_micro < bid_vwap
+                vwap_ok = bid_vwap is None or best_sell_micro >= bid_vwap
                 if regime_ok and vwap_ok:
                     signal = -1
 

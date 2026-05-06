@@ -21,10 +21,10 @@ Three execution modes
 
   OAT sweep (Phase 1 — quick sanity check):
       Holds all parameters at their defaults and varies ONE parameter at a time.
-      8 runs total (1 baseline + 7 non-default).  Use this first to confirm the
+      9 runs total (1 baseline + 8 non-default).  Use this first to confirm the
       pipeline runs cleanly and to spot obviously sensitive parameters.
-      Typical wall time: ~14–36 min on a laptop (90-day window).
-        ↳ klines fetched ONCE (~30–90 s) then shared across all 8 runs.
+      Typical wall time: ~16–40 min on a laptop (90-day window).
+        ↳ klines fetched ONCE (~30–90 s) then shared across all 9 runs.
       Run with:  python -m backtest.sensitivity --oat
 
   Full factorial grid (DEPRECATED — Phase 2 legacy):
@@ -48,9 +48,11 @@ Use Case A vs Use Case B
 Output
 ------
   Console: sorted summary table (one row per combination).
-  File:    backtest/results/sensitivity_<timestamp>.csv  (all metrics, all runs).
-  File:    backtest/results/best_params.json             (winning parameter set).
+  File:    backtest/reporting/sensitivity_<timestamp>.csv  (all metrics, all runs).
+  File:    backtest/reporting/optuna_*.html                (Optuna diagnostic charts).
+  File:    backtest/results/best_params.json               (winning parameter set).
            Loaded by websocket_main.py at startup via _load_best_params().
+  File:    backtest/results/optuna.db                      (Optuna study state — resumable).
 
 Notes
 -----
@@ -76,7 +78,12 @@ import optuna
 import pandas as pd
 
 from backtest.data import fetch_klines
-from backtest.pnl import simulate_pnl
+from backtest.pnl import compute_buy_and_hold, simulate_pnl
+from backtest.reporting.formatters import (
+    print_bnh_comparison,
+    print_oat_sensitivity_report,
+    print_sensitivity_table,
+)
 from backtest.signals import _add_hmm_features, run_signals
 from config_parameters import (
     SENSITIVITY_REFIT_EVERY,
@@ -90,10 +97,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Results directory
+# Directories
 # ---------------------------------------------------------------------------
+# _RESULTS_DIR  — machine-readable artefacts consumed by the live system and
+#                 Optuna (best_params.json, optuna.db).  NOT for human reports.
+# _REPORTING_DIR — human-readable summaries: sensitivity CSVs and Optuna HTML
+#                  charts.  Lives under backtest/reporting/ alongside formatters.py.
 _RESULTS_DIR = pathlib.Path(__file__).parent / "results"
 _RESULTS_DIR.mkdir(exist_ok=True)
+
+_REPORTING_DIR = pathlib.Path(__file__).parent / "reporting"
+_REPORTING_DIR.mkdir(exist_ok=True)
 
 _BEST_PARAMS_PATH = _RESULTS_DIR / "best_params.json"
 
@@ -107,14 +121,19 @@ _PARAM_GRID: dict[str, list[Any]] = {
     "hmm_lookback_rows": [120, 60, 30],  # default 120 (2h)
     "hmm_max_regimes": [3, 2],  # default=3;   test 2
     "vwap_window": [5, 2, 3],  # default=5 min; test 2 min
-    "fee_rate": [0.0005, 0.00025],  # default=0.05 %; 0.025%
+    "fee_rate": [0.0005, 0.00025],  # default=0.05 % (BNB discount); 0.025 % (VIP tier)
 }
 
 _OPTUNA_SPACE: dict[str, tuple] = {
     "hmm_lookback_rows": ("int", 30, 240, 10),
-    "hmm_max_regimes":   ("int",  2,   4,  1),
-    "vwap_window":       ("int",  2,  15,  1),
+    "hmm_max_regimes": ("int", 2, 4, 1),
+    "vwap_window": ("int", 2, 15, 1),
 }
+
+# Fixed fee rate used for all Bayes trials.
+# 0.001 = 0.1 % — standard Binance spot taker fee (no BNB discount).
+# Set to 0.0 temporarily for fee-free diagnostic runs.
+_BAYES_FEE_RATE: float = 0.001
 
 # Metric used to rank combinations and select best_params.json.
 _RANK_METRIC = "sharpe_ratio"
@@ -186,7 +205,7 @@ def _check_existing_best_params(mode: str, extra_note: str = "") -> bool:
     print()
 
     try:
-        answer = input("  Continue? [y/N]: ").strip().lower()
+        answer = input("  Continue? [y/N]: \n").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("\n  Non-interactive environment detected — aborting.")
         return False
@@ -213,7 +232,7 @@ def _build_oat_grid() -> list[dict[str, Any]]:
       - Runs 1–N: each non-default value for one parameter while all others
                   remain at their default.
 
-    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 1 + 2 + 2 = 8 runs.
+    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 1 + 2 + 1 = 7 runs.
     """
     defaults = {k: v[0] for k, v in _PARAM_GRID.items()}
     grid: list[dict[str, Any]] = [defaults.copy()]  # run 0: baseline
@@ -261,7 +280,7 @@ def _make_objective(prefetched_df: pd.DataFrame):
         params: dict[str, Any] = {}
         for name, (_, low, high, step) in _OPTUNA_SPACE.items():
             params[name] = trial.suggest_int(name=name, low=low, high=high, step=step)
-        params["fee_rate"] = 0.001  # fixed — not a strategy knob
+        params["fee_rate"] = _BAYES_FEE_RATE  # fixed for this study
         log.info("Trial %d starting: %s", trial.number, params)
         try:
             result = _run_one(params, prefetched_df)
@@ -281,10 +300,37 @@ def _make_objective(prefetched_df: pd.DataFrame):
     return objective
 
 
+def _compute_bnh(prefetched_df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Compute the buy-and-hold benchmark exactly once for a fixed price window.
+
+    Parameters
+    ----------
+    prefetched_df : pd.DataFrame
+        Feature-enriched klines DataFrame (output of ``_add_hmm_features``).
+        The ``close`` column is used for entry/exit prices.
+
+    Returns
+    -------
+    dict
+        Keys: ``bnh_entry_price``, ``bnh_exit_price``, ``bnh_btc_held``,
+        ``bnh_final_equity_usdt``, ``bnh_total_return_pct``.
+    """
+    bnh = compute_buy_and_hold(prefetched_df)
+    log.info(
+        "Buy-and-hold benchmark: entry=%.2f  exit=%.2f  return=%.2f%%",
+        bnh["bnh_entry_price"],
+        bnh["bnh_exit_price"],
+        bnh["bnh_total_return_pct"],
+    )
+    return bnh
+
+
 def _save_optuna_plots(study: optuna.Study) -> None:
     """
     Save the three standard Optuna diagnostic charts as self-contained HTML
-    files to ``backtest/results/``.
+    files to ``backtest/results/``.  Called automatically after every Bayesian
+    study completes.
 
     Charts produced
     ---------------
@@ -319,7 +365,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 1. Optimisation history — always available after ≥ 1 trial
     try:
         fig = plot_optimization_history(study)
-        path = _RESULTS_DIR / f"optuna_history_{ts}.html"
+        path = _REPORTING_DIR / f"optuna_history_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna history chart → %s", path)
     except Exception as exc:
@@ -335,7 +381,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 2. Parameter importance
     try:
         fig = plot_param_importances(study)
-        path = _RESULTS_DIR / f"optuna_importance_{ts}.html"
+        path = _REPORTING_DIR / f"optuna_importance_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna importance chart → %s", path)
     except Exception as exc:
@@ -344,7 +390,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 3. Contour — hmm_lookback_rows × vwap_window (the two continuous knobs)
     try:
         fig = plot_contour(study, params=["hmm_lookback_rows", "vwap_window"])
-        path = _RESULTS_DIR / f"optuna_contour_{ts}.html"
+        path = _REPORTING_DIR / f"optuna_contour_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna contour chart → %s", path)
     except Exception as exc:
@@ -352,9 +398,8 @@ def _save_optuna_plots(study: optuna.Study) -> None:
 
 
 def _run_sensitivity_optuna_study(
-    n_trials: int = 30,
-    save_plots: bool = False,
-    lookback: str | None = None,
+        n_trials: int = 30,
+        lookback: str | None = None,
 ) -> pd.DataFrame:
     """
     Run the Bayesian sensitivity study using Optuna TPE and return results.
@@ -368,11 +413,6 @@ def _run_sensitivity_optuna_study(
         Number of Optuna trials to run.  Each trial calls ``_run_one()`` once.
         Convergence is typically stable above 25 trials for 3 parameters.
         Default 30 (~50–100 min on a laptop with the 90-day window).
-    save_plots : bool
-        If ``True``, save the three Optuna diagnostic HTML charts to
-        ``backtest/results/`` after ``study.optimize()`` completes (Step 7).
-        Charts: optimisation history, parameter importance, contour.
-        Default ``False`` (opt-in via ``--save-plots`` CLI flag).
     lookback : str | None
         dateutil string overriding ``SENSITIVITY_LOOKBACK`` for this run only.
         Example: ``"180 days ago UTC"`` for a deep-calibration run.
@@ -386,7 +426,8 @@ def _run_sensitivity_optuna_study(
         ``hmm_lookback_rows``, ``hmm_max_regimes``, ``vwap_window``,
         ``fee_rate``, ``sharpe_ratio``.
         Sorted by ``sharpe_ratio`` descending.  Persisted to
-        ``sensitivity_bayes_<ts>.csv`` and ``best_params.json``.
+        ``backtest/reporting/sensitivity_bayes_<ts>.csv`` and
+        ``backtest/results/best_params.json``.
 
     Notes
     -----
@@ -405,8 +446,8 @@ def _run_sensitivity_optuna_study(
     # trials on top rather than restarting, but it still commits hours of
     # compute and may overwrite best_params.json with a new best.
     if not _check_existing_best_params(
-        mode=f"bayes (adding {n_trials} more Optuna trials)",
-        extra_note="The study resumes — prior trials are kept and result can only improve.",
+            mode=f"bayes (adding {n_trials} more Optuna trials)",
+            extra_note="The study resumes — prior trials are kept and result can only improve.",
     ):
         return pd.DataFrame()
 
@@ -425,6 +466,9 @@ def _run_sensitivity_optuna_study(
         len(prefetched_df),
         n_trials,
     )
+
+    # ── Buy-and-hold benchmark — computed ONCE (price window is fixed) ────
+    bnh = _compute_bnh(prefetched_df)
 
     # ── Create / resume study ─────────────────────────────────────────────
     # Absolute path so the DB resolves regardless of CWD.
@@ -453,21 +497,16 @@ def _run_sensitivity_optuna_study(
         show_progress_bar=True,
     )
 
-    # ── Step 7: optional diagnostic charts ───────────────────────────────
-    if save_plots:
-        _save_optuna_plots(study)
-    else:
-        log.info(
-            "Step 7 charts skipped (pass --save-plots to generate them)."
-        )
+    # ── Step 7: diagnostic charts (always saved) ─────────────────────────
+    _save_optuna_plots(study)
 
     # ── Convert completed trials → DataFrame ─────────────────────────────
     rows = []
     for t in study.trials:
         if t.state == optuna.trial.TrialState.COMPLETE:
             rows.append({
-                **t.params,          # hmm_lookback_rows, hmm_max_regimes, vwap_window
-                "fee_rate": 0.001,   # fixed — not sampled by Optuna
+                **t.params,  # hmm_lookback_rows, hmm_max_regimes, vwap_window
+                "fee_rate": _BAYES_FEE_RATE,  # fixed — not sampled by Optuna
                 _RANK_METRIC: t.value,
             })
 
@@ -481,6 +520,11 @@ def _run_sensitivity_optuna_study(
         .reset_index(drop=True)
     )
 
+    # Broadcast the B&H benchmark columns onto every row — same value for all
+    # trials since the price window is identical across the whole study.
+    for k, v in bnh.items():
+        results_df[k] = v
+
     log.info(
         "Best trial: %s = %.4f  (params: %s)",
         _RANK_METRIC,
@@ -489,20 +533,36 @@ def _run_sensitivity_optuna_study(
     )
 
     # ── Reuse shared helpers ──────────────────────────────────────────────
-    _print_table(results_df, mode="bayes")
+    print_sensitivity_table(results_df, mode="bayes", param_grid=_PARAM_GRID, display_cols=_DISPLAY_COLS,
+                            rank_metric=_RANK_METRIC)
     _save_results(results_df, mode="bayes")
 
     valid = results_df[results_df[_RANK_METRIC].notna()]
     if not valid.empty:
         _save_best_params(valid.iloc[0])
+        # Optuna only stores Sharpe per trial — re-run the best params once to
+        # retrieve the full stats (including total_return_pct) for the B&H box.
+        log.info(
+            "Re-running best trial params to compute full stats for B&H comparison…"
+        )
+        try:
+            best_full = _run_one(
+                {**study.best_params, "fee_rate": _BAYES_FEE_RATE},
+                prefetched_df,
+            )
+            best_series = pd.Series({**best_full, **bnh})
+        except Exception:
+            log.warning(
+                "Could not re-run best trial — falling back to trial row "
+                "(B&H comparison may be skipped).",
+                exc_info=True,
+            )
+            best_series = valid.iloc[0]
+        print_bnh_comparison(best_series)
     else:
         log.warning("No valid Optuna trials to save as best_params.json.")
 
     return results_df
-
-
-# ---------------------------------------------------------------------------
-# Single-run executor
 # ---------------------------------------------------------------------------
 
 
@@ -561,6 +621,8 @@ _DISPLAY_COLS = [
     "vwap_window",
     "fee_rate",
     "total_return_pct",
+    "bnh_total_return_pct",  # passive buy-and-hold benchmark
+    "strategy_vs_bnh_pct",  # total_return_pct − bnh_total_return_pct (derived)
     "max_drawdown_pct",
     "sharpe_ratio",
     "sortino_ratio",
@@ -571,75 +633,15 @@ _DISPLAY_COLS = [
 ]
 
 
-def _print_table(results_df: pd.DataFrame, mode: str) -> None:
-    """Print a formatted summary table to the console."""
-    n = len(results_df)
-    print()
-    print("═" * 100)
-    print(f"  SENSITIVITY ANALYSIS — BTCUSDT  ({mode}, {n} combinations)")
-    print("═" * 100)
-
-    # Mark default row — bayes DF may not contain all _DISPLAY_COLS (only
-    # Sharpe is stored per trial; other metrics are absent).  Show only the
-    # columns that actually exist so _print_table works for all three modes.
-    defaults = {k: v[0] for k, v in _PARAM_GRID.items()}
-    available_cols = [c for c in _DISPLAY_COLS if c in results_df.columns]
-    display = results_df[available_cols].copy()
-    display.insert(0, "note", "")
-    for idx, row in display.iterrows():
-        is_default = all(
-            row[k] == defaults[k]
-            for k in ("hmm_lookback_rows", "hmm_max_regimes", "vwap_window", "fee_rate")
-        )
-        display.at[idx, "note"] = "← baseline" if is_default else ""
-
-    print(display.to_string(index=False, float_format="{:.3f}".format))
-    print("═" * 100)
-    print()
-
-
-def _oat_sensitivity_report(results_df: pd.DataFrame, baseline_sharpe: float) -> bool:
-    """
-    Print per-parameter sensitivity vs the baseline Sharpe.
-
-    Returns True if any parameter breaches the threshold (triggers Phase 2).
-    """
-    defaults = {k: v[0] for k, v in _PARAM_GRID.items()}
-    trigger_phase2 = False
-
-    print(
-        "── OAT Sensitivity Report (vs baseline Sharpe = {:.3f}) ──".format(
-            baseline_sharpe
-        )
-    )
-    for param in _PARAM_GRID.keys():
-        non_default = results_df[results_df[param] != defaults[param]]
-        for _, row in non_default.iterrows():
-            delta = row[_RANK_METRIC] - baseline_sharpe
-            flag = (
-                "  ⚠️  |ΔSharpe| > 0.5 — consider running --bayes!"
-                if abs(delta) > _OAT_SENSITIVITY_THRESHOLD
-                else ""
-            )
-            print(
-                f"  {param}={row[param]!r:>6}  →  Sharpe={row[_RANK_METRIC]:.3f}"
-                f"  ΔSharpe={delta:+.3f}{flag}"
-            )
-            if abs(delta) > _OAT_SENSITIVITY_THRESHOLD:
-                trigger_phase2 = True
-    print()
-    return trigger_phase2
-
-
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
 
 def _save_results(results_df: pd.DataFrame, mode: str) -> pathlib.Path:
-    """Write all results to a timestamped CSV file."""
+    """Write all results to a timestamped CSV file under backtest/reporting/."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    csv_path = _RESULTS_DIR / f"sensitivity_{mode}_{ts}.csv"
+    csv_path = _REPORTING_DIR / f"sensitivity_{mode}_{ts}.csv"
     results_df.to_csv(csv_path, index=False)
     log.info("Results saved → %s", csv_path)
     return csv_path
@@ -735,6 +737,9 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
         len(grid),
     )
 
+    # ── Buy-and-hold benchmark — computed ONCE (price window is fixed) ────
+    bnh = _compute_bnh(prefetched_df)
+
     all_results: list[dict[str, Any]] = []
     for i, params in enumerate(grid, 1):
         log.info("── Run %d / %d ──", i, len(grid))
@@ -761,7 +766,13 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
         _RANK_METRIC, ascending=False, na_position="last"
     )
 
-    _print_table(results_df, mode)
+    # Broadcast the B&H benchmark columns onto every row — same value for all
+    # runs since the price window is identical across the whole sweep.
+    for k, v in bnh.items():
+        results_df[k] = v
+
+    print_sensitivity_table(results_df, mode=mode, param_grid=_PARAM_GRID, display_cols=_DISPLAY_COLS,
+                            rank_metric=_RANK_METRIC)
 
     if not full_grid:
         # OAT: compute per-parameter sensitivity vs baseline
@@ -774,7 +785,13 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
             ]
         if not baseline_rows.empty:
             baseline_sharpe = float(baseline_rows.iloc[0][_RANK_METRIC])
-            trigger = _oat_sensitivity_report(results_df, baseline_sharpe)
+            trigger = print_oat_sensitivity_report(
+                results_df,
+                baseline_sharpe=baseline_sharpe,
+                param_grid=_PARAM_GRID,
+                rank_metric=_RANK_METRIC,
+                sensitivity_threshold=_OAT_SENSITIVITY_THRESHOLD,
+            )
             if trigger:
                 log.warning(
                     "At least one parameter exceeds the |ΔSharpe| > %.1f threshold. "
@@ -788,6 +805,7 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
     valid = results_df[results_df[_RANK_METRIC].notna()]
     if not valid.empty:
         _save_best_params(valid.iloc[0])
+        print_bnh_comparison(valid.iloc[0])
     else:
         log.warning("No valid results to save as best_params.json.")
 
@@ -803,8 +821,9 @@ if __name__ == "__main__":
         description=(
             "Sensitivity analysis for the BTCUSDT backtesting pipeline.\n\n"
             "DEFAULT (no flags): Bayesian optimisation via Optuna — 30 trials.\n"
-            "  Typical wall time: ~50–100 min (klines fetched once, shared across all trials).\n\n"
-            "--oat        Phase 1 OAT sweep (8 combinations, ~14–36 min).\n"
+            "  Typical wall time: ~50–100 min (klines fetched once, shared across all trials).\n"
+            "  Optuna diagnostic charts are always saved to backtest/results/.\n\n"
+            "--oat        Phase 1 OAT sweep (7 combinations, ~14–35 min).\n"
             "--full-grid  Deprecated full factorial grid (54 combinations, ~95–245 min).\n"
             "--bayes      Explicit Bayesian search (same as default, accepts --n-trials).\n\n"
             "NOTE — Use Case B (180-day window) is DEFERRED due to runtime:\n"
@@ -816,7 +835,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--oat",
         action="store_true",
-        help="Run the OAT sweep (Phase 1, 8 combinations, ~14–36 min).",
+        help="Run the OAT sweep (Phase 1, 7 combinations, ~14–35 min).",
     )
     parser.add_argument(
         "--full-grid",
@@ -836,16 +855,6 @@ if __name__ == "__main__":
         type=int,
         default=30,
         help="Number of Optuna trials for --bayes (default: 30).",
-    )
-    parser.add_argument(
-        "--save-plots",
-        action="store_true",
-        help=(
-            "After --bayes completes, save three Optuna diagnostic HTML charts "
-            "to backtest/results/: optimisation history, parameter importance, "
-            "and hmm_lookback_rows × vwap_window contour. "
-            "Requires plotly (pip install plotly)."
-        ),
     )
     parser.add_argument(
         "--lookback",
@@ -872,6 +881,5 @@ if __name__ == "__main__":
         # Default path: --bayes or no flag at all → Bayesian optimisation
         _run_sensitivity_optuna_study(
             n_trials=args.n_trials,
-            save_plots=args.save_plots,
             lookback=args.lookback,
         )

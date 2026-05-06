@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-04-25)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-05-05)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -63,11 +63,17 @@ FILES
     # HMM regime detection
     HMM_FEATURE_COLS     = ["return","volatility","obi_proxy","trade_density"]
     HMM_N_ITERATIONS     = 1000   # max EM iterations per model fit
-    HMM_MAX_REGIMES      = 4      # upper bound on hidden states (BIC search: 2…4)
+    HMM_MAX_REGIMES      = len(HMM_FEATURE_COLS) - 1  # = 3; upper bound on hidden states
+                                  # (BIC search: 2…3 states); capped at n_features-1 to
+                                  # avoid under-populated states with only 4 features
     HMM_RANDOM_STATE     = 46     # seed for reproducible HMM initialisation
     HMM_INTERVAL         = KLINE_INTERVAL_1MINUTE  # kline granularity (1 m)
     HMM_LOOKBACK         = "2 hours ago UTC"        # ~120 rows at 1 m
-    HMM_MIN_COVAR        = 1e-3   # regularisation floor for covariance matrices
+    HMM_MIN_COVAR        = 1e-1   # regularisation floor for covariance matrices
+                                  # (1e-1 recommended safe default for z-scored financial features)
+    HMM_N_INIT           = 10     # random-seed restarts per candidate n_components value
+                                  # inside select_hmm_model(); reduces degenerate EM solutions
+                                  # (e.g. transmat row summing to 0) on flat/low-variance windows
     HMM_TRAIN_ROWS       = 80     # in-sample rows for fit(); remaining ~40 rows are out-of-sample
                                   # scaler is fit_transform'd on [:HMM_TRAIN_ROWS], transform'd on full window
     HMM_MIN_CONFIDENCE   = 0.70  # min posterior probability (predict_proba) to allow an order;
@@ -81,7 +87,7 @@ FILES
     HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
     VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
     REFIT_EVERY          = 120    # iterations between full HMM BIC re-fits (live: every 2 h; backtest: ~1,080 refits over 180 days)
-    BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 5000 for fast debug)
+    BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 500 for fast debug)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
     BACKTEST_INITIAL_BTC     = 0.0735    # starting BTC balance (set > 0 to simulate existing position)
@@ -210,19 +216,25 @@ FILES
       • Scores candidates (70 % depth / 30 % delta) and picks the best
         opportunity for buy and sell sides.
         Opportunity tuple: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq).
-      • VWAP FILTER (momentum confirmation) — reads _bid_vwap / _ask_vwap under _vwap_lock:
-          BUY:  execute only if _ask_vwap is None OR micro_price > ask_vwap.
-                Interpretation: upward momentum — current price exceeds
-                the historical avg cost to buy.
-                Skip with log if micro_price ≤ ask_vwap.
-          SELL: execute only if _bid_vwap is None OR micro_price < bid_vwap.
-                Interpretation: downward momentum — current price is below
-                the historical avg bid.
-                Skip with log if micro_price ≥ bid_vwap.
+      • VWAP FILTER (mean-reversion / dip-and-strength confirmation) — reads _bid_vwap
+        (and _ask_vwap, retained for diagnostics) under _vwap_lock:
+          BUY:  execute only if _bid_vwap is None OR micro_price < bid_vwap.
+                Interpretation: genuine dip — current price has fallen BELOW
+                the historical avg bid, confirming a buy-the-dip signal.
+                Skip with log if micro_price >= bid_vwap (price at/above average
+                — not a genuine dip).
+          SELL: execute only if _bid_vwap is None OR micro_price >= bid_vwap.
+                Interpretation: genuine strength — current price is AT or ABOVE
+                the historical avg bid, confirming a sell-into-strength signal.
+                Skip with log if micro_price < bid_vwap (price below average
+                — not genuine strength to sell into).
+        Both comparisons use _bid_vwap; _ask_vwap is still computed and stored
+        in state but is not used by the gate logic (retained for diagnostics).
         During the first ~1 min (before historical_analysis runs) both VWAPs
-        are None, so the filter is transparent and orders execute as before.
-        NOTE: This logic may be inverted in the future to implement a
-        buy-the-dip / mean-reversion strategy instead.
+        are None, so the filter is transparent and orders execute solely on
+        regime + score.
+        NOTE: To switch back to a momentum strategy, reverse the conditions:
+          BUY if micro_price > ask_vwap; SELL if micro_price < bid_vwap.
       • REGIME FILTER (two sequential gates) — reads regime_label AND
         regime_confidence under _regime_lock:
 
@@ -345,7 +357,7 @@ FILES
     self.current_regime = regimes[-1]  (last candle — genuinely out-of-sample)
 
   MODEL SELECTION (BIC):
-    GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (4) states.
+    GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (3) states.
     Best model selected by lowest BIC = -2 ln L̂ + k ln N  (N = HMM_TRAIN_ROWS).
     current_regime set to state index of the last candle.
 
@@ -580,7 +592,7 @@ FILES
              / _select_best_opportunity delegate to)
     Flow B — Regime filter        : rolling 120-candle kline window →
              RegimeDirector (HMM)
-    Flow C — VWAP momentum filter : rolling 5-candle best-bid/ask → VWAP
+    Flow C — VWAP dip/strength filter : rolling 5-candle best-bid/ask → bid_vwap
 
   backtest/signals.py             — run_signals(): orchestrates all three flows
                                     per candle, applies the combined gate
@@ -747,17 +759,18 @@ FILES
                                     transition only — O(transitions), not O(rows).
 
   backtest/sensitivity.py       — Step 8: Sensitivity analysis (Use Case A).
-                                    DEFAULT mode: Bayesian optimisation via
-                                    Optuna TPE sampler (30 trials).  Also
-                                    supports --oat (8 runs) and deprecated
-                                    --full-grid.
-                                    Tunes HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
-                                    VWAP_WINDOW over a continuous search space
-                                    (_OPTUNA_SPACE).  fee_rate fixed at 0.001
-                                    (not a strategy knob).
-                                    Overrides passed as keyword args to
-                                    run_signals() / simulate_pnl() — no changes
-                                    to config_parameters.py or the live system.
+                                     DEFAULT mode: Bayesian optimisation via
+                                     Optuna TPE sampler (30 trials).  Also
+                                     supports --oat (7 runs) and deprecated
+                                     --full-grid (36 combos).
+                                     Tunes HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
+                                     VWAP_WINDOW over a continuous search space
+                                     (_OPTUNA_SPACE).  fee_rate fixed at 0.001
+                                     in Bayesian mode (not a strategy knob);
+                                     OAT/full-grid test [0.0005, 0.00025].
+                                     Overrides passed as keyword args to
+                                     run_signals() / simulate_pnl() — no changes
+                                     to config_parameters.py or the live system.
                                     Three sensitivity-only speed-up constants
                                     (all in config_parameters.py, no effect on
                                     run_backtest.py or the live system):

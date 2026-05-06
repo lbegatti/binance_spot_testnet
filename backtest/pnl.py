@@ -58,16 +58,107 @@ from config_parameters import (
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Buy-and-hold benchmark
+# ---------------------------------------------------------------------------
+
+
+def compute_buy_and_hold(
+        signals: pd.DataFrame,
+        initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
+        fee_rate: float = BACKTEST_FEE_RATE,
+) -> dict[str, Any]:
+    """
+    Compute the passive buy-and-hold return over the same window as the
+    backtest, using the first non-NaN close as the entry price.
+
+    This benchmark answers:
+        "Would simply holding BTC for the full window have been better
+         or worse than the active strategy?"
+
+    Assumptions
+    -----------
+    * Full ``initial_usdt`` capital is deployed at bar 0 (first non-NaN close).
+    * A single **entry fee** (``fee_rate × gross_buy``) is charged — you would
+      still pay a taker fee to acquire the BTC.
+    * No exit fee is applied — the position is held to session end without
+      selling.
+    * Entry price = first non-NaN ``close`` in ``signals`` (safe against HMM
+      warm-up NaN rows at the start of the window).
+
+    Parameters
+    ----------
+    signals : pd.DataFrame
+        Output of ``backtest.signals.run_signals()``.  Must contain a
+        ``close`` column.
+    initial_usdt : float
+        Starting capital in USDT.  Defaults to ``BACKTEST_INITIAL_CAPITAL``.
+    fee_rate : float
+        Taker fee fraction applied once at entry.  Defaults to
+        ``BACKTEST_FEE_RATE``.
+
+    Returns
+    -------
+    dict with keys:
+        ``bnh_entry_price``      — close at bar 0 (first non-NaN).
+        ``bnh_exit_price``       — close at last bar.
+        ``bnh_btc_held``         — BTC quantity purchased at entry.
+        ``bnh_final_equity_usdt``— final value of the held BTC in USDT.
+        ``bnh_total_return_pct`` — net return (%), after deducting entry fee.
+    """
+    close_series = signals["close"].dropna()
+    if close_series.empty:
+        log.warning("compute_buy_and_hold: no valid close prices — returning NaN.")
+        return {
+            "bnh_entry_price": float("nan"),
+            "bnh_exit_price": float("nan"),
+            "bnh_btc_held": float("nan"),
+            "bnh_final_equity_usdt": float("nan"),
+            "bnh_total_return_pct": float("nan"),
+        }
+
+    entry_price = float(close_series.iloc[0])
+    exit_price = float(signals["close"].dropna().iloc[-1])
+
+    # Gross BTC purchased; fee reduces effective quantity
+    gross_btc = initial_usdt / entry_price
+    entry_fee = initial_usdt * fee_rate  # fee in USDT at entry
+    net_usdt_deployed = initial_usdt - entry_fee  # USDT remaining after fee
+    btc_held = net_usdt_deployed / entry_price  # actual BTC held
+
+    final_equity = btc_held * exit_price
+    total_return_pct = (final_equity - initial_usdt) / initial_usdt * 100
+
+    log.info(
+        "Buy-and-hold: entry=%.2f  exit=%.2f  btc=%.6f  final=%.2f USDT  return=%.2f%%",
+        entry_price,
+        exit_price,
+        btc_held,
+        final_equity,
+        total_return_pct,
+    )
+
+    return {
+        "bnh_entry_price": entry_price,
+        "bnh_exit_price": exit_price,
+        "bnh_btc_held": btc_held,
+        "bnh_final_equity_usdt": final_equity,
+        "bnh_total_return_pct": total_return_pct,
+    }
+
+
+
 # Regimes that block a BUY / SELL signal (must stay in sync with analysis.py)
 _BUY_BLOCKED_REGIMES = {"trending_down", "high_volatility"}
 _SELL_BLOCKED_REGIMES = {"trending_up", "high_volatility"}
 
 
 def simulate_pnl(
-    signals: pd.DataFrame,
-    initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
-    initial_btc: float = BACKTEST_INITIAL_BTC,
-    fee_rate: float = BACKTEST_FEE_RATE,
+        signals: pd.DataFrame,
+        initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
+        initial_btc: float = BACKTEST_INITIAL_BTC,
+        fee_rate: float = BACKTEST_FEE_RATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """
     Simulate P&L on the signal DataFrame from ``run_signals()``.
@@ -289,8 +380,8 @@ def simulate_pnl(
 
 
 def _pair_round_trips(
-    trades_df: pd.DataFrame,
-    last_close: float,
+        trades_df: pd.DataFrame,
+        last_close: float,
 ) -> list[dict]:
     """
     Pair each BUY with the subsequent SELL to form round-trip trades.
@@ -400,8 +491,8 @@ def _pair_round_trips(
 
                 try:
                     holding_min: float = (
-                        pd.Timestamp(str(ts)) - entry["ts"]
-                    ).total_seconds() / 60.0
+                                                 pd.Timestamp(str(ts)) - entry["ts"]
+                                         ).total_seconds() / 60.0
                 except (TypeError, ValueError):
                     holding_min = float("nan")
 
@@ -439,12 +530,12 @@ def _pair_round_trips(
 
 
 def _compute_stats(
-    signals: pd.DataFrame,
-    equity_df: pd.DataFrame,
-    round_trips: list[dict],
-    initial_usdt: float,
-    initial_btc: float,
-    final_equity: float,
+        signals: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        round_trips: list[dict],
+        initial_usdt: float,
+        initial_btc: float,
+        final_equity: float,
 ) -> dict[str, Any]:
     """
     Compute Step 5 performance metrics from the equity curve and round trips.
@@ -609,7 +700,7 @@ def _compute_stats(
     has_confidence_col = "regime_confidence" in signals.columns
     if has_confidence_col:
         _conf_low = signals["regime_confidence"].notna() & (
-            signals["regime_confidence"] < HMM_MIN_CONFIDENCE
+                signals["regime_confidence"] < HMM_MIN_CONFIDENCE
         )
         confidence_blocked_buy = int(
             (signals["best_buy_micro"].notna() & _conf_low).sum()
@@ -627,16 +718,16 @@ def _compute_stats(
     # Regime-blocked: passed confidence gate but regime was unfavourable.
     regime_blocked_buy = int(
         (
-            signals["best_buy_micro"].notna()
-            & _conf_passed
-            & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
+                signals["best_buy_micro"].notna()
+                & _conf_passed
+                & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
         ).sum()
     )
     regime_blocked_sell = int(
         (
-            signals["best_sell_micro"].notna()
-            & _conf_passed
-            & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+                signals["best_sell_micro"].notna()
+                & _conf_passed
+                & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
         ).sum()
     )
 

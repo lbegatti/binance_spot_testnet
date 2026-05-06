@@ -18,6 +18,15 @@ print_report(signals, trades, equity, stats)
 print_regime_validation_report(test_labels, checks, train_days, split_idx)
                                — prints the Step 6b regime validation report
 save_csv(trades, equity)       — persists trade log & equity curve to CSV
+
+Sensitivity report helpers (called by backtest/sensitivity.py)
+--------------------------------------------------------------
+print_sensitivity_table(results_df, mode, param_grid, display_cols, rank_metric)
+                               — prints the per-run summary table
+print_oat_sensitivity_report(results_df, baseline_sharpe, param_grid,
+                              rank_metric, sensitivity_threshold)
+                               — prints the OAT ΔSharpe report
+print_bnh_comparison(best_row) — prints the strategy vs buy-and-hold box
 """
 
 import logging
@@ -408,3 +417,175 @@ def save_csv(trades: pd.DataFrame, equity: pd.DataFrame) -> None:
     path = os.path.join(results_dir, f"equity_{ts_str}.csv")
     equity.to_csv(path)
     log.info("Equity curve saved → %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity analysis report helpers
+# ---------------------------------------------------------------------------
+
+
+def print_sensitivity_table(
+    results_df: pd.DataFrame,
+    mode: str,
+    param_grid: dict,
+    display_cols: list[str],
+    rank_metric: str = "sharpe_ratio",
+) -> None:
+    """
+    Print the per-run sensitivity summary table to stdout.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        One row per parameter combination produced by ``run_sensitivity()``
+        or ``_run_sensitivity_optuna_study()``.
+    mode : str
+        Execution mode label shown in the header (e.g. ``"bayes"``, ``"OAT"``).
+    param_grid : dict[str, list]
+        The ``_PARAM_GRID`` dict from ``sensitivity.py``.  Used to identify
+        the baseline (first value of each parameter list) and to mark it
+        with ``"← baseline"`` in the ``note`` column.
+    display_cols : list[str]
+        Ordered list of column names to show.  Columns absent from
+        ``results_df`` are silently skipped so the table works for all three
+        execution modes (Bayes stores only Sharpe; OAT/grid store all metrics).
+    rank_metric : str
+        Name of the ranking metric column (default ``"sharpe_ratio"``).
+    """
+    n = len(results_df)
+    print()
+    print("═" * 110)
+    print(f"  SENSITIVITY ANALYSIS — BTCUSDT  ({mode}, {n} combinations)")
+    print("═" * 110)
+
+    # Derive strategy_vs_bnh_pct if both source columns are present.
+    display_df = results_df.copy()
+    if "total_return_pct" in display_df.columns and "bnh_total_return_pct" in display_df.columns:
+        display_df["strategy_vs_bnh_pct"] = (
+            display_df["total_return_pct"] - display_df["bnh_total_return_pct"]
+        )
+
+    defaults = {k: v[0] for k, v in param_grid.items()}
+    available_cols = [c for c in display_cols if c in display_df.columns]
+    display = display_df[available_cols].copy()
+    display.insert(0, "note", "")
+    for idx, row in display.iterrows():
+        is_default = all(
+            row[k] == defaults[k]
+            for k in ("hmm_lookback_rows", "hmm_max_regimes", "vwap_window", "fee_rate")
+            if k in row.index
+        )
+        display.at[idx, "note"] = "← baseline" if is_default else ""
+
+    print(display.to_string(index=False, float_format="{:.3f}".format))
+    print("═" * 110)
+    print()
+
+
+def print_oat_sensitivity_report(
+    results_df: pd.DataFrame,
+    baseline_sharpe: float,
+    param_grid: dict,
+    rank_metric: str = "sharpe_ratio",
+    sensitivity_threshold: float = 0.5,
+) -> bool:
+    """
+    Print the per-parameter OAT sensitivity report vs the baseline Sharpe.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Full OAT results (one row per combination).
+    baseline_sharpe : float
+        Sharpe of the all-defaults baseline run.
+    param_grid : dict[str, list]
+        The ``_PARAM_GRID`` dict from ``sensitivity.py``.
+    rank_metric : str
+        Column name of the ranking metric (default ``"sharpe_ratio"``).
+    sensitivity_threshold : float
+        |ΔSharpe| beyond which a ⚠️ flag is displayed and ``True`` is returned
+        (default ``0.5``).
+
+    Returns
+    -------
+    bool
+        ``True`` if any parameter exceeds *sensitivity_threshold* — signals
+        that Bayesian optimisation (``--bayes``) is advisable.
+    """
+    defaults = {k: v[0] for k, v in param_grid.items()}
+    trigger_phase2 = False
+
+    print(
+        "── OAT Sensitivity Report (vs baseline Sharpe = {:.3f}) ──".format(
+            baseline_sharpe
+        )
+    )
+    for param in param_grid.keys():
+        non_default = results_df[results_df[param] != defaults[param]]
+        for _, row in non_default.iterrows():
+            delta = row[rank_metric] - baseline_sharpe
+            flag = (
+                f"  ⚠️  |ΔSharpe| > {sensitivity_threshold} — consider running --bayes!"
+                if abs(delta) > sensitivity_threshold
+                else ""
+            )
+            print(
+                f"  {param}={row[param]!r:>6}  →  Sharpe={row[rank_metric]:.3f}"
+                f"  ΔSharpe={delta:+.3f}{flag}"
+            )
+            if abs(delta) > sensitivity_threshold:
+                trigger_phase2 = True
+    print()
+    return trigger_phase2
+
+
+def print_bnh_comparison(best_row: pd.Series) -> None:
+    """
+    Print a bordered summary box comparing the best strategy result against
+    the passive buy-and-hold benchmark for the same window.
+
+    Called after every execution path (Bayes, OAT, full-grid) once the best
+    row has been identified.  If the B&H columns are absent the box is skipped
+    with an INFO log.
+
+    Interpretation
+    --------------
+    * ``outperformance > 0`` → strategy beat passive holding (gained more or
+      lost less than simply holding BTC).
+    * ``outperformance < 0`` → strategy underperformed even passive holding —
+      review signal quality or the lookback window.
+
+    Parameters
+    ----------
+    best_row : pd.Series
+        Must contain ``total_return_pct``, ``bnh_total_return_pct``, and
+        optionally ``sharpe_ratio``.
+    """
+    strat = best_row.get("total_return_pct", float("nan"))
+    bnh_ret = best_row.get("bnh_total_return_pct", float("nan"))
+    sharpe = best_row.get("sharpe_ratio", float("nan"))
+
+    if math.isnan(strat) or math.isnan(bnh_ret):
+        log.info("B&H comparison skipped — columns not present in best row.")
+        return
+
+    vs = bnh_ret - strat
+    verdict = (
+        "✅  strategy beat passive holding"
+        if vs >= 0
+        else "❌  strategy underperformed passive holding"
+    )
+
+    w = 62  # inner width
+    print()
+    print("╔" + "═" * w + "╗")
+    print(f"║  {'STRATEGY vs BUY-AND-HOLD  (best result)':<{w - 2}}║")
+    print("╠" + "═" * w + "╣")
+    sharpe_str = f"{sharpe:+.4f}" if not math.isnan(sharpe) else "n/a"
+    print(f"║  Strategy  return : {strat:>+8.2f}%   (Sharpe: {sharpe_str}){'':>{w - 48}}║")
+    print(f"║  Buy-and-hold     : {bnh_ret:>+8.2f}%{'':>{w - 30}}║")
+    print("╠" + "═" * w + "╣")
+    print(f"║  Outperformance   : {vs:>+8.2f}%   {verdict:<{w - 33}}║")
+    print("╚" + "═" * w + "╝")
+    print()
+

@@ -12,10 +12,11 @@
 ## Overview
 
 The live strategy (defined in `strategy/analysis.py`) makes order decisions in
-real time based on a 50-level order book snapshot, a VWAP momentum filter, and
-an HMM regime filter.  The purpose of backtesting is to replay equivalent
-logic against historical data and measure whether the strategy generates
-positive risk-adjusted returns before committing further to live execution.
+real time based on a 50-level order book snapshot, a VWAP dip/strength filter
+(mean-reversion), and an HMM regime filter.  The purpose of backtesting is to
+replay equivalent logic against historical data and measure whether the strategy
+generates positive risk-adjusted returns before committing further to live
+execution.
 
 ---
 
@@ -313,7 +314,7 @@ Two gates are applied sequentially to Flow A output:
 
 ---
 
-### Flow C — VWAP Momentum Filter (rolling window of level-0 values)
+### Flow C — VWAP Dip/Strength Filter (rolling window of level-0 values)
 
 The VWAP operates on **one scalar pair per candle** — the best bid price +
 volume and best ask price + volume extracted from level 0 of the synthetic
@@ -337,10 +338,12 @@ ask_vwap(t) = Σ best_ask(i) × volume_best_ask(i) / Σ volume_best_ask(i)
 **Input:** 5 × 2 scalar pairs (5 candles, each contributing best_bid/ask price
 and volume).
 **Output:** two scalar values `bid_vwap(t)` and `ask_vwap(t)` per candle.
+`ask_vwap` is retained in the signal record for diagnostics; both sides of the
+gate below use `bid_vwap` exclusively.
 
-Gate applied to Flow A output (after regime filter):
-- BUY: execute only if `micro_price(t) > ask_vwap(t)` (upward momentum)
-- SELL: execute only if `micro_price(t) < bid_vwap(t)` (downward momentum)
+Gate applied to Flow A output (after regime filter — **mean-reversion / dip-and-strength strategy**):
+- BUY:  execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) < bid_vwap(t)` (price has dipped below the historical bid average — genuine dip confirmed)
+- SELL: execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) ≥ bid_vwap(t)` (price is at or above the historical bid average — genuine strength confirmed)
 
 ---
 
@@ -355,21 +358,24 @@ Flow C: bid_vwap, ask_vwap
         │
         ▼
 signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
-                        AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
-                        AND regime_label not in {"trending_down", "high_volatility"}
-                        AND micro_price > ask_vwap (or ask_vwap is None)
+                         AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
+                         AND regime_label not in {"trending_down", "high_volatility"}
+                         AND (bid_vwap is None OR micro_price < bid_vwap)
+                             ← dip confirmed: price below historical bid average
           = −1 (SELL)  if Flow A produced a SELL candidate
-                        AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
-                        AND regime_label not in {"trending_up", "high_volatility"}
-                        AND micro_price < bid_vwap (or bid_vwap is None)
+                         AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
+                         AND regime_label not in {"trending_up", "high_volatility"}
+                         AND (bid_vwap is None OR micro_price ≥ bid_vwap)
+                             ← strength confirmed: price at or above historical bid average
           =  0 (flat)  otherwise
 ```
 
-> The **confidence gate** is applied **before** the direction gate.  If the
-> model's posterior probability for the predicted regime is below
-> `HMM_MIN_CONFIDENCE`, both sides are skipped regardless of regime label or
-> VWAP — identical to the behaviour of `low_latency_analysis()` in the live
-> system.
+> **Mean-reversion / dip-and-strength strategy.**  The VWAP gate uses `bid_vwap`
+> for both sides (not `ask_vwap` for BUY).  A BUY fires only when the current
+> price has *fallen below* the rolling historical bid, confirming a genuine dip.
+> A SELL fires only when the price is *at or above* that same average, confirming
+> genuine strength to sell into.  The `ask_vwap` is still computed and stored in
+> the signal record for diagnostic and visualisation purposes.
 
 ---
 
@@ -482,7 +488,7 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 | **Avg holding period** | `avg_holding_minutes` | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period) |
 | **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
 | **Regime filter hit rate** | `regime_filter_hit_rate_pct` | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
-| **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP momentum gate (third and final gate) |
+| **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate) |
 
 ---
 
@@ -752,7 +758,7 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `run_backtest.py` always predicts every candle. |
 | Runtime (Bayes, 30 trials) | ~50–100 min on a laptop (klines pre-fetched once, shared across all trials) |
-| Runtime (OAT, 8 runs) | ~12–30 min on a laptop (after optimisations) |
+| Runtime (OAT, 7 runs) | ~12–30 min on a laptop (after optimisations) |
 | Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `run_backtest.py`) |
 | Run (Bayes, default) | `python -m backtest.sensitivity` or `python -m backtest.sensitivity --bayes` |
 | Run (OAT) | `python -m backtest.sensitivity --oat` |
@@ -776,8 +782,8 @@ range is the **default** used by the baseline run.
 |---|---|---|---|---|
 | 1 | HMM lookback window | `HMM_LOOKBACK_ROWS` | 120 (2 h) | 60, **120**, 240 |
 | 2 | Max HMM regimes (BIC upper bound) | `HMM_MAX_REGIMES` | 3 | **3**, 2  *(4+ risks under-populated states with 4 features)* |
-| 3 | VWAP momentum window | `VWAP_WINDOW` | 5 (5 min) | **5**, 2  *(10 min excluded — too slow for 1 s cadence)* |
-| 4 | Taker fee rate | `BACKTEST_FEE_RATE` | 0.001 (0.10 %) | **0.001**, 0.0005  *(0.05 % achievable at VIP 3+)* |
+| 3 | VWAP dip/strength window | `VWAP_WINDOW` | 5 (5 min) | **5**, 2, 3  *(10 min excluded — too slow for 1 s cadence)* |
+| 4 | Taker fee rate | `BACKTEST_FEE_RATE` | 0.0005 (0.05 %) | **0.0005**, 0.00025  *(0.025 % achievable at VIP 4+; note: Bayesian mode always uses `0.001`)* |
 
 **Excluded from scope:**
 - Depth:delta score weights (0.70 / 0.30) — not a config constant.
@@ -825,7 +831,7 @@ knob and excluded from the search space.
 #### Phase 1 — One-At-a-Time (OAT) sweep *(quick sanity check)*
 
 Hold all parameters at defaults; vary one at a time.
-- 1 baseline + 7 non-default values = **8 runs**.
+- 1 baseline + 6 non-default values = **7 runs**.
 - Shows which parameter individually drives the most sensitivity.
 - Does **not** capture interaction effects.
 - Trigger rule: if any single OAT parameter causes `|ΔSharpe| > 0.5`, the
@@ -900,7 +906,7 @@ _, _, stats = simulate_pnl(signals, fee_rate=params["fee_rate"])
 | `itertuples()` in P&L loop | — (code change in `pnl.py`) | ~5× faster P&L walk |
 | Numpy-vectorised book build | — (code change in `synthetic_book.py`) | ~5–10× faster per candle |
 
-Total wall time: **~12–30 min** for the full OAT (8 runs) on a laptop, vs ~66–180 min without these optimisations.
+Total wall time: **~12–30 min** for the full OAT (7 runs) on a laptop, vs ~66–180 min without these optimisations.
 
 ---
 
@@ -1053,7 +1059,7 @@ concrete file in `backtest/`.
   (`build_levels` → `collect_candidates` → `select_best_opportunity` via
   `strategy/book_utils.py`), applies three sequential gates — **confidence
   gate** (`regime_confidence ≥ HMM_MIN_CONFIDENCE`), **regime direction gate**
-  (Flow B), and **VWAP momentum gate** (Flow C) — and returns a time-indexed
+  (Flow B), and **VWAP dip/strength gate** (Flow C) — and returns a time-indexed
   signal DataFrame (`+1` BUY, `−1` SELL, `0` flat) plus regime label,
   `regime_confidence`, VWAP, and micro-price details.
   *(Implemented.)*
@@ -1153,8 +1159,8 @@ concrete file in `backtest/`.
   - Three optional HTML charts (`--save-plots`): optimisation history,
     parameter importance (fANOVA), contour (`hmm_lookback_rows × vwap_window`).
 
-  **OAT mode** (`python -m backtest.sensitivity --oat`):
-  - 8 runs (1 baseline + 7 non-default), ~12–30 min.
+  - **OAT mode** (`python -m backtest.sensitivity --oat`):
+  - 7 runs (1 baseline + 6 non-default), ~12–30 min.
   - Per-parameter delta-Sharpe report; flags `|ΔSharpe| > 0.5` with a
     suggestion to run `--bayes`.
 
@@ -1182,5 +1188,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-05-01*
+*Document last updated: 2026-05-03*
 

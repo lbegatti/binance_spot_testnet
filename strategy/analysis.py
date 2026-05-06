@@ -187,12 +187,20 @@ class AnalysisEngine:
            ``0.70 × norm_depth + 0.30 × norm_delta``; picks the best for each
            side.  Returns an 8-element tuple
            ``(level_idx, score|None, delta, depth, obi, micro_price, bq, aq)``.
-        6. **VWAP filter** (momentum confirmation) — reads ``_bid_vwap`` /
+        6. **VWAP filter** (dip / strength confirmation) — reads ``_bid_vwap`` /
            ``_ask_vwap`` under ``_vwap_lock``:
-           - BUY: skip if ``ask_vwap`` is set **and** ``micro_price ≤ ask_vwap``.
-           - SELL: skip if ``bid_vwap`` is set **and** ``micro_price ≥ bid_vwap``.
-           Both are ``None`` for the first ~1 min; filter is transparent until
-           ``historical_analysis`` publishes the first VWAP.
+           - BUY:  execute only when ``bid_vwap`` is ``None`` **or**
+             ``micro_price < bid_vwap`` (current price is below the historical
+             bid average — genuine dip confirmed).  Skip when
+             ``micro_price ≥ bid_vwap`` (price is at or above the historical
+             bid — not a genuine dip).
+           - SELL: execute only when ``bid_vwap`` is ``None`` **or**
+             ``micro_price ≥ bid_vwap`` (current price is at or above the
+             historical bid average — genuine strength confirmed).  Skip when
+             ``micro_price < bid_vwap`` (price below historical bid — not
+             genuine strength).
+           Both VWAPs are ``None`` for the first ~1 min; filter is transparent
+           until ``historical_analysis`` publishes the first values.
         7. **Regime confidence gate** — reads ``regime_director.regime_confidence``
            (posterior probability from ``predict_proba()``) under ``_regime_lock``:
            - Skip **both** sides if ``regime_confidence < HMM_MIN_CONFIDENCE``
@@ -269,13 +277,18 @@ class AnalysisEngine:
                 continue
 
             # After the first historical_analysis iteration (~1 min), _bid_vwap
-            # and _ask_vwap are populated.  They act as a confirmation filter:
-            #   BUY  → execute only if micro_price > ask_vwap (upward momentum:
-            #          current price exceeds the historical avg cost to buy).
-            #   SELL → execute only if micro_price < bid_vwap (downward momentum:
-            #          current price is below the historical avg bid).
+            # and _ask_vwap are populated.  They act as a dip/strength confirmation
+            # filter aligned with the reversed candidate logic in book_utils.py:
+            #   BUY  → execute only if bid_vwap is None or micro_price < bid_vwap
+            #          (price is below the historical bid average — genuine dip).
+            #          Skip if micro_price >= bid_vwap (price at/above historical
+            #          bid — not a genuine dip).
+            #   SELL → execute only if bid_vwap is None or micro_price >= bid_vwap
+            #          (price is at or above historical bid — genuine strength).
+            #          Skip if micro_price < bid_vwap (price below historical
+            #          bid — not genuine strength to sell into).
             # While VWAPs are still None (first ~1 min) the filter is transparent
-            # and orders execute based on the score alone.
+            # and orders execute based on regime + score alone.
             if best_buy:
                 micro_price = best_buy[5]  # index 5 of the tuple
                 if (
@@ -287,12 +300,12 @@ class AnalysisEngine:
                         iteration,
                         current_regime,
                     )
-                elif ask_vwap is not None and micro_price <= ask_vwap:
+                elif bid_vwap is not None and micro_price >= bid_vwap:
                     logging.info(
-                        "HFT #%d [buy] — skipped: micro_price %.2f ≤ ask_vwap %.2f",
+                        "HFT #%d [buy] — skipped: micro_price %.2f >= bid_vwap %.2f (not a dip)",
                         iteration,
                         micro_price,
-                        ask_vwap,
+                        bid_vwap,
                     )
                 else:
                     self.order_executor.execute("BUY", best_buy)
@@ -307,9 +320,9 @@ class AnalysisEngine:
                         iteration,
                         current_regime,
                     )
-                elif bid_vwap is not None and micro_price >= bid_vwap:
+                elif bid_vwap is not None and micro_price <= bid_vwap:
                     logging.info(
-                        "HFT #%d [sell] — skipped: micro_price %.2f ≥ bid_vwap %.2f",
+                        "HFT #%d [sell] — skipped: micro_price %.2f <= bid_vwap %.2f (not strength)",
                         iteration,
                         micro_price,
                         bid_vwap,
