@@ -1,5 +1,5 @@
 """
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-05-05)
+SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-05-07)
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -682,6 +682,12 @@ FILES
                                     t-test, volatility check, confidence
                                     floor, label frequency, hit-rate
                                     alignment).
+                                    print_sensitivity_table(): per-run summary
+                                    table for all sensitivity modes.
+                                    print_oat_sensitivity_report(): OAT
+                                    delta-Sharpe report per parameter.
+                                    print_bnh_comparison(): strategy vs
+                                    buy-and-hold comparison box.
                                     save_csv(): timestamped trades_*.csv and
                                     equity_*.csv to backtest/results/.
                                     fmt(): safe float formatter (NaN / inf safe).
@@ -783,39 +789,47 @@ FILES
                                     _check_existing_best_params() guard: reads
                                     best_params.json age/Sharpe/params and
                                     prompts [y/N] before every run (all modes).
-                                    Bayesian mode:
-                                      Data pre-fetched once; _make_objective()
-                                      factory closure shares it across all trials.
-                                      Study persisted to results/optuna.db
-                                      (load_if_exists=True → auto-resume).
-                                      Optional HTML charts (--save-plots):
-                                        optuna_history_<ts>.html
-                                        optuna_importance_<ts>.html
-                                        optuna_contour_<ts>.html
-                                      ~50–100 min for 30 trials (90-day window).
-                                     Default (Bayes): python -m backtest.sensitivity
-                                     OAT (Phase 1):  python -m backtest.sensitivity --oat
-                                     Full-grid (dep): python -m backtest.sensitivity --full-grid
-                                     Writes:
-                                       results/sensitivity_<mode>_<ts>.csv
-                                       results/best_params.json
-                                           └── consumed by strategy/param_loader.py
-                                                  ├── load_best_params() ← websocket_main.py
-                                                  │     called at startup BEFORE RegimeDirector();
-                                                  │     patches strategy.regime_director namespace
-                                                  │     (HMM_MAX_REGIMES, HMM_LOOKBACK).
-                                                  │     Patches are visible because RegimeDirector
-                                                  │     __init__ uses None sentinels — see 4b.
-                                                  │     Falls back to defaults if absent.
-                                                 └── load_best_params_for_backtest() ← run_backtest.py
-                                                       called at top of run_backtest() before
-                                                       run_signals(); returns dict of cast values
-                                                       passed as kwargs (hmm_lookback_rows,
-                                                       hmm_max_regimes, vwap_window, fee_rate);
-                                                       falls back to defaults if absent.
-                                       results/optuna.db  ← Bayes mode only (SQLite study)
-                                    Use Case B (180-day window) DEFERRED —
-                                    ~4–12 h OAT runtime on a laptop.
+                                     Bayesian mode:
+                                       Data pre-fetched once; _make_objective()
+                                       factory closure shares it across all trials.
+                                       Study persisted to results/optuna.db
+                                       (load_if_exists=True → auto-resume).
+                                       HTML charts (always saved after every Bayesian
+                                       study → written to reporting/ not results/):
+                                          reporting/optuna_history_<ts>.html
+                                          reporting/optuna_importance_<ts>.html
+                                          reporting/optuna_contour_<ts>.html
+                                       ~50–100 min for 30 trials (90-day window).
+                                     Console report formatting delegated to
+                                     reporting/formatters.py:
+                                       print_sensitivity_table()    ← all modes
+                                       print_oat_sensitivity_report() ← OAT only
+                                       print_bnh_comparison()       ← all modes
+                                      Default (Bayes): python -m backtest.sensitivity
+                                      OAT (Phase 1):  python -m backtest.sensitivity --oat
+                                      Full-grid (dep): python -m backtest.sensitivity --full-grid
+                                      Writes:
+                                        reporting/sensitivity_<mode>_<ts>.csv
+                                            ← human-readable (alongside HTML charts)
+                                        results/best_params.json
+                                            ← machine-readable; loaded by live system
+                                            └── consumed by strategy/param_loader.py
+                                                   ├── load_best_params() ← websocket_main.py
+                                                   │     called at startup BEFORE RegimeDirector();
+                                                   │     patches strategy.regime_director namespace
+                                                   │     (HMM_MAX_REGIMES, HMM_LOOKBACK).
+                                                   │     Patches are visible because RegimeDirector
+                                                   │     __init__ uses None sentinels — see 4b.
+                                                   │     Falls back to defaults if absent.
+                                                  └── load_best_params_for_backtest() ← run_backtest.py
+                                                        called at top of run_backtest() before
+                                                        run_signals(); returns dict of cast values
+                                                        passed as kwargs (hmm_lookback_rows,
+                                                        hmm_max_regimes, vwap_window, fee_rate);
+                                                        falls back to defaults if absent.
+                                        results/optuna.db  ← Bayes mode only (SQLite study)
+                                     Use Case B (180-day window) DEFERRED —
+                                     ~4–12 h OAT runtime on a laptop.
 
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,

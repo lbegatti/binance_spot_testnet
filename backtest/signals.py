@@ -23,6 +23,7 @@ from config_parameters import (
     HMM_MIN_CONFIDENCE,
     BACKTEST_FILL_SPREAD_BPS,
     HMM_MAX_REGIMES,
+    VWAP_THRESHOLD_MULTIPLIER,
 )
 
 logging.basicConfig(
@@ -70,6 +71,7 @@ def run_signals(
     predict_every: int | None = None,
     lookback: str | None = None,
     prefetched_df: pd.DataFrame | None = None,
+    vwap_threshold: float | None = None,
 ) -> pd.DataFrame:
     """
     Replay the full trading pipeline on historical 1-minute klines.
@@ -127,6 +129,17 @@ def run_signals(
         When ``None`` (default), the normal fetch path runs and the
         ``lookback`` parameter controls the window.  Existing callers
         (``run_backtest.py``) are completely unaffected.
+    vwap_threshold : float | None
+        Minimum fractional dip / rally required around the VWAP before a
+        signal fires.  Creates a symmetric dead zone:
+
+        - BUY  fires only when ``micro_price < bid_vwap × (1 − threshold)``.
+        - SELL fires only when ``micro_price ≥ bid_vwap × (1 + threshold)``.
+
+        Rule of thumb: set to at least 2 × one-way fee to guarantee a
+        profitable round trip (e.g. 0.002 for 0.10 % / side fees).
+        Default ``VWAP_THRESHOLD_MULTIPLIER`` from ``config_parameters.py``
+        (0.003 → 0.30 % dead zone).
 
     For every candle from ``_lookback`` onward the function
     reproduces the three concurrent flows of the live system:
@@ -153,13 +166,15 @@ def run_signals(
         * ``signal = +1`` (BUY)  when ``best_buy`` exists **and**
           ``regime_confidence ≥ HMM_MIN_CONFIDENCE`` (model is certain enough)
           **and** regime ∉ {``trending_down``, ``high_volatility``}
-          **and** (``bid_vwap`` is ``None`` or ``micro_price < bid_vwap``)
-          (dip confirmed — price is below the historical bid average).
+          **and** (``bid_vwap`` is ``None`` or
+          ``micro_price < bid_vwap × (1 − vwap_threshold)``)
+          (dip deep enough to cover fees and leave profit).
         * ``signal = -1`` (SELL) when ``best_sell`` exists **and**
           ``regime_confidence ≥ HMM_MIN_CONFIDENCE``
           **and** regime ∉ {``trending_up``, ``high_volatility``}
-          **and** (``bid_vwap`` is ``None`` or ``micro_price >= bid_vwap``)
-          (strength confirmed — price is at or above the historical bid average).
+          **and** (``bid_vwap`` is ``None`` or
+          ``micro_price ≥ bid_vwap × (1 + vwap_threshold)``)
+          (rally strong enough to cover fees and leave profit).
         * ``signal = 0``  otherwise (no trade).
 
     Returns:
@@ -188,6 +203,7 @@ def run_signals(
     _refit_every = refit_every if refit_every is not None else REFIT_EVERY
     _predict_every = predict_every if predict_every is not None else 1
     _fetch_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
+    _vwap_threshold = vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
 
     # 1. Fetch and prepare data
     if prefetched_df is not None:
@@ -366,23 +382,24 @@ def run_signals(
         )
 
         # Combined gate (mirrors live low_latency_analysis)
-        # VWAP strategy: mean-reversion / dip-and-strength confirmation.
-        #   BUY  → only when price has dipped BELOW the historical bid average
-        #          (bid_vwap is None or micro_price < bid_vwap).
-        #   SELL → only when price is AT or ABOVE the historical bid average
-        #          (bid_vwap is None or micro_price >= bid_vwap).
+        # Threshold-gated mean-reversion: the dip / rally must be large enough
+        # to cover round-trip fees and leave a profit margin.
+        #   BUY  → price < bid_vwap × (1 − threshold)   [deep enough dip]
+        #   SELL → price ≥ bid_vwap × (1 + threshold)   [strong enough rally]
         # Both sides use bid_vwap; ask_vwap is retained in the record for
         # diagnostics but is no longer used by the gate logic.
         if confidence_ok:
             if best_buy and best_buy_micro is not None:
                 regime_ok = regime not in ("trending_down", "high_volatility")
-                vwap_ok = bid_vwap is None or best_buy_micro < bid_vwap
+                vwap_floor = bid_vwap * (1.0 - _vwap_threshold) if bid_vwap is not None else None
+                vwap_ok = vwap_floor is None or best_buy_micro < vwap_floor
                 if regime_ok and vwap_ok:
                     signal = 1
 
             if best_sell and best_sell_micro is not None and signal == 0:
                 regime_ok = regime not in ("trending_up", "high_volatility")
-                vwap_ok = bid_vwap is None or best_sell_micro >= bid_vwap
+                vwap_ceil = bid_vwap * (1.0 + _vwap_threshold) if bid_vwap is not None else None
+                vwap_ok = vwap_ceil is None or best_sell_micro >= vwap_ceil
                 if regime_ok and vwap_ok:
                     signal = -1
 

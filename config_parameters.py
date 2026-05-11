@@ -170,3 +170,23 @@ BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
 # the balance every round trip.  0.10 → at most 10 % risked per signal.
 # Set to 1.0 to revert to all-in behaviour.
 BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
+
+# ---------------------------------------------------------------------------
+# VWAP Threshold Multiplier — minimum dip / strength required to trade
+# ---------------------------------------------------------------------------
+# The bot only executes a BUY when micro_price < bid_vwap × (1 − threshold),
+# and only executes a SELL when micro_price ≥ bid_vwap × (1 + threshold).
+# This creates a symmetric dead zone around the VWAP so that microscopic
+# noise (1-penny vibrations) never triggers an order.
+#
+# Rule of thumb: threshold must cover the round-trip fee to be profitable.
+#   Standard Binance Spot taker fee: 0.10 % per side → 0.20 % round trip.
+#   0.002 (0.20 %) = exact round-trip break-even (2 × one-way fee).
+#   Default 0.003 (0.30 %) = break-even + 0.10 % profit margin per side.
+#   Higher values filter out more marginal signals, reducing trade count.
+#   Sensitivity Bayesian search refines this value further (0.05 %–1.5 %).
+#
+# Increase to 0.005–0.010 in choppy / low-volatility markets.
+# Set to 0.0 to disable (revert to bare VWAP gate — buys any dip).
+VWAP_THRESHOLD_MULTIPLIER: float = 0.002  # 0.30 % dead zone — break-even + margin
+

@@ -21,15 +21,15 @@ Three execution modes
 
   OAT sweep (Phase 1 — quick sanity check):
       Holds all parameters at their defaults and varies ONE parameter at a time.
-      9 runs total (1 baseline + 8 non-default).  Use this first to confirm the
+      7 runs total (1 baseline + 6 non-default).  Use this first to confirm the
       pipeline runs cleanly and to spot obviously sensitive parameters.
-      Typical wall time: ~16–40 min on a laptop (90-day window).
-        ↳ klines fetched ONCE (~30–90 s) then shared across all 9 runs.
+      Typical wall time: ~12–30 min on a laptop (90-day window).
+        ↳ klines fetched ONCE (~30–90 s) then shared across all 7 runs.
       Run with:  python -m backtest.sensitivity --oat
 
   Full factorial grid (DEPRECATED — Phase 2 legacy):
       All combinations exhaustively.  Superseded by --bayes.
-      Typical wall time: ~95–245 min on a laptop (90-day window).
+      18 combinations (3×2×3). Typical wall time: ~40–90 min on a laptop.
       Run with:  python -m backtest.sensitivity --full-grid
 
 Use Case A vs Use Case B
@@ -89,6 +89,7 @@ from config_parameters import (
     SENSITIVITY_REFIT_EVERY,
     SENSITIVITY_LOOKBACK,
     SENSITIVITY_PREDICT_EVERY,
+    VWAP_THRESHOLD_MULTIPLIER,
 )
 
 logging.basicConfig(
@@ -117,22 +118,29 @@ _BEST_PARAMS_PATH = _RESULTS_DIR / "best_params.json"
 # Each entry is (config_constant_name, list_of_values_to_test).
 # The first value in every list is the DEFAULT — used as the baseline run
 # and held fixed while other parameters are varied in the OAT sweep.
+#
+# fee_rate and vwap_threshold are NOT in this grid:
+#   fee_rate      — fixed at _BAYES_FEE_RATE (0.001 = standard Binance taker).
+#                   Testing different fee tiers is meaningless: Binance charges
+#                   what it charges regardless of what value we use here.
+#   vwap_threshold — fixed at VWAP_THRESHOLD_MULTIPLIER (0.002) for OAT / full-grid.
+
 _PARAM_GRID: dict[str, list[Any]] = {
     "hmm_lookback_rows": [120, 60, 30],  # default 120 (2h)
-    "hmm_max_regimes": [3, 2],  # default=3;   test 2
-    "vwap_window": [5, 2, 3],  # default=5 min; test 2 min
-    "fee_rate": [0.0005, 0.00025],  # default=0.05 % (BNB discount); 0.025 % (VIP tier)
+    "hmm_max_regimes":   [3, 2],         # default=3;   test 2
+    "vwap_window":       [5, 2, 3],      # default=5 min; test 2 min, 3 min
 }
 
 _OPTUNA_SPACE: dict[str, tuple] = {
-    "hmm_lookback_rows": ("int", 30, 240, 10),
-    "hmm_max_regimes": ("int", 2, 4, 1),
-    "vwap_window": ("int", 2, 15, 1),
+    "hmm_lookback_rows": ("int",  30,  240, 10),
+    "hmm_max_regimes":   ("int",   2,    4,  1),
+    "vwap_window":       ("int",   2,   15,  1),
 }
 
 # Fixed fee rate used for all Bayes trials.
 # 0.001 = 0.1 % — standard Binance spot taker fee (no BNB discount).
-# Set to 0.0 temporarily for fee-free diagnostic runs.
+# fee_rate is a fixed exchange cost, not a strategy knob, and is excluded
+# from the Optuna search space (_OPTUNA_SPACE).
 _BAYES_FEE_RATE: float = 0.001
 
 # Metric used to rank combinations and select best_params.json.
@@ -232,7 +240,11 @@ def _build_oat_grid() -> list[dict[str, Any]]:
       - Runs 1–N: each non-default value for one parameter while all others
                   remain at their default.
 
-    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 1 + 2 + 1 = 7 runs.
+    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 1 + 2 = 6 non-default → 7 runs.
+      hmm_lookback_rows: 2 non-default
+      hmm_max_regimes:   1 non-default
+      vwap_window:       2 non-default
+    fee_rate and vwap_threshold are held fixed at _BAYES_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
     defaults = {k: v[0] for k, v in _PARAM_GRID.items()}
     grid: list[dict[str, Any]] = [defaults.copy()]  # run 0: baseline
@@ -250,7 +262,11 @@ def _build_full_grid() -> list[dict[str, Any]]:
     """
     Build the full factorial grid (all combinations).
 
-    Total: 3 × 2 × 3 × 3 = 54 combinations.
+    Total: 3 × 2 × 3 = 18 combinations.
+      hmm_lookback_rows: [120, 60, 30]  → 3
+      hmm_max_regimes:   [3, 2]         → 2
+      vwap_window:       [5, 2, 3]      → 3
+    fee_rate and vwap_threshold are held fixed at _BAYES_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
     keys = list(_PARAM_GRID.keys())
     return [
@@ -278,9 +294,12 @@ def _make_objective(prefetched_df: pd.DataFrame):
 
     def objective(trial: optuna.Trial) -> float:
         params: dict[str, Any] = {}
-        for name, (_, low, high, step) in _OPTUNA_SPACE.items():
-            params[name] = trial.suggest_int(name=name, low=low, high=high, step=step)
-        params["fee_rate"] = _BAYES_FEE_RATE  # fixed for this study
+        for name, (kind, low, high, step) in _OPTUNA_SPACE.items():
+            if kind == "int":
+                params[name] = trial.suggest_int(name=name, low=low, high=high, step=step)
+            else:  # "float"
+                params[name] = trial.suggest_float(name=name, low=low, high=high, step=step)
+        # fee_rate and vwap_threshold are fixed — _run_one applies them automatically.
         log.info("Trial %d starting: %s", trial.number, params)
         try:
             result = _run_one(params, prefetched_df)
@@ -471,25 +490,48 @@ def _run_sensitivity_optuna_study(
     bnh = _compute_bnh(prefetched_df)
 
     # ── Create / resume study ─────────────────────────────────────────────
-    # Absolute path so the DB resolves regardless of CWD.
+    # The study name encodes the data window's START date so that every unique
+    # lookback window gets its own isolated study in the DB.
+    #
+    # WHY THIS MATTERS:
+    #   Optuna stores Sharpe values per trial. If the same study is resumed two
+    #   days later, the old trials carry Sharpe values computed on a *different*
+    #   price window (e.g. Feb 7–May 8) while new trials use today's window
+    #   (Feb 9–May 10). study.best_value then picks the best across mixed windows
+    #   — the winning trial's Sharpe is stale and the saved best_params.json
+    #   reflects parameters that were optimal for a window that no longer exists.
+    #
+    # FIX: name the study after the window start date. Running on May 8 creates
+    #   "btcusdt_sensitivity_20260208". Running on May 10 creates a FRESH study
+    #   "btcusdt_sensitivity_20260210". Interrupted runs on the same day still
+    #   resume correctly (same study name). Old per-day studies stay in the DB
+    #   as an audit trail but never pollute a new day's optimisation.
+    window_start_dt = pd.Timestamp.utcnow() - pd.tseries.frequencies.to_offset(
+        effective_lookback.replace(" ago UTC", "")
+    )
+    window_tag = window_start_dt.strftime("%Y%m%d")
+    study_name = f"btcusdt_sensitivity_{window_tag}"
+
     _optuna_db = (_RESULTS_DIR / "optuna.db").as_posix()
-    # Suppress Optuna's own INFO logs (trial start/finish) — we log manually.
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction="maximize",
-        study_name="btcusdt_sensitivity",
+        study_name=study_name,
         storage=f"sqlite:///{_optuna_db}",
-        load_if_exists=True,  # resume if interrupted — completed trials not re-run
+        load_if_exists=True,  # resume if interrupted ON THE SAME DAY — trials not re-run
         sampler=optuna.samplers.TPESampler(seed=42),
     )
 
     already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     if already_done:
         log.info(
-            "Resuming study — %d trials already complete, running %d more.",
+            "Resuming study '%s' — %d trials already complete on this window, running %d more.",
+            study_name,
             already_done,
             n_trials,
         )
+    else:
+        log.info("Fresh study '%s' — no prior trials for this window.", study_name)
 
     study.optimize(
         _make_objective(prefetched_df=prefetched_df),
@@ -506,7 +548,10 @@ def _run_sensitivity_optuna_study(
         if t.state == optuna.trial.TrialState.COMPLETE:
             rows.append({
                 **t.params,  # hmm_lookback_rows, hmm_max_regimes, vwap_window
-                "fee_rate": _BAYES_FEE_RATE,  # fixed — not sampled by Optuna
+                # fee_rate and vwap_threshold are fixed — recorded for CSV
+                # self-documentation but never varied across trials.
+                "fee_rate": _BAYES_FEE_RATE,
+                "vwap_threshold": VWAP_THRESHOLD_MULTIPLIER,
                 _RANK_METRIC: t.value,
             })
 
@@ -539,18 +584,17 @@ def _run_sensitivity_optuna_study(
 
     valid = results_df[results_df[_RANK_METRIC].notna()]
     if not valid.empty:
-        _save_best_params(valid.iloc[0])
-        # Optuna only stores Sharpe per trial — re-run the best params once to
-        # retrieve the full stats (including total_return_pct) for the B&H box.
+        # Re-run the best trial's params on current data BEFORE saving.
+        # This ensures best_params.json always reflects today's window, not a
+        # stale Sharpe from a previous day that still lives in the Optuna DB.
         log.info(
             "Re-running best trial params to compute full stats for B&H comparison…"
         )
         try:
-            best_full = _run_one(
-                {**study.best_params, "fee_rate": _BAYES_FEE_RATE},
-                prefetched_df,
-            )
+            best_full = _run_one(study.best_params, prefetched_df)
             best_series = pd.Series({**best_full, **bnh})
+            # Save using the CURRENT-data stats so source_value is honest.
+            _save_best_params(best_series)
         except Exception:
             log.warning(
                 "Could not re-run best trial — falling back to trial row "
@@ -558,6 +602,7 @@ def _run_sensitivity_optuna_study(
                 exc_info=True,
             )
             best_series = valid.iloc[0]
+            _save_best_params(best_series)
         print_bnh_comparison(best_series)
     else:
         log.warning("No valid Optuna trials to save as best_params.json.")
@@ -573,8 +618,10 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
     Parameters
     ----------
     params : dict
-        Must contain: ``hmm_lookback_rows``, ``hmm_max_regimes``,
-        ``vwap_window``, ``fee_rate``.
+        Must contain: ``hmm_lookback_rows``, ``hmm_max_regimes``, ``vwap_window``.
+        May optionally contain ``vwap_threshold`` (Bayes trials supply it;
+        OAT / full-grid runs do not — defaults to ``VWAP_THRESHOLD_MULTIPLIER``).
+        ``fee_rate`` is always fixed at ``_BAYES_FEE_RATE`` regardless.
     prefetched_df : pd.DataFrame
         Feature-enriched klines DataFrame fetched once before the grid loop.
         Passed directly to ``run_signals()`` via ``prefetched_df=`` to avoid
@@ -585,12 +632,15 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
     dict
         The ``params`` dict merged with the stats dict from ``simulate_pnl()``.
     """
+    _fee = _BAYES_FEE_RATE
+    _threshold = params.get("vwap_threshold", VWAP_THRESHOLD_MULTIPLIER)
     log.info(
-        "Running: lookback=%d  max_regimes=%d  vwap=%d  fee=%.4f%%",
+        "Running: lookback=%d  max_regimes=%d  vwap=%d  threshold=%.4f%%  fee=%.4f%%",
         params["hmm_lookback_rows"],
         params["hmm_max_regimes"],
         params["vwap_window"],
-        params["fee_rate"] * 100,
+        _threshold * 100,
+        _fee * 100,
     )
 
     # run_signals() uses SENSITIVITY_REFIT_EVERY (480) for a ~4× speedup.
@@ -601,14 +651,17 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
         hmm_lookback_rows=params["hmm_lookback_rows"],
         hmm_max_regimes=params["hmm_max_regimes"],
         vwap_window=params["vwap_window"],
+        vwap_threshold=_threshold,
         refit_every=SENSITIVITY_REFIT_EVERY,
         predict_every=SENSITIVITY_PREDICT_EVERY,
         prefetched_df=prefetched_df,
     )
 
-    _, _, stats = simulate_pnl(signals, fee_rate=params["fee_rate"])
+    _, _, stats = simulate_pnl(signals, fee_rate=_fee)
 
-    return {**params, **stats}
+    # Always record the actual fee and threshold used so the CSV/JSON are
+    # self-documenting even when they weren't part of the grid sweep.
+    return {**params, "fee_rate": _fee, "vwap_threshold": _threshold, **stats}
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +672,7 @@ _DISPLAY_COLS = [
     "hmm_lookback_rows",
     "hmm_max_regimes",
     "vwap_window",
-    "fee_rate",
+    "vwap_threshold",       # fixed for OAT/grid; Bayes-optimised for Bayesian runs
     "total_return_pct",
     "bnh_total_return_pct",  # passive buy-and-hold benchmark
     "strategy_vs_bnh_pct",  # total_return_pct − bnh_total_return_pct (derived)
@@ -662,7 +715,8 @@ def _save_best_params(best_row: pd.Series) -> None:
         "hmm_lookback_rows": int(best_row["hmm_lookback_rows"]),
         "hmm_max_regimes": int(best_row["hmm_max_regimes"]),
         "vwap_window": int(best_row["vwap_window"]),
-        "fee_rate": float(best_row["fee_rate"]),
+        "vwap_threshold": float(best_row.get("vwap_threshold", VWAP_THRESHOLD_MULTIPLIER)),
+        "fee_rate": float(best_row.get("fee_rate", _BAYES_FEE_RATE)),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_metric": _RANK_METRIC,
         "source_value": float(best_row[_RANK_METRIC]),
@@ -689,8 +743,8 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
     Parameters
     ----------
     full_grid : bool
-        If ``True`` (default), run the full 54-combination factorial grid.
-        If ``False``, run the OAT sweep (8 combinations, ~14–36 min).
+        If ``True`` (default), run the full 36-combination factorial grid.
+        If ``False``, run the OAT sweep (7 combinations, ~12–30 min).
     lookback : str | None
         dateutil string overriding ``SENSITIVITY_LOOKBACK`` for this run only.
         ``None`` → use ``SENSITIVITY_LOOKBACK`` from ``config_parameters.py``.
@@ -760,7 +814,12 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
             )
             # Store the params with NaN metrics so the row still appears in the
             # CSV and the OAT sensitivity report, visibly marked as failed.
-            all_results.append({**params, _RANK_METRIC: float("nan")})
+            all_results.append({
+                **params,
+                "fee_rate": _BAYES_FEE_RATE,
+                "vwap_threshold": VWAP_THRESHOLD_MULTIPLIER,
+                _RANK_METRIC: float("nan"),
+            })
 
     results_df = pd.DataFrame(all_results).sort_values(
         _RANK_METRIC, ascending=False, na_position="last"
@@ -781,8 +840,7 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
             (results_df["hmm_lookback_rows"] == defaults["hmm_lookback_rows"])
             & (results_df["hmm_max_regimes"] == defaults["hmm_max_regimes"])
             & (results_df["vwap_window"] == defaults["vwap_window"])
-            & (results_df["fee_rate"] == defaults["fee_rate"])
-            ]
+        ]
         if not baseline_rows.empty:
             baseline_sharpe = float(baseline_rows.iloc[0][_RANK_METRIC])
             trigger = print_oat_sensitivity_report(
@@ -822,12 +880,12 @@ if __name__ == "__main__":
             "Sensitivity analysis for the BTCUSDT backtesting pipeline.\n\n"
             "DEFAULT (no flags): Bayesian optimisation via Optuna — 30 trials.\n"
             "  Typical wall time: ~50–100 min (klines fetched once, shared across all trials).\n"
-            "  Optuna diagnostic charts are always saved to backtest/results/.\n\n"
-            "--oat        Phase 1 OAT sweep (7 combinations, ~14–35 min).\n"
-            "--full-grid  Deprecated full factorial grid (54 combinations, ~95–245 min).\n"
+            "  Optuna diagnostic charts are always saved to backtest/reporting/.\n\n"
+            "--oat        Phase 1 OAT sweep (7 combinations, ~12–30 min).\n"
+            "--full-grid  Deprecated full factorial grid (18 combinations, ~40–90 min).\n"
             "--bayes      Explicit Bayesian search (same as default, accepts --n-trials).\n\n"
             "NOTE — Use Case B (180-day window) is DEFERRED due to runtime:\n"
-            "  OAT 8 runs × ~45–120 min/run = ~6–16 hours on a laptop.\n"
+            "  OAT 7 runs × ~45–120 min/run = ~5–14 hours on a laptop.\n"
             "  Only Use Case A (90-day window) is run here."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -835,12 +893,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--oat",
         action="store_true",
-        help="Run the OAT sweep (Phase 1, 7 combinations, ~14–35 min).",
+        help="Run the OAT sweep (Phase 1, 7 combinations, ~12–30 min).",
     )
     parser.add_argument(
         "--full-grid",
         action="store_true",
-        help="[DEPRECATED] Run the full factorial grid (54 combinations). Use --bayes instead.",
+        help="[DEPRECATED] Run the full factorial grid (18 combinations). Use --bayes instead.",
     )
     parser.add_argument(
         "--bayes",

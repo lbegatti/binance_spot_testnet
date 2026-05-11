@@ -12,6 +12,7 @@ from config_parameters import (
     CRYPTOCCY,
     HMM_REFIT_INTERVAL,
     HMM_MIN_CONFIDENCE,
+    VWAP_THRESHOLD_MULTIPLIER,
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import volume_weighted_average_price
@@ -187,20 +188,20 @@ class AnalysisEngine:
            ``0.70 × norm_depth + 0.30 × norm_delta``; picks the best for each
            side.  Returns an 8-element tuple
            ``(level_idx, score|None, delta, depth, obi, micro_price, bq, aq)``.
-        6. **VWAP filter** (dip / strength confirmation) — reads ``_bid_vwap`` /
-           ``_ask_vwap`` under ``_vwap_lock``:
-           - BUY:  execute only when ``bid_vwap`` is ``None`` **or**
-             ``micro_price < bid_vwap`` (current price is below the historical
-             bid average — genuine dip confirmed).  Skip when
-             ``micro_price ≥ bid_vwap`` (price is at or above the historical
-             bid — not a genuine dip).
-           - SELL: execute only when ``bid_vwap`` is ``None`` **or**
-             ``micro_price ≥ bid_vwap`` (current price is at or above the
-             historical bid average — genuine strength confirmed).  Skip when
-             ``micro_price < bid_vwap`` (price below historical bid — not
-             genuine strength).
-           Both VWAPs are ``None`` for the first ~1 min; filter is transparent
-           until ``historical_analysis`` publishes the first values.
+         6. **VWAP threshold gate** (dip / strength confirmation with dead zone) —
+            reads ``_bid_vwap`` / ``_ask_vwap`` under ``_vwap_lock``:
+            - BUY:  execute only when ``bid_vwap`` is ``None`` **or**
+              ``micro_price < bid_vwap × (1 − VWAP_THRESHOLD_MULTIPLIER)``
+              (dip is deep enough to cover round-trip fees and leave profit).
+              Skip when ``micro_price ≥ bid_vwap × (1 − threshold)`` (dip too
+              shallow — inside the dead zone or above VWAP entirely).
+            - SELL: execute only when ``bid_vwap`` is ``None`` **or**
+              ``micro_price ≥ bid_vwap × (1 + VWAP_THRESHOLD_MULTIPLIER)``
+              (rally is strong enough to cover fees and leave profit).
+              Skip when ``micro_price < bid_vwap × (1 + threshold)`` (rally
+              too weak — inside the dead zone or below VWAP entirely).
+            Both VWAPs are ``None`` for the first ~1 min; filter is transparent
+            until ``historical_analysis`` publishes the first values.
         7. **Regime confidence gate** — reads ``regime_director.regime_confidence``
            (posterior probability from ``predict_proba()``) under ``_regime_lock``:
            - Skip **both** sides if ``regime_confidence < HMM_MIN_CONFIDENCE``
@@ -277,20 +278,26 @@ class AnalysisEngine:
                 continue
 
             # After the first historical_analysis iteration (~1 min), _bid_vwap
-            # and _ask_vwap are populated.  They act as a dip/strength confirmation
-            # filter aligned with the reversed candidate logic in book_utils.py:
-            #   BUY  → execute only if bid_vwap is None or micro_price < bid_vwap
-            #          (price is below the historical bid average — genuine dip).
-            #          Skip if micro_price >= bid_vwap (price at/above historical
-            #          bid — not a genuine dip).
-            #   SELL → execute only if bid_vwap is None or micro_price >= bid_vwap
-            #          (price is at or above historical bid — genuine strength).
-            #          Skip if micro_price < bid_vwap (price below historical
-            #          bid — not genuine strength to sell into).
+            # and _ask_vwap are populated.  They act as a threshold-gated
+            # dip/strength confirmation filter (mean-reversion strategy):
+            #
+            #   BUY  → execute only if bid_vwap is None **or**
+            #          micro_price < bid_vwap × (1 − VWAP_THRESHOLD_MULTIPLIER)
+            #          The dip must be deep enough to cover the round-trip fee
+            #          and leave profit.  Microscopic noise below the VWAP
+            #          (≤ threshold) is rejected.
+            #          Skip if micro_price ≥ bid_vwap × (1 − threshold).
+            #
+            #   SELL → execute only if bid_vwap is None **or**
+            #          micro_price ≥ bid_vwap × (1 + VWAP_THRESHOLD_MULTIPLIER)
+            #          The rally must be strong enough to cover fees + profit.
+            #          Skip if micro_price < bid_vwap × (1 + threshold).
+            #
             # While VWAPs are still None (first ~1 min) the filter is transparent
             # and orders execute based on regime + score alone.
             if best_buy:
                 micro_price = best_buy[5]  # index 5 of the tuple
+                buy_threshold = bid_vwap * (1.0 - VWAP_THRESHOLD_MULTIPLIER) if bid_vwap is not None else None
                 if (
                     current_regime == "trending_down"
                     or current_regime == "high_volatility"
@@ -300,17 +307,21 @@ class AnalysisEngine:
                         iteration,
                         current_regime,
                     )
-                elif bid_vwap is not None and micro_price >= bid_vwap:
+                elif buy_threshold is not None and micro_price >= buy_threshold:
                     logging.info(
-                        "HFT #%d [buy] — skipped: micro_price %.2f >= bid_vwap %.2f (not a dip)",
+                        "HFT #%d [buy] — skipped: micro_price %.2f >= vwap_floor %.2f "
+                        "(bid_vwap=%.2f, threshold=%.4f — dip too shallow)",
                         iteration,
                         micro_price,
+                        buy_threshold,
                         bid_vwap,
+                        VWAP_THRESHOLD_MULTIPLIER,
                     )
                 else:
                     self.order_executor.execute("BUY", best_buy)
             if best_sell:
                 micro_price = best_sell[5]
+                sell_threshold = bid_vwap * (1.0 + VWAP_THRESHOLD_MULTIPLIER) if bid_vwap is not None else None
                 if (
                     current_regime == "trending_up"
                     or current_regime == "high_volatility"
@@ -320,12 +331,15 @@ class AnalysisEngine:
                         iteration,
                         current_regime,
                     )
-                elif bid_vwap is not None and micro_price <= bid_vwap:
+                elif sell_threshold is not None and micro_price < sell_threshold:
                     logging.info(
-                        "HFT #%d [sell] — skipped: micro_price %.2f <= bid_vwap %.2f (not strength)",
+                        "HFT #%d [sell] — skipped: micro_price %.2f < vwap_ceil %.2f "
+                        "(bid_vwap=%.2f, threshold=%.4f — rally too weak)",
                         iteration,
                         micro_price,
+                        sell_threshold,
                         bid_vwap,
+                        VWAP_THRESHOLD_MULTIPLIER,
                     )
                 else:
                     self.order_executor.execute("SELL", best_sell)

@@ -83,7 +83,7 @@ binance_spot_testnet/
 │   ├── regime_validation.py           # Offline long-horizon HMM validation — python -m backtest.regime_validation
 │   └── reporting/                     # Console report formatting and CSV export (AI-authored)
 │       ├── __init__.py
-│       └── formatters.py              # fmt(), print_report(), save_csv() — public helpers
+│       └── formatters.py              # fmt(), print_report(), save_csv(), print_sensitivity_table(), print_oat_sensitivity_report(), print_bnh_comparison() — public helpers
 │
 └── visualization/                     # Plotting utilities
     ├── __init__.py
@@ -750,10 +750,10 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
 | `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, bps-based `half_spread` fill model (`BACKTEST_FILL_SPREAD_BPS`), per-trade position cap (`BACKTEST_MAX_POSITION_PCT`), equity curve, FIFO round-trip pairing, Step 5 metrics |
 | `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7 |
-| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`) and CSV export (`save_csv`) — AI-authored |
+| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands (Panel 3 rebuild: `_REGIME_NUMERIC` step-line + confidence ×3 scaling), VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
-| `backtest/sensitivity.py` | ✅ done (Use Case A) | **Bayesian optimisation via Optuna TPE (default, 30 trials)**, OAT sweep (`--oat`, 7 runs), and deprecated full-grid (`--full-grid`, 36 combos) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`. `fee_rate` fixed at `0.001` in Bayes mode; OAT/full-grid test `[0.0005, 0.00025]`. `--lookback` flag overrides `SENSITIVITY_LOOKBACK` per run. `_check_existing_best_params()` guard prompts `[y/N]` before overwriting. Writes `best_params.json` and `optuna.db` (Bayes) — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
+| `backtest/sensitivity.py` | ✅ done (Use Case A) | **Bayesian optimisation via Optuna TPE (default, 30 trials)**, OAT sweep (`--oat`, 7 runs), and deprecated full-grid (`--full-grid`, 36 combos) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`. `fee_rate` fixed at `0.001` in Bayes mode; OAT/full-grid test `[0.0005, 0.00025]`. `--lookback` flag overrides `SENSITIVITY_LOOKBACK` per run. `_check_existing_best_params()` guard prompts `[y/N]` before overwriting. Human-readable output (sensitivity CSVs, Optuna HTML charts) written to **`backtest/reporting/`**; machine-readable artefacts (`best_params.json`, `optuna.db`) remain in `backtest/results/`. Console report formatting delegated to `backtest/reporting/formatters.py` (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`). Writes `best_params.json` — loaded by **both** `websocket_main.py` (live, at startup) **and** `run_backtest.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
 
 > **Parameter Flow**
 > ```
@@ -1098,5 +1098,5 @@ effectively instantaneous.
 
 ---
 
-*Document last updated: 2026-05-05*
+*Document last updated: 2026-05-07*
 

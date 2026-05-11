@@ -129,9 +129,11 @@ def collect_candidates(
     - **Depth-at-level-0 filter**: total depth must be ≥ 50 % of
       ``level_0_depth`` (sufficient liquidity relative to the best level).
 
-    A level passes as a **buy candidate** when ``micro_price > mid_price``
-    (aggressive buy pressure) and as a **sell candidate** when
-    ``micro_price < mid_price`` (aggressive sell pressure).
+    A level passes as a **buy candidate** when ``micro_price < mid_price``
+    (ask-side dominance — price dipping below mid, confirming a buy-the-dip
+    signal) and as a **sell candidate** when ``micro_price > mid_price``
+    (bid-side dominance — price elevated above mid, confirming
+    sell-into-strength).
 
     Extracting this logic here keeps it reusable by both the live
     ``AnalysisEngine`` and the backtesting pipeline without requiring callers
@@ -176,15 +178,15 @@ def collect_candidates(
     # was dropped).
     level_indices = np.arange(1, len(levels))
 
-    # obi > 0.0 → buy wall heavier than sell side; price may be pushed up.
-    # obi < 0.0 → sellers crowding the book; suggests a downward move.
-    # obi = 0   → balanced book.
+    # obi > 0.0 → bid wall heavier than ask side → micro_price pushed ABOVE mid → SELL signal.
+    # obi < 0.0 → ask wall heavier than bid side → micro_price pulled BELOW mid → BUY signal.
+    # obi = 0   → balanced book → micro_price ≈ mid_price → no directional candidate.
     not_thin = total_depths >= median_depth  # thin-book filter
     depth_ok = total_depths >= 0.5 * level_0_depth  # relative depth filter
     valid = not_thin & depth_ok
 
-    buy_mask = valid & (micro_prices > mid_prices)  # buy  signal
-    sell_mask = valid & (micro_prices < mid_prices)  # sell signal
+    buy_mask = valid & (micro_prices < mid_prices)   # mean-reversion BUY: price dipped below mid
+    sell_mask = valid & (micro_prices > mid_prices)  # mean-reversion SELL: price elevated above mid
 
     buy_deltas = micro_prices - mid_prices
     sell_deltas = mid_prices - micro_prices

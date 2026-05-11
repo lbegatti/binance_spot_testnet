@@ -117,6 +117,7 @@ def run_backtest(
         hmm_lookback_rows=best.get("hmm_lookback_rows"),
         hmm_max_regimes=best.get("hmm_max_regimes"),
         vwap_window=best.get("vwap_window"),
+        vwap_threshold=best.get("vwap_threshold"),  # from best_params.json (Bayesian-optimised)
     )
 
     # Step 4: simulate P&L

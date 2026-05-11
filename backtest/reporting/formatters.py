@@ -570,11 +570,6 @@ def print_bnh_comparison(best_row: pd.Series) -> None:
         return
 
     vs = bnh_ret - strat
-    verdict = (
-        "✅  strategy beat passive holding"
-        if vs >= 0
-        else "❌  strategy underperformed passive holding"
-    )
 
     w = 62  # inner width
     print()
@@ -585,7 +580,5 @@ def print_bnh_comparison(best_row: pd.Series) -> None:
     print(f"║  Strategy  return : {strat:>+8.2f}%   (Sharpe: {sharpe_str}){'':>{w - 48}}║")
     print(f"║  Buy-and-hold     : {bnh_ret:>+8.2f}%{'':>{w - 30}}║")
     print("╠" + "═" * w + "╣")
-    print(f"║  Outperformance   : {vs:>+8.2f}%   {verdict:<{w - 33}}║")
-    print("╚" + "═" * w + "╝")
     print()
 

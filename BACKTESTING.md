@@ -804,8 +804,7 @@ navigate the parameter space rather than exhaustively enumerating it.
 - The study is persisted to `backtest/results/optuna.db` (SQLite) with
   `load_if_exists=True`, so an interrupted run **resumes automatically** from
   the last completed trial.
-- Optional Plotly diagnostic HTML charts saved to `backtest/results/` via
-  `--save-plots`:
+- Plotly diagnostic HTML charts — automatically saved to **`backtest/reporting/`** after every Bayesian study:
   - `optuna_history_<ts>.html` — objective value vs trial number (convergence check).
   - `optuna_importance_<ts>.html` — fANOVA parameter importance.
   - `optuna_contour_<ts>.html` — 2-D Sharpe surface for `hmm_lookback_rows × vwap_window`.
@@ -813,7 +812,6 @@ navigate the parameter space rather than exhaustively enumerating it.
 ```bash
 python -m backtest.sensitivity                         # 30 trials (default)
 python -m backtest.sensitivity --bayes --n-trials 50  # custom trial count
-python -m backtest.sensitivity --bayes --save-plots   # also save HTML charts
 python -m backtest.sensitivity --lookback "180 days ago UTC"  # deep calibration
 ```
 
@@ -930,12 +928,12 @@ drawdown, Sortino, win rate, profit factor, round trips, avg holding period),
 followed by a per-parameter delta-Sharpe report.
 
 **Files written:**
-- `backtest/results/sensitivity_<mode>_<timestamp>.csv` — all metrics, all runs.
-- `backtest/results/best_params.json` — winning parameter set (ranked by Sharpe).
-- `backtest/results/optuna.db` — SQLite study persistence (Bayes mode only).
-- `backtest/results/optuna_history_<ts>.html` — (opt-in via `--save-plots`).
-- `backtest/results/optuna_importance_<ts>.html` — (opt-in via `--save-plots`).
-- `backtest/results/optuna_contour_<ts>.html` — (opt-in via `--save-plots`).
+- `backtest/reporting/sensitivity_<mode>_<timestamp>.csv` — all metrics, all runs (human-readable).
+- `backtest/results/best_params.json` — winning parameter set (ranked by Sharpe; machine-readable).
+- `backtest/results/optuna.db` — SQLite study persistence (Bayes mode only; machine-readable).
+- `backtest/reporting/optuna_history_<ts>.html` — (Bayes mode only — always saved automatically).
+- `backtest/reporting/optuna_importance_<ts>.html` — (Bayes mode only — always saved automatically).
+- `backtest/reporting/optuna_contour_<ts>.html` — (Bayes mode only — always saved automatically).
 
 ---
 
@@ -1156,8 +1154,8 @@ concrete file in `backtest/`.
   - Data pre-fetched once (`_make_objective` factory closure over `prefetched_df`).
   - Study persisted to `backtest/results/optuna.db`; resumes automatically if
     interrupted (`load_if_exists=True`).
-  - Three optional HTML charts (`--save-plots`): optimisation history,
-    parameter importance (fANOVA), contour (`hmm_lookback_rows × vwap_window`).
+  - Three optional HTML charts (`--save-plots`) — saved to **`backtest/reporting/`**:
+    optimisation history, parameter importance (fANOVA), contour (`hmm_lookback_rows × vwap_window`).
 
   - **OAT mode** (`python -m backtest.sensitivity --oat`):
   - 7 runs (1 baseline + 6 non-default), ~12–30 min.
@@ -1169,6 +1167,10 @@ concrete file in `backtest/`.
     editing `config_parameters.py`.
   - `_check_existing_best_params()` guard: shows age, Sharpe and params of any
     existing `best_params.json`; requires `[y/N]` confirmation before proceeding.
+  - Sensitivity CSVs (`sensitivity_<mode>_<ts>.csv`) written to **`backtest/reporting/`**;
+    `best_params.json` (machine-readable, loaded by live system) written to `backtest/results/`.
+  - Console report formatting (`print_sensitivity_table`, `print_oat_sensitivity_report`,
+    `print_bnh_comparison`) delegated to `backtest/reporting/formatters.py`.
   - Writes `best_params.json` — loaded via `strategy.param_loader`
     (`load_best_params()` by `websocket_main.py` at startup;
     `load_best_params_for_backtest()` by `run_backtest.py` before `run_signals()`).
@@ -1188,5 +1190,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-05-03*
+*Document last updated: 2026-05-07*
 

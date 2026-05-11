@@ -125,9 +125,11 @@ HMM_LOOKBACK conversion
 ------------------------
 ``best_params.json`` stores ``hmm_lookback_rows`` (``int``) because
 ``sensitivity.py`` is a backtest tool that counts rows.  The live system
-uses ``HMM_LOOKBACK`` (a dateutil string, e.g. ``"2 hours ago UTC"``).
-The mapping covers only the three values tested in ``sensitivity.py``;
-any unknown value is skipped with a WARNING.
+uses ``HMM_LOOKBACK`` (a dateutil string, e.g. ``"40 minutes ago UTC"``).
+Since 1 candle = 1 minute, the conversion is: ``rows_to_lookback(n)``
+which produces ``"N minutes ago UTC"`` for any positive integer N.
+This means any value Optuna discovers (30, 40, 70, …) is applied correctly
+without a static lookup table.
 """
 
 import json
@@ -140,13 +142,22 @@ import pathlib
 # Fixed — always resolves relative to this file's location (strategy/)
 BEST_PARAMS_PATH = pathlib.Path(__file__).parent.parent / "backtest" / "results" / "best_params.json"
 
-# Maps hmm_lookback_rows (int) → HMM_LOOKBACK dateutil string used by the
-# live system.  Only values tested in sensitivity.py are included.
-ROWS_TO_LOOKBACK: dict[int, str] = {
-    60: "1 hour ago UTC",
-    120: "2 hours ago UTC",  # config_parameters.py default
-    240: "4 hours ago UTC",
-}
+
+# Converts hmm_lookback_rows (int, 1-minute candles) → HMM_LOOKBACK dateutil
+# string used by the live system.  1 row = 1 minute, so the conversion is
+# direct: 40 rows → "40 minutes ago UTC".
+# A static lookup table was used previously but broke whenever Optuna discovered
+# a value outside the hand-coded set (e.g. 40). The function below handles any
+# positive integer correctly.
+
+def rows_to_lookback(rows: int) -> str:
+    """Convert a candle count to a dateutil lookback string (1 row = 1 minute)."""
+    if rows < 60:
+        return f"{rows} minutes ago UTC"
+    hours, mins = divmod(rows, 60)
+    if mins == 0:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago UTC"
+    return f"{rows} minutes ago UTC"
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +189,9 @@ def load_best_params() -> None:
     |                       | via ``ROWS_TO_LOOKBACK``)   |
     +-----------------------+-----------------------------+
 
+    Additionally patches ``strategy.analysis.VWAP_THRESHOLD_MULTIPLIER``
+    when ``vwap_threshold`` is present in ``best_params.json``.
+
     Falls back to ``config_parameters.py`` defaults silently when:
 
     - ``best_params.json`` is absent (WARNING logged).
@@ -186,6 +200,7 @@ def load_best_params() -> None:
       ``HMM_LOOKBACK`` left unchanged).
     """
     import strategy.regime_director as rd_mod  # deferred — avoids import cycle
+    import strategy.analysis as analysis_mod  # deferred — same reason
 
     if not BEST_PARAMS_PATH.exists():
         logging.warning(
@@ -214,20 +229,22 @@ def load_best_params() -> None:
     # ── Override HMM_LOOKBACK (convert int rows → dateutil string) ────────
     if "hmm_lookback_rows" in best:
         rows = int(best["hmm_lookback_rows"])
-        lookback_str = ROWS_TO_LOOKBACK.get(rows)
-        if lookback_str:
-            rd_mod.HMM_LOOKBACK = lookback_str
-            logging.info(
-                "param_loader: HMM_LOOKBACK = '%s' (%d rows)",
-                lookback_str,
-                rows,
-            )
-        else:
-            logging.warning(
-                "param_loader: hmm_lookback_rows=%d not in ROWS_TO_LOOKBACK "
-                "— HMM_LOOKBACK left at config default.",
-                rows,
-            )
+        lookback_str = rows_to_lookback(rows)
+        rd_mod.HMM_LOOKBACK = lookback_str
+        logging.info(
+            "param_loader: HMM_LOOKBACK = '%s' (%d rows)",
+            lookback_str,
+            rows,
+        )
+
+    # ── Override VWAP_THRESHOLD_MULTIPLIER in analysis.py ────────────────
+    if "vwap_threshold" in best:
+        analysis_mod.VWAP_THRESHOLD_MULTIPLIER = float(best["vwap_threshold"])
+        logging.info(
+            "param_loader: VWAP_THRESHOLD_MULTIPLIER = %.5f (%.3f %%)",
+            analysis_mod.VWAP_THRESHOLD_MULTIPLIER,
+            analysis_mod.VWAP_THRESHOLD_MULTIPLIER * 100,
+        )
 
     logging.info(
         "param_loader: best_params applied (generated %s, %s=%.4f).",
@@ -266,6 +283,8 @@ def load_best_params_for_backtest() -> dict:
         +-----------------------+----------+
         | ``vwap_window``       | ``int``  |
         +-----------------------+----------+
+        | ``vwap_threshold``    | ``float``|
+        +-----------------------+----------+
         | ``fee_rate``          | ``float``|
         +-----------------------+----------+
 
@@ -301,14 +320,15 @@ def load_best_params_for_backtest() -> dict:
         best.get("source_value", float("nan")),
     )
 
-    # Return only the four keys that the backtest pipeline consumes.
+    # Return only the keys that the backtest pipeline consumes.
     # Unknown / extra keys (e.g. generated_at) are intentionally excluded.
     result = {}
     for key, cast in (
-        ("hmm_lookback_rows", int),
-        ("hmm_max_regimes", int),
-        ("vwap_window", int),
-        ("fee_rate", float),
+            ("hmm_lookback_rows", int),
+            ("hmm_max_regimes", int),
+            ("vwap_window", int),
+            ("vwap_threshold", float),
+            ("fee_rate", float),
     ):
         if key in best:
             result[key] = cast(best[key])
