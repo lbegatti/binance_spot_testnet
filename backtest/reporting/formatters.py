@@ -349,7 +349,7 @@ def print_regime_validation_report(
         ("label_frequency", "Check 5 — Label frequency (all regimes ≥ 1 %):"),
         (
             "hit_rate_alignment",
-            "Check 6 — Hit-rate alignment (informational — compare with run_backtest.py):",
+            "Check 6 — Hit-rate alignment (informational — compare with runner.py):",
         ),
     ]
 

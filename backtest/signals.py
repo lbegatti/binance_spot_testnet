@@ -108,7 +108,7 @@ def run_signals(
     predict_every : int | None
         How many candles to skip between cheap Viterbi passes
         (``predict_current_regime()``).  1 = predict every candle (default,
-        used by ``run_backtest.py``).  Sensitivity runs may pass a higher
+        used by ``runner.py``).  Sensitivity runs may pass a higher
         value (e.g. ``SENSITIVITY_PREDICT_EVERY = 5``) to cut Viterbi
         overhead by ~5× while preserving relative parameter rankings.
     prefetched_df : pd.DataFrame | None
@@ -128,7 +128,7 @@ def run_signals(
 
         When ``None`` (default), the normal fetch path runs and the
         ``lookback`` parameter controls the window.  Existing callers
-        (``run_backtest.py``) are completely unaffected.
+        (``runner.py``) are completely unaffected.
     vwap_threshold : float | None
         Minimum fractional dip / rally required around the VWAP before a
         signal fires.  Creates a symmetric dead zone:
@@ -181,7 +181,8 @@ def run_signals(
         pd.DataFrame: One row per candle (from ``HMM_LOOKBACK_ROWS`` onward),
             indexed by ``timestamp``, with columns:
             ``close`` (candle close — VWAP anchor),
-            ``half_spread`` (``(high-low)/2`` — taker fill cost; BUY fills at
+            ``half_spread`` (bps-based fill cost: ``close × BACKTEST_FILL_SPREAD_BPS /
+            20_000``; default 5 bps ≈ $20 at $80k BTC. BUY fills at
             ``close + half_spread``, SELL fills at ``close - half_spread``),
             ``signal`` (+1 BUY / -1 SELL / 0 HOLD),
             ``regime``, ``regime_confidence`` (posterior probability of the
@@ -194,7 +195,7 @@ def run_signals(
     """
     # Resolve parameter overrides — fall back to config constants when None.
     # This is the only place where overrides are applied; callers that pass
-    # no arguments (e.g. run_backtest.py) are completely unaffected.
+    # no arguments (e.g. runner.py) are completely unaffected.
     _lookback = (
         hmm_lookback_rows if hmm_lookback_rows is not None else HMM_LOOKBACK_ROWS
     )

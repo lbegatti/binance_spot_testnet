@@ -127,15 +127,34 @@ SENSITIVITY_REFIT_EVERY = 480
 # (180 days) to keep each of the 6 OAT runs fast (~36–108 min total).
 # 30 days ≈ 43,200 rows at 1 m resolution.
 # IMPORTANT: this is passed as start_str to fetch_klines() inside run_signals()
-# only when called from sensitivity.py.  run_backtest.py always uses
+# only when called from sensitivity.py.  runner.py always uses
 # BACKTEST_LOOKBACK and is completely unaffected.
 SENSITIVITY_LOOKBACK = "90 days ago UTC"
 # How many candles to skip between cheap Viterbi passes (predict_current_regime)
 # in sensitivity.py.  Between two predict calls the last known regime label is
 # reused.  1-min candles → regime changes in ≤5 min are missed, but the
 # RELATIVE ranking of parameter combinations is preserved (all runs use the
-# same cadence).  run_backtest.py always uses predict_every=1 (every candle).
-SENSITIVITY_PREDICT_EVERY = 5  # 8 h at 1 m — sensitivity-sweep override only
+# same cadence).  runner.py always uses predict_every=1 (every candle).
+SENSITIVITY_PREDICT_EVERY = 5  # ~5 min at 1 m — sensitivity-sweep override only
+# Between two full-BIC refit calls, predict_current_regime() is called only every
+# 5 candles; the last known regime label is reused (~5× Viterbi speedup).
+# runner.py always uses predict_every=1 (every candle).
+
+# Fee rate applied to ALL sensitivity runs (OAT, full-grid, Bayes).
+# Must match BACKTEST_FEE_RATE — Binance charges what it charges regardless.
+# Kept as a separate constant so changing BACKTEST_FEE_RATE does not silently
+# affect sensitivity results (and vice versa), making any deliberate change obvious.
+SENSITIVITY_FEE_RATE: float = 0.001  # 0.10 % — standard Binance Spot taker fee
+
+# Metric used to rank parameter combinations and select best_params.json.
+# "sharpe_ratio" is the standard risk-adjusted return metric.
+# Other valid choices: "sortino_ratio", "total_return_pct".
+SENSITIVITY_RANK_METRIC: str = "sharpe_ratio"
+
+# |ΔSharpe| threshold that flags a parameter as highly sensitive in the OAT report.
+# If any non-default value moves the rank metric by more than this amount,
+# the OAT report prints a warning and recommends running --bayes.
+SENSITIVITY_OAT_THRESHOLD: float = 0.5
 
 # -- P&L simulation (backtest/pnl.py) -------------------------------------
 # Starting balances.  Total = USDT + BTC × first_close ≈ $10 000 at $68 k BTC.
@@ -168,25 +187,29 @@ BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
 # Maximum fraction of available USDT deployed per BUY trade.
 # Prevents all-in behaviour where fee + spread costs compound on 100 % of
 # the balance every round trip.  0.10 → at most 10 % risked per signal.
-# Set to 1.0 to revert to all-in behaviour.
+# Set to 1.0 to revert to full all-in behaviour.
 BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
 
 # ---------------------------------------------------------------------------
-# VWAP Threshold Multiplier — minimum dip / strength required to trade
+# VWAP gate — applies to BOTH live system AND backtest
 # ---------------------------------------------------------------------------
-# The bot only executes a BUY when micro_price < bid_vwap × (1 − threshold),
-# and only executes a SELL when micro_price ≥ bid_vwap × (1 + threshold).
-# This creates a symmetric dead zone around the VWAP so that microscopic
-# noise (1-penny vibrations) never triggers an order.
+# The bot executes a BUY only when micro_price < bid_vwap × (1 − threshold),
+# and a SELL only when micro_price ≥ bid_vwap × (1 + threshold).
+# This creates a symmetric dead zone around the VWAP so microscopic noise
+# (1-penny vibrations) never triggers an order.
 #
-# Rule of thumb: threshold must cover the round-trip fee to be profitable.
+# Rule of thumb: threshold must cover at least the round-trip fee.
 #   Standard Binance Spot taker fee: 0.10 % per side → 0.20 % round trip.
 #   0.002 (0.20 %) = exact round-trip break-even (2 × one-way fee).
-#   Default 0.003 (0.30 %) = break-even + 0.10 % profit margin per side.
+#   0.003 (0.30 %) = break-even + 0.10 % profit margin per side (default).
 #   Higher values filter out more marginal signals, reducing trade count.
-#   Sensitivity Bayesian search refines this value further (0.05 %–1.5 %).
 #
 # Increase to 0.005–0.010 in choppy / low-volatility markets.
-# Set to 0.0 to disable (revert to bare VWAP gate — buys any dip).
-VWAP_THRESHOLD_MULTIPLIER: float = 0.002  # 0.30 % dead zone — break-even + margin
+# Set to 0.0 to disable (reverts to bare VWAP gate — buys any dip).
+#
+# Imported by: strategy/analysis.py (live WebSocket path),
+#              backtest/signals.py  (backtest path),
+#              backtest/sensitivity.py (fixed baseline — not tuned in grid).
+VWAP_THRESHOLD_MULTIPLIER: float = 0.003  # 0.30 % dead zone — break-even + margin
+
 

@@ -132,45 +132,45 @@ class MessageHandler:
             if self._tick_count % QUOTE_EVERY_N_TICKS == 0:
                 calculate_best_quote(self.state.local_book)
 
-    def handle_balance_message(self, _, message):
-        """
-        Parse and apply an ``outboundAccountPosition`` event to the live balance state.
-
-        .. deprecated::
-            **Superseded by** ``OrderExecutor._handle_balance_update``.
-
-            Real-time balance updates now arrive on the same WebSocket API
-            connection used for order placement (``session.logon`` →
-            ``userDataStream.subscribe`` → ``outboundAccountPosition`` push).
-            This method is preserved for reference but is **not wired** to any
-            stream in the current architecture.
-
-        Processing steps (when active):
-
-        1. **Event filter** — silently ignores any event whose ``"e"`` field
-           is not ``"outboundAccountPosition"``.
-        2. **Balance update** — under ``state.thread_balance_lock``, iterates
-           over the ``"B"`` (balances) array and updates
-           ``state.balance_status[asset]`` for ``CRYPTOCCY`` and ``CCY``.
-           Only the ``"f"`` (free) field is stored.
-        3. **Logging** — logs the refreshed free balances while holding the
-           lock.
-
-        Args:
-            _: The WebSocket client instance (unused).
-            message (str): Raw JSON string from a Binance User Data Stream.
-        """
-        data = json.loads(message)
-        if "e" in data and data["e"] == "outboundAccountPosition":
-            with self.state.thread_balance_lock:
-                for asset_data in data.get("B", []):
-                    asset = asset_data["a"]
-                    if asset in self.state.balance_status:
-                        self.state.balance_status[asset] = float(asset_data["f"])
-                logging.info(
-                    "Balance status - %s: %s | %s: %s",
-                    CRYPTOCCY,
-                    self.state.balance_status[CRYPTOCCY],
-                    CCY,
-                    self.state.balance_status[CCY],
-                )
+    # def handle_balance_message(self, _, message):
+    #     """
+    #     Parse and apply an ``outboundAccountPosition`` event to the live balance state.
+    #
+    #     .. deprecated::
+    #         **Superseded by** ``OrderExecutor._handle_balance_update``.
+    #
+    #         Real-time balance updates now arrive on the same WebSocket API
+    #         connection used for order placement (``session.logon`` →
+    #         ``userDataStream.subscribe`` → ``outboundAccountPosition`` push).
+    #         This method is preserved for reference but is **not wired** to any
+    #         stream in the current architecture.
+    #
+    #     Processing steps (when active):
+    #
+    #     1. **Event filter** — silently ignores any event whose ``"e"`` field
+    #        is not ``"outboundAccountPosition"``.
+    #     2. **Balance update** — under ``state.thread_balance_lock``, iterates
+    #        over the ``"B"`` (balances) array and updates
+    #        ``state.balance_status[asset]`` for ``CRYPTOCCY`` and ``CCY``.
+    #        Only the ``"f"`` (free) field is stored.
+    #     3. **Logging** — logs the refreshed free balances while holding the
+    #        lock.
+    #
+    #     Args:
+    #         _: The WebSocket client instance (unused).
+    #         message (str): Raw JSON string from a Binance User Data Stream.
+    #     """
+    #     data = json.loads(message)
+    #     if "e" in data and data["e"] == "outboundAccountPosition":
+    #         with self.state.thread_balance_lock:
+    #             for asset_data in data.get("B", []):
+    #                 asset = asset_data["a"]
+    #                 if asset in self.state.balance_status:
+    #                     self.state.balance_status[asset] = float(asset_data["f"])
+    #             logging.info(
+    #                 "Balance status - %s: %s | %s: %s",
+    #                 CRYPTOCCY,
+    #                 self.state.balance_status[CRYPTOCCY],
+    #                 CCY,
+    #                 self.state.balance_status[CCY],
+    #             )

@@ -35,7 +35,7 @@ Three execution modes
 Use Case A vs Use Case B
 ------------------------
   USE CASE A — Live tuning  [IMPLEMENTED HERE]
-      Window: SENSITIVITY_LOOKBACK = "30 days ago UTC" (~43,200 rows).
+      Window: SENSITIVITY_LOOKBACK = "90 days ago UTC" (~129,600 rows at 1 m).
       Purpose: find parameter values that work well in RECENT conditions so
       the live system starts with a tuned configuration rather than hard-coded
       defaults.  Output written to backtest/results/best_params.json.
@@ -89,6 +89,9 @@ from config_parameters import (
     SENSITIVITY_REFIT_EVERY,
     SENSITIVITY_LOOKBACK,
     SENSITIVITY_PREDICT_EVERY,
+    SENSITIVITY_FEE_RATE,
+    SENSITIVITY_RANK_METRIC,
+    SENSITIVITY_OAT_THRESHOLD,
     VWAP_THRESHOLD_MULTIPLIER,
 )
 
@@ -120,34 +123,22 @@ _BEST_PARAMS_PATH = _RESULTS_DIR / "best_params.json"
 # and held fixed while other parameters are varied in the OAT sweep.
 #
 # fee_rate and vwap_threshold are NOT in this grid:
-#   fee_rate      — fixed at _BAYES_FEE_RATE (0.001 = standard Binance taker).
+#   fee_rate      — fixed at SENSITIVITY_FEE_RATE (0.001 = standard Binance taker).
 #                   Testing different fee tiers is meaningless: Binance charges
 #                   what it charges regardless of what value we use here.
 #   vwap_threshold — fixed at VWAP_THRESHOLD_MULTIPLIER (0.002) for OAT / full-grid.
 
 _PARAM_GRID: dict[str, list[Any]] = {
     "hmm_lookback_rows": [120, 60, 30],  # default 120 (2h)
-    "hmm_max_regimes":   [3, 2],         # default=3;   test 2
-    "vwap_window":       [5, 2, 3],      # default=5 min; test 2 min, 3 min
+    "hmm_max_regimes": [3, 2],  # default=3;   test 2
+    "vwap_window": [5, 2, 3],  # default=5 min; test 2 min, 3 min
 }
 
 _OPTUNA_SPACE: dict[str, tuple] = {
-    "hmm_lookback_rows": ("int",  30,  240, 10),
-    "hmm_max_regimes":   ("int",   2,    4,  1),
-    "vwap_window":       ("int",   2,   15,  1),
+    "hmm_lookback_rows": ("int", 30, 240, 10),
+    "hmm_max_regimes": ("int", 2, 4, 1),
+    "vwap_window": ("int", 2, 15, 1),
 }
-
-# Fixed fee rate used for all Bayes trials.
-# 0.001 = 0.1 % — standard Binance spot taker fee (no BNB discount).
-# fee_rate is a fixed exchange cost, not a strategy knob, and is excluded
-# from the Optuna search space (_OPTUNA_SPACE).
-_BAYES_FEE_RATE: float = 0.001
-
-# Metric used to rank combinations and select best_params.json.
-_RANK_METRIC = "sharpe_ratio"
-
-# Sharpe-change threshold that triggers Phase 2 (full factorial grid).
-_OAT_SENSITIVITY_THRESHOLD = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +235,7 @@ def _build_oat_grid() -> list[dict[str, Any]]:
       hmm_lookback_rows: 2 non-default
       hmm_max_regimes:   1 non-default
       vwap_window:       2 non-default
-    fee_rate and vwap_threshold are held fixed at _BAYES_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
+    fee_rate and vwap_threshold are held fixed at SENSITIVITY_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
     defaults = {k: v[0] for k, v in _PARAM_GRID.items()}
     grid: list[dict[str, Any]] = [defaults.copy()]  # run 0: baseline
@@ -266,7 +257,7 @@ def _build_full_grid() -> list[dict[str, Any]]:
       hmm_lookback_rows: [120, 60, 30]  → 3
       hmm_max_regimes:   [3, 2]         → 2
       vwap_window:       [5, 2, 3]      → 3
-    fee_rate and vwap_threshold are held fixed at _BAYES_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
+    fee_rate and vwap_threshold are held fixed at SENSITIVITY_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
     keys = list(_PARAM_GRID.keys())
     return [
@@ -506,9 +497,13 @@ def _run_sensitivity_optuna_study(
     #   "btcusdt_sensitivity_20260210". Interrupted runs on the same day still
     #   resume correctly (same study name). Old per-day studies stay in the DB
     #   as an audit trail but never pollute a new day's optimisation.
-    window_start_dt = pd.Timestamp.utcnow() - pd.tseries.frequencies.to_offset(
-        effective_lookback.replace(" ago UTC", "")
-    )
+    import re as _re
+    _m = _re.match(r"(\d+)\s+days?\s+ago", effective_lookback, _re.IGNORECASE)
+    if _m:
+        window_start_dt = pd.Timestamp.utcnow() - pd.Timedelta(days=int(_m.group(1)))
+    else:
+        # Fallback: use today as tag (study is still isolated per calendar day)
+        window_start_dt = pd.Timestamp.utcnow()
     window_tag = window_start_dt.strftime("%Y%m%d")
     study_name = f"btcusdt_sensitivity_{window_tag}"
 
@@ -550,9 +545,9 @@ def _run_sensitivity_optuna_study(
                 **t.params,  # hmm_lookback_rows, hmm_max_regimes, vwap_window
                 # fee_rate and vwap_threshold are fixed — recorded for CSV
                 # self-documentation but never varied across trials.
-                "fee_rate": _BAYES_FEE_RATE,
+                "fee_rate": SENSITIVITY_FEE_RATE,
                 "vwap_threshold": VWAP_THRESHOLD_MULTIPLIER,
-                _RANK_METRIC: t.value,
+                SENSITIVITY_RANK_METRIC: t.value,
             })
 
     if not rows:
@@ -561,7 +556,7 @@ def _run_sensitivity_optuna_study(
 
     results_df = (
         pd.DataFrame(rows)
-        .sort_values(_RANK_METRIC, ascending=False, na_position="last")
+        .sort_values(SENSITIVITY_RANK_METRIC, ascending=False, na_position="last")
         .reset_index(drop=True)
     )
 
@@ -572,17 +567,17 @@ def _run_sensitivity_optuna_study(
 
     log.info(
         "Best trial: %s = %.4f  (params: %s)",
-        _RANK_METRIC,
+        SENSITIVITY_RANK_METRIC,
         study.best_value,
         study.best_params,
     )
 
     # ── Reuse shared helpers ──────────────────────────────────────────────
     print_sensitivity_table(results_df, mode="bayes", param_grid=_PARAM_GRID, display_cols=_DISPLAY_COLS,
-                            rank_metric=_RANK_METRIC)
+                            rank_metric=SENSITIVITY_RANK_METRIC)
     _save_results(results_df, mode="bayes")
 
-    valid = results_df[results_df[_RANK_METRIC].notna()]
+    valid = results_df[results_df[SENSITIVITY_RANK_METRIC].notna()]
     if not valid.empty:
         # Re-run the best trial's params on current data BEFORE saving.
         # This ensures best_params.json always reflects today's window, not a
@@ -608,6 +603,8 @@ def _run_sensitivity_optuna_study(
         log.warning("No valid Optuna trials to save as best_params.json.")
 
     return results_df
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -621,7 +618,7 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
         Must contain: ``hmm_lookback_rows``, ``hmm_max_regimes``, ``vwap_window``.
         May optionally contain ``vwap_threshold`` (Bayes trials supply it;
         OAT / full-grid runs do not — defaults to ``VWAP_THRESHOLD_MULTIPLIER``).
-        ``fee_rate`` is always fixed at ``_BAYES_FEE_RATE`` regardless.
+        ``fee_rate`` is always fixed at ``SENSITIVITY_FEE_RATE`` regardless.
     prefetched_df : pd.DataFrame
         Feature-enriched klines DataFrame fetched once before the grid loop.
         Passed directly to ``run_signals()`` via ``prefetched_df=`` to avoid
@@ -632,7 +629,7 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
     dict
         The ``params`` dict merged with the stats dict from ``simulate_pnl()``.
     """
-    _fee = _BAYES_FEE_RATE
+    _fee = SENSITIVITY_FEE_RATE
     _threshold = params.get("vwap_threshold", VWAP_THRESHOLD_MULTIPLIER)
     log.info(
         "Running: lookback=%d  max_regimes=%d  vwap=%d  threshold=%.4f%%  fee=%.4f%%",
@@ -672,7 +669,7 @@ _DISPLAY_COLS = [
     "hmm_lookback_rows",
     "hmm_max_regimes",
     "vwap_window",
-    "vwap_threshold",       # fixed for OAT/grid; Bayes-optimised for Bayesian runs
+    "vwap_threshold",  # fixed for OAT/grid; Bayes-optimised for Bayesian runs
     "total_return_pct",
     "bnh_total_return_pct",  # passive buy-and-hold benchmark
     "strategy_vs_bnh_pct",  # total_return_pct − bnh_total_return_pct (derived)
@@ -704,6 +701,10 @@ def _save_best_params(best_row: pd.Series) -> None:
     """
     Write the winning parameter set to best_params.json.
 
+    Only overwrites the file if the new Sharpe ratio is strictly better than
+    the value already stored.  This prevents a noisy re-run from destroying
+    a previously healthy result.
+
     The live system loads this file at startup via _load_best_params()
     in websocket_main.py.  If the file is missing the live system falls
     back silently to config_parameters.py defaults.
@@ -711,23 +712,45 @@ def _save_best_params(best_row: pd.Series) -> None:
     IMPORTANT: do NOT commit best_params.json to git — it is sample-specific.
     Add 'backtest/results/best_params.json' to .gitignore.
     """
+    new_sharpe = float(best_row[SENSITIVITY_RANK_METRIC])
+
+    # ── Guard: never overwrite a better existing result ──────────────────
+    existing_sharpe = float("-inf")
+    if _BEST_PARAMS_PATH.exists():
+        try:
+            with _BEST_PARAMS_PATH.open() as fh:
+                existing = json.load(fh)
+            existing_sharpe = float(existing.get("source_value", float("-inf")))
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass  # unreadable — treat as no prior
+
+    if new_sharpe <= existing_sharpe:
+        log.warning(
+            "New %s (%.4f) ≤ existing (%.4f) — best_params.json NOT overwritten.",
+            SENSITIVITY_RANK_METRIC,
+            new_sharpe,
+            existing_sharpe,
+        )
+        return
+
     payload = {
         "hmm_lookback_rows": int(best_row["hmm_lookback_rows"]),
         "hmm_max_regimes": int(best_row["hmm_max_regimes"]),
         "vwap_window": int(best_row["vwap_window"]),
         "vwap_threshold": float(best_row.get("vwap_threshold", VWAP_THRESHOLD_MULTIPLIER)),
-        "fee_rate": float(best_row.get("fee_rate", _BAYES_FEE_RATE)),
+        "fee_rate": float(best_row.get("fee_rate", SENSITIVITY_FEE_RATE)),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source_metric": _RANK_METRIC,
-        "source_value": float(best_row[_RANK_METRIC]),
+        "source_metric": SENSITIVITY_RANK_METRIC,
+        "source_value": new_sharpe,
     }
     with _BEST_PARAMS_PATH.open("w") as fh:
         json.dump(payload, fh, indent=2)
     log.info(
-        "Best params saved → %s  (%s = %.4f)",
+        "Best params saved → %s  (%s = %.4f, improved from %.4f)",
         _BEST_PARAMS_PATH,
-        _RANK_METRIC,
-        payload["source_value"],
+        SENSITIVITY_RANK_METRIC,
+        new_sharpe,
+        existing_sharpe,
     )
 
 
@@ -752,7 +775,7 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
     Returns
     -------
     pd.DataFrame
-        One row per combination, sorted by ``_RANK_METRIC`` descending.
+        One row per combination, sorted by ``SENSITIVITY_RANK_METRIC`` descending.
     """
     effective_lookback = lookback if lookback is not None else SENSITIVITY_LOOKBACK
     if full_grid:
@@ -816,13 +839,13 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
             # CSV and the OAT sensitivity report, visibly marked as failed.
             all_results.append({
                 **params,
-                "fee_rate": _BAYES_FEE_RATE,
+                "fee_rate": SENSITIVITY_FEE_RATE,
                 "vwap_threshold": VWAP_THRESHOLD_MULTIPLIER,
-                _RANK_METRIC: float("nan"),
+                SENSITIVITY_RANK_METRIC: float("nan"),
             })
 
     results_df = pd.DataFrame(all_results).sort_values(
-        _RANK_METRIC, ascending=False, na_position="last"
+        SENSITIVITY_RANK_METRIC, ascending=False, na_position="last"
     )
 
     # Broadcast the B&H benchmark columns onto every row — same value for all
@@ -831,7 +854,7 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
         results_df[k] = v
 
     print_sensitivity_table(results_df, mode=mode, param_grid=_PARAM_GRID, display_cols=_DISPLAY_COLS,
-                            rank_metric=_RANK_METRIC)
+                            rank_metric=SENSITIVITY_RANK_METRIC)
 
     if not full_grid:
         # OAT: compute per-parameter sensitivity vs baseline
@@ -840,27 +863,27 @@ def run_sensitivity(full_grid: bool = True, lookback: str | None = None) -> pd.D
             (results_df["hmm_lookback_rows"] == defaults["hmm_lookback_rows"])
             & (results_df["hmm_max_regimes"] == defaults["hmm_max_regimes"])
             & (results_df["vwap_window"] == defaults["vwap_window"])
-        ]
+            ]
         if not baseline_rows.empty:
-            baseline_sharpe = float(baseline_rows.iloc[0][_RANK_METRIC])
+            baseline_sharpe = float(baseline_rows.iloc[0][SENSITIVITY_RANK_METRIC])
             trigger = print_oat_sensitivity_report(
                 results_df,
                 baseline_sharpe=baseline_sharpe,
                 param_grid=_PARAM_GRID,
-                rank_metric=_RANK_METRIC,
-                sensitivity_threshold=_OAT_SENSITIVITY_THRESHOLD,
+                rank_metric=SENSITIVITY_RANK_METRIC,
+                sensitivity_threshold=SENSITIVITY_OAT_THRESHOLD,
             )
             if trigger:
                 log.warning(
                     "At least one parameter exceeds the |ΔSharpe| > %.1f threshold. "
                     "Consider running Bayesian optimisation with --bayes for a wider search.",
-                    _OAT_SENSITIVITY_THRESHOLD,
+                    SENSITIVITY_OAT_THRESHOLD,
                 )
 
     _save_results(results_df, mode)
 
-    # Save best params (top row after sorting by _RANK_METRIC)
-    valid = results_df[results_df[_RANK_METRIC].notna()]
+    # Save best params (top row after sorting by SENSITIVITY_RANK_METRIC)
+    valid = results_df[results_df[SENSITIVITY_RANK_METRIC].notna()]
     if not valid.empty:
         _save_best_params(valid.iloc[0])
         print_bnh_comparison(valid.iloc[0])

@@ -3,7 +3,7 @@ backtest/diagnostics/
 ---------------------
 Standalone diagnostic tools for the backtesting framework.
 
-These scripts are **not** wired into ``backtest/run_backtest.py`` and must be
+These scripts are **not** wired into ``backtest/runner.py`` and must be
 run independently.  They are kept in a separate sub-package to make it
 immediately clear that they are one-off checks, not part of the main
 backtesting pipeline.

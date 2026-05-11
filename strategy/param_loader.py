@@ -10,7 +10,7 @@ Why ``strategy/`` and not ``backtest/``?
     This module is the *consumer* used by the live system — it belongs in
     ``strategy/`` alongside the other runtime components.
 
-    ``backtest/run_backtest.py`` has its own independent loader
+    ``backtest/runner.py`` has its own independent loader
     (``_load_best_params_for_backtest()``) that passes the values as kwargs
     to ``run_signals()`` and ``simulate_pnl()`` — no module patching needed
     there because the backtest functions accept explicit overrides.
@@ -48,7 +48,7 @@ Fields NOT overridden
                      signal that strategy alpha is thin at realistic fees
                      (0.001 = standard Binance Spot taker); simulating with the
                      lower value produces ~4× over-optimistic P&L.
-                     ``run_backtest.py`` deliberately ignores this field and
+                     ``runner.py`` deliberately ignores this field and
                      always uses ``BACKTEST_FEE_RATE`` from ``config_parameters.py``.
 
 Why patching ``config_parameters`` directly would NOT work

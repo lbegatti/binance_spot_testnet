@@ -5,6 +5,13 @@ import numpy as np
 
 def add_strategy_indicators(order_book_df: pd.DataFrame, strategy: str = "buy"):
     """Add indicators to the order book DataFrame to identify potential opportunities based on the specified strategy.
+
+    .. note::
+        **REST PATH ONLY** — called exclusively by ``strategy/quotes.py`` which
+        is used by the REST execution path (``restapi_main.py``).  The WebSocket
+        and backtesting paths use ``strategy/book_utils.py`` directly.
+        Do not remove — ``restapi_main.py`` depends on this.
+
     Indicators added:
     - micro_mid_delta: The difference between the micro price and the mid-price.
     - is_thin_micro_effect: Boolean indicating if the total depth is below the median depth, hinting a thin order book.

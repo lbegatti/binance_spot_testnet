@@ -21,11 +21,17 @@ outputs used for strategy evaluation:
 Fill assumption
 ---------------
 Fill prices are derived from the ``half_spread`` column stored in the signals
-DataFrame (``(high - low) / 2`` — the same quantity computed in
-``synthetic_book.py`` Step 1).  This is the natural taker cost:
+DataFrame.  This is a bps-based taker cost, NOT the candle range:
 
-    BUY  fill = close + half_spread   (≡ synthetic_best_ask — you cross the spread)
-    SELL fill = close - half_spread   (≡ synthetic_best_bid — you receive the bid)
+    half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
+    BUY  fill   = close + half_spread   (≡ synthetic ask — you cross the spread)
+    SELL fill   = close − half_spread   (≡ synthetic bid — you receive the bid)
+
+Why NOT ``(high − low) / 2``:
+    A 1-min BTC candle range of $50–$300 gives half_spread $25–$150 — 10–100×
+    larger than the real Binance BTCUSDT spread of ~1–5 bps.  ``(high-low)/2``
+    is used in ``synthetic_book.py`` ONLY for constructing synthetic level
+    prices; it is NOT the fill-cost model here.
 
 No additional slippage fraction is applied — the half-spread already captures
 the round-trip cost of crossing the synthetic bid/ask.

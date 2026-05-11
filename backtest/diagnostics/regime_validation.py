@@ -18,14 +18,14 @@ This is fast (seconds, not minutes) and scales to 1-year lookback with
 no performance concern.  The model never sees test data during fitting,
 so there is zero leakage by construction.
 
-**Not wired into ``run_backtest.py``** — this is a standalone diagnostic tool.
+**Not wired into ``runner.py``** — this is a standalone diagnostic tool.
 Run manually with:
 
     python -m backtest.diagnostics.regime_validation
 
 Why is this in ``backtest/diagnostics/`` and not ``backtest/``?
     All files directly in ``backtest/`` (``signals.py``, ``pnl.py``,
-    ``run_backtest.py``, etc.) form the main pipeline orchestrated by
+    ``runner.py``, etc.) form the main pipeline orchestrated by
     ``run_backtest()``.  This script is a separate, one-off health check
     for the HMM model and must be invoked independently.
 
@@ -96,9 +96,12 @@ logging.basicConfig(
 #   (paginated at 1 m resolution) but Phase 2 (fit + predict) still
 #   completes in seconds.  Use "90 days ago UTC" for a faster run.
 #
-# Note: BACKTEST_LOOKBACK (used by run_backtest.py) is intentionally kept
-#       at "90 days ago UTC" — this validation script uses its own
+# Note: BACKTEST_LOOKBACK (used by runner.py) is intentionally kept
+#       at "180 days ago UTC" — this validation script uses its own
 #       VALIDATION_LOOKBACK so the two tools remain independent.
+#       Unlike the live RegimeDirector (which trains on only HMM_TRAIN_ROWS = 80
+#       rows to avoid look-ahead bias), this diagnostic fits on the full 70%
+#       train set (~367,500 rows) for a thorough regime coverage check.
 # ---------------------------------------------------------------------------
 VALIDATION_LOOKBACK = "365 days ago UTC"  # fetch window (~1 year, ~525,000 rows)
 _TRAIN_RATIO = 0.70  # first 70 % = train, last 30 % = test (evaluated)
@@ -115,7 +118,7 @@ def _fetch_and_prepare() -> tuple[pd.DataFrame, int]:
     the evaluation-window start index from ``_TRAIN_RATIO``.
 
     Uses ``VALIDATION_LOOKBACK`` (default ``"365 days ago UTC"``, ~1 year,
-    independent of ``BACKTEST_LOOKBACK`` used by ``run_backtest.py``) —
+    independent of ``BACKTEST_LOOKBACK`` used by ``runner.py``) —
     bypasses ``BACKTEST_MAX_ROWS`` intentionally.
 
     Returns:
@@ -374,7 +377,7 @@ def _run_checks(
 
     **Check 6 — Hit-rate alignment (informational):**
         Fraction of test candles where the regime filter would block
-        BUY or SELL orders.  Compare with ``run_backtest.py``'s
+        BUY or SELL orders.  Compare with ``runner.py``'s
         ``regime_filter_hit_rate_pct``.
 
     Args:
@@ -518,7 +521,7 @@ def _run_checks(
     )
     both_blocked = test_labels["regime_label"].isin({"high_volatility"}).sum()
     results["hit_rate_alignment"] = {
-        "pass": True,  # informational — compare with run_backtest.py regime_filter_hit_rate_pct
+        "pass": True,  # informational — compare with runner.py regime_filter_hit_rate_pct
         "detail": (
             f"BUY  — allowed: {(n - buy_blocked) / n * 100:.1f}%  "
             f"blocked: {buy_blocked / n * 100:.1f}%  "

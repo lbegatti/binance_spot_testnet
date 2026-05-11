@@ -163,9 +163,9 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
-# At the default of 20 min the engine runs:
-#   • low_latency_analysis → 20 × 60 / 1  = 1200 iterations  (every 1 s)
-#   • historical_analysis  → 20 × 60 / 60 =   20 iterations  (every 60 s / 1 min)
+# At the default of 10 min the engine runs:
+#   • low_latency_analysis → 10 × 60 / 1  =  600 iterations  (every 1 s)
+#   • historical_analysis  → 10 × 60 / 60 =   10 iterations  (every 60 s / 1 min)
 
 session_minutes = DEFAULT_SESSION_MINUTES
 session_seconds = session_minutes * 60

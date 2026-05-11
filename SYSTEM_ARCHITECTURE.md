@@ -1,5 +1,5 @@
-"""
-SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY  (as of 2026-05-07)
+# SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY
+
 -----------------------------------------------------------------------------
 SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
@@ -41,9 +41,7 @@ FILES
       __init__.py                     — Re-exports fmt, print_report, save_csv, print_regime_validation_report
       formatters.py                   — fmt(), print_report(), save_csv(), print_regime_validation_report(), HEAVY/LIGHT/PREVIEW constants
 
-─────────────────────────────────────────────────────────────────────────────
-1. CONFIGURATION  (config_parameters.py)
-─────────────────────────────────────────────────────────────────────────────
+## 1. CONFIGURATION  (config_parameters.py)
   All constants are defined in one place and imported by every other module.
 
     SYMBOL               = "BTCUSDT" # trading pair used across all calls
@@ -110,9 +108,7 @@ FILES
     # the fee-adjusted divisor ensures the total debit never exceeds usdt,
     # preventing "insufficient balance" rejections on the testnet.
 
-─────────────────────────────────────────────────────────────────────────────
-2. SHARED STATE  (order_book_state.py — OrderBookState)
-─────────────────────────────────────────────────────────────────────────────
+## 2. SHARED STATE  (order_book_state.py — OrderBookState)
   Single source of truth injected into both MessageHandler and AnalysisEngine.
   Two dedicated locks prevent contention between the high-frequency order-book
   path (100 ms ticks) and the lower-frequency balance-update path:
@@ -142,9 +138,7 @@ FILES
     thread_balance_lock  : Lock   — serializes balance_status independently of
                                     thread_lock to avoid unnecessary contention
 
-─────────────────────────────────────────────────────────────────────────────
-3. DATA INGESTION & SYNCING  (message_handler.py — MessageHandler)
-─────────────────────────────────────────────────────────────────────────────
+## 3. DATA INGESTION & SYNCING  (message_handler.py — MessageHandler)
   Exposes one active WebSocket callback:
 
   ── handle_depth_message(_, message)  [ws_client — production diff-depth] ──
@@ -181,9 +175,7 @@ FILES
   through the testnet WebSocket API (wss://testnet.binance.vision/ws-api/v3)
   via OrderExecutor.
 
-─────────────────────────────────────────────────────────────────────────────
-4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
-─────────────────────────────────────────────────────────────────────────────
+## 4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
   Receives the same OrderBookState instance as MessageHandler.
   Checks stop_event on every iteration; exits gracefully when it is set.
 
@@ -324,9 +316,7 @@ FILES
                 historical iteration #20 → refreshes VWAP one last time
                 stop_event set → both threads exit
 
-─────────────────────────────────────────────────────────────────────────────
 4b. REGIME DETECTION  (strategy/regime_director.py — RegimeDirector)
-─────────────────────────────────────────────────────────────────────────────
   Trains a Gaussian Hidden Markov Model on recent Binance 1-minute klines
   to classify the current market into a hidden regime.  The result is exposed
   as a plain string label AND a posterior confidence float consumed by
@@ -416,9 +406,7 @@ FILES
       select_hmm_model()          — full EM refit + new scaler (outside _regime_lock)
       assign_regime_labels()      — fast label write (inside _regime_lock)
 
-─────────────────────────────────────────────────────────────────────────────
-5. SESSION DRIVER  (websocket_main.py)
-─────────────────────────────────────────────────────────────────────────────
+## 5. SESSION DRIVER  (websocket_main.py)
   Orchestrates the full lifecycle:
 
   Step 1 — Load .env (API key / secret), instantiate testnet REST client.
@@ -483,9 +471,7 @@ FILES
                     (gain/loss on the starting BTC position due to market movement)
                  A + B  Total P&L  = end_total − start_total  (%  return on start portfolio)
 
-─────────────────────────────────────────────────────────────────────────────
-6. EXECUTION  (execution/order_executor.py — OrderExecutor)
-─────────────────────────────────────────────────────────────────────────────
+## 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
   Places LIMIT GTC orders AND maintains real-time balance updates via a
   single Binance WebSocket API connection, avoiding the per-request HTTP
   overhead of the REST API and eliminating the need for a listenKey.
@@ -563,9 +549,7 @@ FILES
         class method).
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
 
-─────────────────────────────────────────────────────────────────────────────
-7. BACKTESTING  (backtest/)
-─────────────────────────────────────────────────────────────────────────────
+## 7. BACKTESTING  (backtest/)
   Offline replay of the live strategy on 180 days of historical 1-min klines
   (~259,200 candles).  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
@@ -768,18 +752,21 @@ FILES
                                      DEFAULT mode: Bayesian optimisation via
                                      Optuna TPE sampler (30 trials).  Also
                                      supports --oat (7 runs) and deprecated
-                                     --full-grid (36 combos).
+                                     --full-grid (18 combos).
                                      Tunes HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
                                      VWAP_WINDOW over a continuous search space
                                      (_OPTUNA_SPACE).  fee_rate fixed at 0.001
-                                     in Bayesian mode (not a strategy knob);
-                                     OAT/full-grid test [0.0005, 0.00025].
+                                     in ALL modes (BACKTEST_FEE_RATE — not a
+                                     strategy knob, not in the param grid).
+                                     vwap_threshold fixed at
+                                     VWAP_THRESHOLD_MULTIPLIER in OAT/full-grid
+                                     (also not in the param grid).
                                      Overrides passed as keyword args to
                                      run_signals() / simulate_pnl() — no changes
                                      to config_parameters.py or the live system.
                                     Three sensitivity-only speed-up constants
                                     (all in config_parameters.py, no effect on
-                                    run_backtest.py or the live system):
+                                    runner.py or the live system):
                                       SENSITIVITY_REFIT_EVERY = 480  (~4× fewer refits)
                                       SENSITIVITY_LOOKBACK = "90 days ago UTC"
                                                              (~2× fewer rows than 180d)
@@ -821,7 +808,7 @@ FILES
                                                    │     Patches are visible because RegimeDirector
                                                    │     __init__ uses None sentinels — see 4b.
                                                    │     Falls back to defaults if absent.
-                                                  └── load_best_params_for_backtest() ← run_backtest.py
+                                                  └── load_best_params_for_backtest() ← runner.py
                                                         called at top of run_backtest() before
                                                         run_signals(); returns dict of cast values
                                                         passed as kwargs (hmm_lookback_rows,
@@ -836,4 +823,3 @@ FILES
                          regime_validation.py ✅, visualization.py ✅,
                          sensitivity.py ✅ (Use Case A; Use Case B deferred),
                          param_loader.py ✅ (load_best_params + load_best_params_for_backtest).
-"""

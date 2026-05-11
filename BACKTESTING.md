@@ -1,7 +1,7 @@
 # Backtesting Plan — Binance Spot Testnet Strategy
 
 > **Status:** Steps 1–7 implemented (``data.py``, ``synthetic_book.py``,
-> ``signals.py``, ``pnl.py``, ``run_backtest.py``, ``regime_validation.py``,
+> ``signals.py``, ``pnl.py``, ``runner.py``, ``regime_validation.py``,
 > ``visualization.py``).  Step 8 (sensitivity analysis, Use Case A) is implemented with
 > **Bayesian optimisation via Optuna as the default execution mode**; OAT sweep retained
 > as `--oat`; full-grid deprecated.  Use Case B (180-day window) is deferred.
@@ -341,9 +341,10 @@ and volume).
 `ask_vwap` is retained in the signal record for diagnostics; both sides of the
 gate below use `bid_vwap` exclusively.
 
-Gate applied to Flow A output (after regime filter — **mean-reversion / dip-and-strength strategy**):
-- BUY:  execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) < bid_vwap(t)` (price has dipped below the historical bid average — genuine dip confirmed)
-- SELL: execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) ≥ bid_vwap(t)` (price is at or above the historical bid average — genuine strength confirmed)
+Gate applied to Flow A output (after regime filter — **mean-reversion / dip-and-strength strategy** with dead-zone threshold δ = `VWAP_THRESHOLD_MULTIPLIER`, default 0.003):
+- BUY:  execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) < bid_vwap(t) × (1 − δ)` (dip deep enough to cover the round-trip fee and leave profit)
+- SELL: execute only if `bid_vwap(t)` is `None` **or** `micro_price(t) ≥ bid_vwap(t) × (1 + δ)` (rally strong enough to cover the round-trip fee and leave profit)
+- Signals within ±δ of the VWAP are rejected as micro-noise.  Set `VWAP_THRESHOLD_MULTIPLIER = 0.0` in `config_parameters.py` to revert to the bare VWAP gate.
 
 ---
 
@@ -360,21 +361,24 @@ Flow C: bid_vwap, ask_vwap
 signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
                          AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
                          AND regime_label not in {"trending_down", "high_volatility"}
-                         AND (bid_vwap is None OR micro_price < bid_vwap)
-                             ← dip confirmed: price below historical bid average
+                         AND (bid_vwap is None
+                              OR micro_price < bid_vwap × (1 − VWAP_THRESHOLD_MULTIPLIER))
+                             ← dip deep enough to cover fees + leave profit
           = −1 (SELL)  if Flow A produced a SELL candidate
                          AND regime_confidence ≥ HMM_MIN_CONFIDENCE (or None)
                          AND regime_label not in {"trending_up", "high_volatility"}
-                         AND (bid_vwap is None OR micro_price ≥ bid_vwap)
-                             ← strength confirmed: price at or above historical bid average
+                         AND (bid_vwap is None
+                              OR micro_price ≥ bid_vwap × (1 + VWAP_THRESHOLD_MULTIPLIER))
+                             ← rally strong enough to cover fees + leave profit
           =  0 (flat)  otherwise
 ```
 
-> **Mean-reversion / dip-and-strength strategy.**  The VWAP gate uses `bid_vwap`
+> **Mean-reversion / dip-and-strength strategy with dead zone.**  The VWAP gate uses `bid_vwap`
 > for both sides (not `ask_vwap` for BUY).  A BUY fires only when the current
-> price has *fallen below* the rolling historical bid, confirming a genuine dip.
-> A SELL fires only when the price is *at or above* that same average, confirming
-> genuine strength to sell into.  The `ask_vwap` is still computed and stored in
+> price has *fallen below* the rolling historical bid **by more than δ**, confirming a genuine dip.
+> A SELL fires only when the price is *at or above* that same average **plus δ**, confirming
+> genuine strength to sell into.  The dead zone (±δ) prevents trading on micro-noise that
+> cannot cover the round-trip fee.  The `ask_vwap` is still computed and stored in
 > the signal record for diagnostic and visualisation purposes.
 
 ---
@@ -756,10 +760,10 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | Window | `SENSITIVITY_LOOKBACK = "90 days ago UTC"` (~129,600 rows at 1 m) |
 | Rationale | The live HMM refits every 5 min on the latest 2 h of data. Tuning on 90 days of **recent** data gives a broader regime sample while still being 2× faster than the full 180-day backtest window. |
 | Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
-| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `run_backtest.py` always predicts every candle. |
+| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `runner.py` always predicts every candle. |
 | Runtime (Bayes, 30 trials) | ~50–100 min on a laptop (klines pre-fetched once, shared across all trials) |
 | Runtime (OAT, 7 runs) | ~12–30 min on a laptop (after optimisations) |
-| Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `run_backtest.py`) |
+| Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `runner.py`) |
 | Run (Bayes, default) | `python -m backtest.sensitivity` or `python -m backtest.sensitivity --bayes` |
 | Run (OAT) | `python -m backtest.sensitivity --oat` |
 
@@ -873,7 +877,7 @@ that the study **resumes** (existing trials are not lost) rather than restarting
 
 `run_signals()` accepts six optional keyword arguments that default to `None`
 (falling back to `config_parameters.py` constants when `None`).  Existing
-callers (`run_backtest.py`) require zero changes.
+callers (`runner.py`) require zero changes.
 
 ```python
 # Inside _run_one() — shared by OAT, full-grid, and every Bayesian trial
@@ -890,7 +894,7 @@ _, _, stats = simulate_pnl(signals, fee_rate=params["fee_rate"])
 
 > **`fee_rate` in `_run_one()`:** `fee_rate=0.001` is always injected into
 > `params` before every `_run_one()` call (both Bayes and grid modes).
-> `run_backtest.py` uses its own `BACKTEST_FEE_RATE = 0.001` — the sensitivity
+> `runner.py` uses its own `BACKTEST_FEE_RATE = 0.001` — the sensitivity
 > result is informational only since Binance charges its fixed taker fee regardless.
 > The sensitivity optimizer's choice of fee rate is diagnostic, not prescriptive.
 
@@ -957,20 +961,20 @@ After the sweep, `sensitivity.py` writes the winning row to
 #### Who loads it and how
 
 Both consumers delegate to **`strategy/param_loader.py`** — the single module
-that owns all loading logic, keeping `websocket_main.py` and `run_backtest.py`
+that owns all loading logic, keeping `websocket_main.py` and `runner.py`
 free of JSON / file-handling code.
 
 | Consumer | Function called | When | What is overridden | Mechanism |
 |---|---|---|---|---|
 | `websocket_main.py` | `param_loader.load_best_params()` | At startup, before `RegimeDirector()` is instantiated | `HMM_MAX_REGIMES`, `HMM_LOOKBACK` | Patches `strategy.regime_director` module namespace directly (not `config_parameters`) — necessary because `regime_director.py` binds constants at import time via `from config_parameters import`. |
-| `run_backtest.py` | `param_loader.load_best_params_for_backtest()` | At the top of `run_backtest()`, before `run_signals()` | `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, `fee_rate` | Returns a plain `dict`; values passed as keyword arguments to `run_signals()` and `simulate_pnl()`. Keys absent from `best_params.json` are simply omitted — both functions fall back to `config_parameters.py` defaults automatically. |
+| `runner.py` | `param_loader.load_best_params_for_backtest()` | At the top of `run_backtest()`, before `run_signals()` | `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, `fee_rate` | Returns a plain `dict`; values passed as keyword arguments to `run_signals()` and `simulate_pnl()`. Keys absent from `best_params.json` are simply omitted — both functions fall back to `config_parameters.py` defaults automatically. |
 
 #### Parameter Flow
 
 ```
 sensitivity.py  ──►  best_params.json  ──►  strategy/param_loader.py
                                                   ├── load_best_params()             → websocket_main.py  (live)
-                                                  └── load_best_params_for_backtest() → run_backtest.py    (backtest)
+                                                  └── load_best_params_for_backtest() → runner.py    (backtest)
 ```
 
 Both consumers fall back silently to `config_parameters.py` defaults when
@@ -981,7 +985,7 @@ Both consumers fall back silently to `config_parameters.py` defaults when
 - `vwap_window` — backtest-only (`backtest/signals.py`).  The live system does
   not use `VWAP_WINDOW`, so `websocket_main.py` ignores this field.
 - `fee_rate` — informational for the live system (Binance charges its own fees
-  regardless).  `run_backtest.py` does pass it to `simulate_pnl()`.
+  regardless).  `runner.py` does pass it to `simulate_pnl()`.
 
 #### Notes on `HMM_LOOKBACK` (live) vs `HMM_LOOKBACK_ROWS` (backtest)
 
@@ -1092,7 +1096,9 @@ concrete file in `backtest/`.
   applies a **70/30 train-test split** at runtime (`split_idx = int(len(df) * 0.70)`).
   **Self-contained** — does not use `RegimeDirector`; replicates BIC search and label
   assignment directly with raw `GaussianHMM` + `StandardScaler` so the training window
-  is not capped at 80 rows.  Phase 2 scores all ~157,500 test candles in a
+  is **not** capped at `HMM_TRAIN_ROWS` (80 rows).  Unlike the live system which trains on
+  only 80 rows to avoid look-ahead bias, this diagnostic fits on the full 70% train set
+  (~367,500 rows) to give the HMM the broadest possible regime-coverage check.  Phase 2 scores all ~157,500 test candles in a
   **single vectorised Viterbi pass** with NumPy advanced indexing for confidence
   extraction (`proba[np.arange(n), states]`) and a lookup-array for label mapping
   (`label_array[states]`).  `BACKTEST_MAX_ROWS` is intentionally bypassed.
@@ -1173,7 +1179,7 @@ concrete file in `backtest/`.
     `print_bnh_comparison`) delegated to `backtest/reporting/formatters.py`.
   - Writes `best_params.json` — loaded via `strategy.param_loader`
     (`load_best_params()` by `websocket_main.py` at startup;
-    `load_best_params_for_backtest()` by `run_backtest.py` before `run_signals()`).
+    `load_best_params_for_backtest()` by `runner.py` before `run_signals()`).
 
   > **Why patches from `param_loader` take effect on `RegimeDirector`:**
   > `RegimeDirector.__init__` uses `None` sentinels for `lookback` and
