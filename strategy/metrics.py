@@ -25,24 +25,24 @@ def get_order_book_metrics(order_book_df: pd.DataFrame):
         pd.DataFrame: The input DataFrame with additional columns for the calculated metrics.
     """
     order_book_df["total_depth"] = (
-            order_book_df["bid_quantity"] + order_book_df["ask_quantity"]
+        order_book_df["bid_quantity"] + order_book_df["ask_quantity"]
     )
     order_book_df["mid_price"] = (
-                                         order_book_df["bid_price"] + order_book_df["ask_price"]
-                                 ) / 2
+        order_book_df["bid_price"] + order_book_df["ask_price"]
+    ) / 2
     order_book_df["obi"] = (
-                                   order_book_df["bid_quantity"] - order_book_df["ask_quantity"]
-                           ) / (order_book_df["bid_quantity"] + order_book_df["ask_quantity"])
+        order_book_df["bid_quantity"] - order_book_df["ask_quantity"]
+    ) / (order_book_df["bid_quantity"] + order_book_df["ask_quantity"])
     order_book_df["micro_price"] = (
-                                           (order_book_df["bid_price"] * order_book_df["ask_quantity"])
-                                           + (order_book_df["ask_price"] * order_book_df["bid_quantity"])
-                                   ) / (order_book_df["bid_quantity"] + order_book_df["ask_quantity"])
+        (order_book_df["bid_price"] * order_book_df["ask_quantity"])
+        + (order_book_df["ask_price"] * order_book_df["bid_quantity"])
+    ) / (order_book_df["bid_quantity"] + order_book_df["ask_quantity"])
     order_book_df["micro_vs_mid"] = (
-            order_book_df["micro_price"] > order_book_df["mid_price"]
+        order_book_df["micro_price"] > order_book_df["mid_price"]
     ).astype(bool)
     order_book_df["bid_ask_spread"] = (
-                                              order_book_df["ask_price"] - order_book_df["bid_price"]
-                                      ) / order_book_df["mid_price"]
+        order_book_df["ask_price"] - order_book_df["bid_price"]
+    ) / order_book_df["mid_price"]
     order_book_df["is_large_spread"] = order_book_df["bid_ask_spread"] > 0.001
     order_book_df["is_small_spread"] = order_book_df["bid_ask_spread"] <= 0.0002
 

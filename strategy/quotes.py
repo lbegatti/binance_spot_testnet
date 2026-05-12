@@ -23,10 +23,10 @@ def find_best_quote(order_book_df: pd.DataFrame, position: str) -> pd.DataFrame:
     micro_filter = df["micro_vs_mid"] if position == "buy" else ~df["micro_vs_mid"]
 
     is_opportunity = (
-            (~df["is_thin_micro_effect"])
-            & micro_filter
-            & df["is_total_depth_50pct_l0"]
-            & (df.index != 0)  # skip level 0 (best quote)
+        (~df["is_thin_micro_effect"])
+        & micro_filter
+        & df["is_total_depth_50pct_l0"]
+        & (df.index != 0)  # skip level 0 (best quote)
     )
 
     if "micro_mid_delta" not in df.columns or not is_opportunity.any():

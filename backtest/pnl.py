@@ -71,9 +71,9 @@ log = logging.getLogger(__name__)
 
 
 def compute_buy_and_hold(
-        signals: pd.DataFrame,
-        initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
-        fee_rate: float = BACKTEST_FEE_RATE,
+    signals: pd.DataFrame,
+    initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
+    fee_rate: float = BACKTEST_FEE_RATE,
 ) -> dict[str, Any]:
     """
     Compute the passive buy-and-hold return over the same window as the
@@ -127,8 +127,8 @@ def compute_buy_and_hold(
     entry_price = float(close_series.iloc[0])
     exit_price = float(signals["close"].dropna().iloc[-1])
 
-    # Gross BTC purchased; fee reduces effective quantity
-    gross_btc = initial_usdt / entry_price
+    # Fee reduces the USDT available to deploy; the remaining USDT buys BTC.
+    # Equivalent to: gross_btc × (1 − fee_rate) — same result, cleaner arithmetic.
     entry_fee = initial_usdt * fee_rate  # fee in USDT at entry
     net_usdt_deployed = initial_usdt - entry_fee  # USDT remaining after fee
     btc_held = net_usdt_deployed / entry_price  # actual BTC held
@@ -154,17 +154,16 @@ def compute_buy_and_hold(
     }
 
 
-
 # Regimes that block a BUY / SELL signal (must stay in sync with analysis.py)
 _BUY_BLOCKED_REGIMES = {"trending_down", "high_volatility"}
 _SELL_BLOCKED_REGIMES = {"trending_up", "high_volatility"}
 
 
 def simulate_pnl(
-        signals: pd.DataFrame,
-        initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
-        initial_btc: float = BACKTEST_INITIAL_BTC,
-        fee_rate: float = BACKTEST_FEE_RATE,
+    signals: pd.DataFrame,
+    initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
+    initial_btc: float = BACKTEST_INITIAL_BTC,
+    fee_rate: float = BACKTEST_FEE_RATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """
     Simulate P&L on the signal DataFrame from ``run_signals()``.
@@ -228,7 +227,7 @@ def simulate_pnl(
 
             # Fill at the synthetic ask: close + half_spread.
             # This is the natural taker cost — you cross the spread when buying.
-            # half_spread = (high - low) / 2 already captures the round-trip cost.
+            # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
             eff_price = close + half_spread
 
             # Balance guard: cannot spend more USDT than available.
@@ -284,7 +283,7 @@ def simulate_pnl(
 
             # Fill at the synthetic bid: close - half_spread.
             # You receive less than mid when selling — the spread is the cost.
-            # half_spread = (high - low) / 2 already captures the round-trip cost.
+            # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
             eff_price = close - half_spread
 
             # Balance guard: cannot sell more BTC than held.
@@ -386,8 +385,8 @@ def simulate_pnl(
 
 
 def _pair_round_trips(
-        trades_df: pd.DataFrame,
-        last_close: float,
+    trades_df: pd.DataFrame,
+    last_close: float,
 ) -> list[dict]:
     """
     Pair each BUY with the subsequent SELL to form round-trip trades.
@@ -497,8 +496,8 @@ def _pair_round_trips(
 
                 try:
                     holding_min: float = (
-                                                 pd.Timestamp(str(ts)) - entry["ts"]
-                                         ).total_seconds() / 60.0
+                        pd.Timestamp(str(ts)) - entry["ts"]
+                    ).total_seconds() / 60.0
                 except (TypeError, ValueError):
                     holding_min = float("nan")
 
@@ -536,12 +535,12 @@ def _pair_round_trips(
 
 
 def _compute_stats(
-        signals: pd.DataFrame,
-        equity_df: pd.DataFrame,
-        round_trips: list[dict],
-        initial_usdt: float,
-        initial_btc: float,
-        final_equity: float,
+    signals: pd.DataFrame,
+    equity_df: pd.DataFrame,
+    round_trips: list[dict],
+    initial_usdt: float,
+    initial_btc: float,
+    final_equity: float,
 ) -> dict[str, Any]:
     """
     Compute Step 5 performance metrics from the equity curve and round trips.
@@ -706,7 +705,7 @@ def _compute_stats(
     has_confidence_col = "regime_confidence" in signals.columns
     if has_confidence_col:
         _conf_low = signals["regime_confidence"].notna() & (
-                signals["regime_confidence"] < HMM_MIN_CONFIDENCE
+            signals["regime_confidence"] < HMM_MIN_CONFIDENCE
         )
         confidence_blocked_buy = int(
             (signals["best_buy_micro"].notna() & _conf_low).sum()
@@ -724,16 +723,16 @@ def _compute_stats(
     # Regime-blocked: passed confidence gate but regime was unfavourable.
     regime_blocked_buy = int(
         (
-                signals["best_buy_micro"].notna()
-                & _conf_passed
-                & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
+            signals["best_buy_micro"].notna()
+            & _conf_passed
+            & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
         ).sum()
     )
     regime_blocked_sell = int(
         (
-                signals["best_sell_micro"].notna()
-                & _conf_passed
-                & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+            signals["best_sell_micro"].notna()
+            & _conf_passed
+            & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
         ).sum()
     )
 

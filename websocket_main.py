@@ -305,14 +305,14 @@ finally:
             if item["asset"] in (CCY, CRYPTOCCY)
         }
         final_usdt = final_balances.get(CCY, 0.0)
-        final_btc  = final_balances.get(CRYPTOCCY, 0.0)
-        d_usdt     = final_usdt - usdt_balance
-        d_btc      = final_btc  - btc_balance
+        final_btc = final_balances.get(CRYPTOCCY, 0.0)
+        d_usdt = final_usdt - usdt_balance
+        d_btc = final_btc - btc_balance
 
         # Fetch current BTC price for portfolio valuation.
         # noinspection PyArgumentList
-        btc_end_price   = float(rest_client.ticker_price(symbol=SYMBOL)["price"])
-        end_total_usdt  = final_usdt + final_btc * btc_end_price
+        btc_end_price = float(rest_client.ticker_price(symbol=SYMBOL)["price"])
+        end_total_usdt = final_usdt + final_btc * btc_end_price
 
         # ── P&L attribution ────────────────────────────────────────────────
         # trading_pnl  = what the STRATEGY contributed.
@@ -331,10 +331,10 @@ finally:
         # All three are in USDT.
 
         if btc_start_price is not None and start_total_usdt is not None:
-            trading_pnl  = d_usdt + d_btc * btc_end_price
-            price_pnl    = btc_balance * (btc_end_price - btc_start_price)
-            total_pnl    = end_total_usdt - start_total_usdt
-            pct_return   = total_pnl / start_total_usdt * 100 if start_total_usdt else 0.0
+            trading_pnl = d_usdt + d_btc * btc_end_price
+            price_pnl = btc_balance * (btc_end_price - btc_start_price)
+            total_pnl = end_total_usdt - start_total_usdt
+            pct_return = total_pnl / start_total_usdt * 100 if start_total_usdt else 0.0
             # Sanity-check: trading_pnl + price_pnl == total_pnl (algebraic identity).
             # Any residual is floating-point rounding noise — shown for transparency.
             residual = total_pnl - (trading_pnl + price_pnl)
@@ -360,17 +360,30 @@ finally:
                 "    ─────────────────────────────────────────────────────\n"
                 "    A + B  Total P&L : %+.2f  (%+.3f %%)\n"
                 "====================================================",
-                CCY,       usdt_balance, final_usdt, d_usdt,
-                CRYPTOCCY, btc_balance,  final_btc,  d_btc,
-                btc_start_price, btc_end_price, btc_end_price - btc_start_price,
+                CCY,
+                usdt_balance,
+                final_usdt,
+                d_usdt,
+                CRYPTOCCY,
+                btc_balance,
+                final_btc,
+                d_btc,
+                btc_start_price,
+                btc_end_price,
+                btc_end_price - btc_start_price,
                 start_total_usdt,
                 end_total_usdt,
                 trading_pnl,
-                price_pnl, btc_balance, btc_end_price - btc_start_price,
-                total_pnl, pct_return,
+                price_pnl,
+                btc_balance,
+                btc_end_price - btc_start_price,
+                total_pnl,
+                pct_return,
             )
             if abs(residual) > 0.01:
-                logging.warning("P&L residual %.4f (floating-point rounding).", residual)
+                logging.warning(
+                    "P&L residual %.4f (floating-point rounding).", residual
+                )
         else:
             # Fallback: no start price captured — show raw deltas only.
             logging.info(
@@ -381,10 +394,17 @@ finally:
                 "  Portfolio (USDT equiv, end price %.2f)\n"
                 "    End total : %.2f %s\n"
                 "====================================================",
-                CCY,      usdt_balance, final_usdt, d_usdt,
-                CRYPTOCCY, btc_balance, final_btc,  d_btc,
+                CCY,
+                usdt_balance,
+                final_usdt,
+                d_usdt,
+                CRYPTOCCY,
+                btc_balance,
+                final_btc,
+                d_btc,
                 btc_end_price,
-                end_total_usdt, CCY,
+                end_total_usdt,
+                CCY,
             )
     except Exception as e:
         logging.error("Could not fetch final balance: %s", e)

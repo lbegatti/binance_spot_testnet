@@ -140,7 +140,9 @@ import pathlib
 # Constants
 # ---------------------------------------------------------------------------
 # Fixed — always resolves relative to this file's location (strategy/)
-BEST_PARAMS_PATH = pathlib.Path(__file__).parent.parent / "backtest" / "results" / "best_params.json"
+BEST_PARAMS_PATH = (
+    pathlib.Path(__file__).parent.parent / "backtest" / "results" / "best_params.json"
+)
 
 
 # Converts hmm_lookback_rows (int, 1-minute candles) → HMM_LOOKBACK dateutil
@@ -149,6 +151,7 @@ BEST_PARAMS_PATH = pathlib.Path(__file__).parent.parent / "backtest" / "results"
 # A static lookup table was used previously but broke whenever Optuna discovered
 # a value outside the hand-coded set (e.g. 40). The function below handles any
 # positive integer correctly.
+
 
 def rows_to_lookback(rows: int) -> str:
     """Convert a candle count to a dateutil lookback string (1 row = 1 minute)."""
@@ -324,11 +327,11 @@ def load_best_params_for_backtest() -> dict:
     # Unknown / extra keys (e.g. generated_at) are intentionally excluded.
     result = {}
     for key, cast in (
-            ("hmm_lookback_rows", int),
-            ("hmm_max_regimes", int),
-            ("vwap_window", int),
-            ("vwap_threshold", float),
-            ("fee_rate", float),
+        ("hmm_lookback_rows", int),
+        ("hmm_max_regimes", int),
+        ("vwap_window", int),
+        ("vwap_threshold", float),
+        ("fee_rate", float),
     ):
         if key in best:
             result[key] = cast(best[key])

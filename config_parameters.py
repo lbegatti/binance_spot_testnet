@@ -211,5 +211,3 @@ BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
 #              backtest/signals.py  (backtest path),
 #              backtest/sensitivity.py (fixed baseline — not tuned in grid).
 VWAP_THRESHOLD_MULTIPLIER: float = 0.003  # 0.30 % dead zone — break-even + margin
-
-

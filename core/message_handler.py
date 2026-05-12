@@ -3,7 +3,7 @@ import logging
 
 from strategy.best_quote_calculator import calculate_best_quote
 from core.order_book_state import OrderBookState
-from config_parameters import CRYPTOCCY, CCY, QUOTE_EVERY_N_TICKS
+from config_parameters import QUOTE_EVERY_N_TICKS
 
 
 class MessageHandler:

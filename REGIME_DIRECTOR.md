@@ -136,7 +136,7 @@ if best_buy:
         # regime blocks BUY — skip entirely, do not evaluate VWAP
         pass
     elif bid_vwap is not None and micro_price >= bid_vwap * (1.0 - VWAP_THRESHOLD_MULTIPLIER):
-        # VWAP dead-zone blocks BUY — dip too shallow to cover fees (inside ±δ)
+        # VWAP dead-zone blocks BUY — dip too shallow to cover fees (inside ±δ of bid_vwap)
         pass
     else:
         executor.execute("BUY", best_buy)      # both filters passed
@@ -145,12 +145,14 @@ if best_sell:
     if current_regime in ("trending_up", "high_volatility"):
         # regime blocks SELL — skip entirely
         pass
-    elif bid_vwap is not None and micro_price < bid_vwap * (1.0 + VWAP_THRESHOLD_MULTIPLIER):
-        # VWAP dead-zone blocks SELL — rally too weak to cover fees (inside ±δ)
+    elif ask_vwap is not None and micro_price < ask_vwap * (1.0 + VWAP_THRESHOLD_MULTIPLIER):
+        # VWAP dead-zone blocks SELL — rally too weak to cover fees (inside ±δ of ask_vwap)
         pass
     else:
         executor.execute("SELL", best_sell)    # both filters passed
 ```
+
+BUY is anchored to `bid_vwap` (volume-weighted bid pressure); SELL is anchored to `ask_vwap` (volume-weighted ask pressure). Using separate anchors avoids cross-side VWAP bias.
 
 ---
 
@@ -191,7 +193,7 @@ historical_analysis()                       low_latency_analysis()
   ④ assign_regime_labels()                          or "high_volatility"
          under _regime_lock                    ⑥ VWAP FILTER (mean-reversion + dead zone)
          (fast write only)                          BUY  blocked if micro ≥ bid_vwap × (1−δ)
-                                                    SELL blocked if micro < bid_vwap × (1+δ)
+                                                    SELL blocked if micro < ask_vwap × (1+δ)
                                               ⑦ OrderExecutor.execute()
                                                    LIMIT GTC via WebSocket API
 ```

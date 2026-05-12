@@ -3,7 +3,14 @@ import logging
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 from binance.lib.utils import websocket_api_signature, get_uuid
 from core.order_book_state import OrderBookState
-from config_parameters import SYMBOL, CRYPTOCCY, CCY, RECV_WINDOW, ORDER_REPORT_LIMIT, BACKTEST_FEE_RATE
+from config_parameters import (
+    SYMBOL,
+    CRYPTOCCY,
+    CCY,
+    RECV_WINDOW,
+    ORDER_REPORT_LIMIT,
+    BACKTEST_FEE_RATE,
+)
 
 
 class OrderExecutor:

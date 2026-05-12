@@ -185,8 +185,12 @@ def collect_candidates(
     depth_ok = total_depths >= 0.5 * level_0_depth  # relative depth filter
     valid = not_thin & depth_ok
 
-    buy_mask = valid & (micro_prices < mid_prices)   # mean-reversion BUY: price dipped below mid
-    sell_mask = valid & (micro_prices > mid_prices)  # mean-reversion SELL: price elevated above mid
+    buy_mask = valid & (
+        micro_prices < mid_prices
+    )  # mean-reversion BUY: price dipped below mid
+    sell_mask = valid & (
+        micro_prices > mid_prices
+    )  # mean-reversion SELL: price elevated above mid
 
     buy_deltas = micro_prices - mid_prices
     sell_deltas = mid_prices - micro_prices

@@ -204,7 +204,9 @@ def run_signals(
     _refit_every = refit_every if refit_every is not None else REFIT_EVERY
     _predict_every = predict_every if predict_every is not None else 1
     _fetch_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
-    _vwap_threshold = vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
+    _vwap_threshold = (
+        vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
+    )
 
     # 1. Fetch and prepare data
     if prefetched_df is not None:
@@ -386,20 +388,25 @@ def run_signals(
         # Threshold-gated mean-reversion: the dip / rally must be large enough
         # to cover round-trip fees and leave a profit margin.
         #   BUY  → price < bid_vwap × (1 − threshold)   [deep enough dip]
-        #   SELL → price ≥ bid_vwap × (1 + threshold)   [strong enough rally]
-        # Both sides use bid_vwap; ask_vwap is retained in the record for
-        # diagnostics but is no longer used by the gate logic.
+        #          anchored to bid VWAP — the relevant pressure for buy-side.
+        #   SELL → price ≥ ask_vwap × (1 + threshold)   [strong enough rally]
+        #          anchored to ask VWAP — the relevant pressure for sell-side.
+        # Using separate anchors avoids cross-side VWAP bias.
         if confidence_ok:
             if best_buy and best_buy_micro is not None:
                 regime_ok = regime not in ("trending_down", "high_volatility")
-                vwap_floor = bid_vwap * (1.0 - _vwap_threshold) if bid_vwap is not None else None
+                vwap_floor = (
+                    bid_vwap * (1.0 - _vwap_threshold) if bid_vwap is not None else None
+                )
                 vwap_ok = vwap_floor is None or best_buy_micro < vwap_floor
                 if regime_ok and vwap_ok:
                     signal = 1
 
             if best_sell and best_sell_micro is not None and signal == 0:
                 regime_ok = regime not in ("trending_up", "high_volatility")
-                vwap_ceil = bid_vwap * (1.0 + _vwap_threshold) if bid_vwap is not None else None
+                vwap_ceil = (
+                    ask_vwap * (1.0 + _vwap_threshold) if ask_vwap is not None else None
+                )
                 vwap_ok = vwap_ceil is None or best_sell_micro >= vwap_ceil
                 if regime_ok and vwap_ok:
                     signal = -1
@@ -408,7 +415,7 @@ def run_signals(
             {
                 "timestamp": timestamp,
                 "close": close_price,  # candle close — VWAP anchor
-                "half_spread": half_spread,  # (high-low)/2 — taker fill cost
+                "half_spread": half_spread,  # bps-based taker fill cost: close × BACKTEST_FILL_SPREAD_BPS / 20_000
                 "signal": signal,
                 "regime": regime,
                 "regime_confidence": regime_confidence,  # posterior prob of winning state

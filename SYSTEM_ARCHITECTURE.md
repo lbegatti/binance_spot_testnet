@@ -208,25 +208,22 @@ FILES
       • Scores candidates (70 % depth / 30 % delta) and picks the best
         opportunity for buy and sell sides.
         Opportunity tuple: (level_idx, score|None, delta, depth, obi, micro_price, bq, aq).
-      • VWAP FILTER (mean-reversion / dip-and-strength confirmation) — reads _bid_vwap
-        (and _ask_vwap, retained for diagnostics) under _vwap_lock:
-          BUY:  execute only if _bid_vwap is None OR micro_price < bid_vwap.
-                Interpretation: genuine dip — current price has fallen BELOW
-                the historical avg bid, confirming a buy-the-dip signal.
-                Skip with log if micro_price >= bid_vwap (price at/above average
-                — not a genuine dip).
-          SELL: execute only if _bid_vwap is None OR micro_price >= bid_vwap.
-                Interpretation: genuine strength — current price is AT or ABOVE
-                the historical avg bid, confirming a sell-into-strength signal.
-                Skip with log if micro_price < bid_vwap (price below average
-                — not genuine strength to sell into).
-        Both comparisons use _bid_vwap; _ask_vwap is still computed and stored
-        in state but is not used by the gate logic (retained for diagnostics).
+      • VWAP FILTER (mean-reversion / dip-and-strength confirmation with dead zone) —
+        reads _bid_vwap and _ask_vwap under _vwap_lock.
+        Each side is anchored to its own reference price to avoid cross-side bias:
+          BUY:  execute only if _bid_vwap is None OR
+                micro_price < bid_vwap × (1 − VWAP_THRESHOLD_MULTIPLIER).
+                Anchored to bid_vwap (volume-weighted bid pressure).
+                Dip must be deeper than δ below the bid average to cover fees.
+                Skip if micro_price >= bid_vwap × (1 − δ)  [inside dead zone].
+          SELL: execute only if _ask_vwap is None OR
+                micro_price >= ask_vwap × (1 + VWAP_THRESHOLD_MULTIPLIER).
+                Anchored to ask_vwap (volume-weighted ask pressure).
+                Rally must be stronger than δ above the ask average to cover fees.
+                Skip if micro_price < ask_vwap × (1 + δ)  [inside dead zone].
         During the first ~1 min (before historical_analysis runs) both VWAPs
         are None, so the filter is transparent and orders execute solely on
         regime + score.
-        NOTE: To switch back to a momentum strategy, reverse the conditions:
-          BUY if micro_price > ask_vwap; SELL if micro_price < bid_vwap.
       • REGIME FILTER (two sequential gates) — reads regime_label AND
         regime_confidence under _regime_lock:
 
@@ -750,15 +747,15 @@ FILES
 
   backtest/sensitivity.py       — Step 8: Sensitivity analysis (Use Case A).
                                      DEFAULT mode: Bayesian optimisation via
-                                     Optuna TPE sampler (30 trials).  Also
-                                     supports --oat (7 runs) and deprecated
+                                     Optuna TPE sampler (40 trials).  Also
+                                     supports --oat (8 runs) and deprecated
                                      --full-grid (18 combos).
                                      Tunes HMM_LOOKBACK_ROWS, HMM_MAX_REGIMES,
                                      VWAP_WINDOW over a continuous search space
                                      (_OPTUNA_SPACE).  fee_rate fixed at 0.001
                                      in ALL modes (BACKTEST_FEE_RATE — not a
                                      strategy knob, not in the param grid).
-                                     vwap_threshold fixed at
+                                     vwap_threshold — Bayesian knob (0.001–0.005); fixed at VWAP_THRESHOLD_MULTIPLIER for
                                      VWAP_THRESHOLD_MULTIPLIER in OAT/full-grid
                                      (also not in the param grid).
                                      Overrides passed as keyword args to
@@ -786,7 +783,7 @@ FILES
                                           reporting/optuna_history_<ts>.html
                                           reporting/optuna_importance_<ts>.html
                                           reporting/optuna_contour_<ts>.html
-                                       ~50–100 min for 30 trials (90-day window).
+                                       ~5–8 h for 40 trials (~8–12 min/trial, 90-day window).
                                      Console report formatting delegated to
                                      reporting/formatters.py:
                                        print_sensitivity_table()    ← all modes
@@ -812,7 +809,7 @@ FILES
                                                         called at top of run_backtest() before
                                                         run_signals(); returns dict of cast values
                                                         passed as kwargs (hmm_lookback_rows,
-                                                        hmm_max_regimes, vwap_window, fee_rate);
+                                                        hmm_max_regimes, vwap_window, vwap_threshold, fee_rate);
                                                         falls back to defaults if absent.
                                         results/optuna.db  ← Bayes mode only (SQLite study)
                                      Use Case B (180-day window) DEFERRED —

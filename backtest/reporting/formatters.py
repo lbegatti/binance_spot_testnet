@@ -460,7 +460,10 @@ def print_sensitivity_table(
 
     # Derive strategy_vs_bnh_pct if both source columns are present.
     display_df = results_df.copy()
-    if "total_return_pct" in display_df.columns and "bnh_total_return_pct" in display_df.columns:
+    if (
+        "total_return_pct" in display_df.columns
+        and "bnh_total_return_pct" in display_df.columns
+    ):
         display_df["strategy_vs_bnh_pct"] = (
             display_df["total_return_pct"] - display_df["bnh_total_return_pct"]
         )
@@ -569,16 +572,15 @@ def print_bnh_comparison(best_row: pd.Series) -> None:
         log.info("B&H comparison skipped — columns not present in best row.")
         return
 
-    vs = bnh_ret - strat
-
     w = 62  # inner width
     print()
     print("╔" + "═" * w + "╗")
     print(f"║  {'STRATEGY vs BUY-AND-HOLD  (best result)':<{w - 2}}║")
     print("╠" + "═" * w + "╣")
     sharpe_str = f"{sharpe:+.4f}" if not math.isnan(sharpe) else "n/a"
-    print(f"║  Strategy  return : {strat:>+8.2f}%   (Sharpe: {sharpe_str}){'':>{w - 48}}║")
+    print(
+        f"║  Strategy  return : {strat:>+8.2f}%   (Sharpe: {sharpe_str}){'':>{w - 48}}║"
+    )
     print(f"║  Buy-and-hold     : {bnh_ret:>+8.2f}%{'':>{w - 30}}║")
     print("╠" + "═" * w + "╣")
     print()
-
