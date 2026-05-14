@@ -547,9 +547,12 @@ class RegimeDirector:
 
         # --- rank-based directional assignment ---
         # Sum the ordinal rank of each state on return and obi_proxy.
-        # idxmax / idxmin are exclusive by definition → no duplicate
-        # trending_up / trending_down labels regardless of n_components.
-        direction_score = means["return"].rank() + means["obi_proxy"].rank()
+        # method='first' breaks ties by position, guaranteeing unique ranks so
+        # idxmax / idxmin always reference *different* states even when all
+        # feature values are identical (e.g. cold-start with all-zero means).
+        direction_score = means["return"].rank(method="first") + means[
+            "obi_proxy"
+        ].rank(method="first")
         best_state = int(direction_score.idxmax())
         worst_state = int(direction_score.idxmin())
 

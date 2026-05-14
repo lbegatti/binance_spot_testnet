@@ -38,7 +38,7 @@ class AnalysisEngine:
     ``websocket_main.py`` can terminate the session cleanly after the
     configured duration has elapsed.
 
-    Attributes:
+        Attributes:
         state (OrderBookState): Shared order book state, injected at construction.
         stop_event (threading.Event): Shared event; when set, both loops exit
             at their next scheduled wake-up.
@@ -61,6 +61,13 @@ class AnalysisEngine:
             ``historical_analysis``; ``None`` until the first iteration.
         _ask_vwap (float | None): Latest ask VWAP published by
             ``historical_analysis``; ``None`` until the first iteration.
+        _position_open (bool): Position guard flag — mirrors the single-position
+            mean-reversion logic in ``backtest/pnl.py``.  Set to ``True`` after
+            any BUY dispatch; reset to ``False`` after any SELL dispatch.
+            Guards against order stacking in REST-fallback mode (balance never
+            updated) and the WS race window (balance update arrives late).
+        _position_guard_skips (int): Counter of BUY signals suppressed by the
+            position guard this session; logged at session end.
 
     Note:
         The static helpers ``_build_levels``, ``_collect_candidates``, and
@@ -105,6 +112,21 @@ class AnalysisEngine:
         self._regime_lock = threading.Lock()
         self._bid_vwap: float | None = None
         self._ask_vwap: float | None = None
+
+        # Position guard — single-open-position mean-reversion mode.
+        # Mirrors the backtest logic in backtest/pnl.py:
+        #   _position_open = True  → a strategy BUY has been dispatched and
+        #                            not yet offset by a SELL; skip further BUYs.
+        #   _position_open = False → flat; the next qualifying BUY signal fires.
+        #
+        # This prevents order stacking in two real failure modes:
+        #   1. REST-fallback mode: state.balance_status is never updated after
+        #      an order (no outboundAccountPosition push), so the balance guard
+        #      alone cannot stop repeated full-size BUY dispatches.
+        #   2. WS-mode race window: a second tick can fire before the
+        #      outboundAccountPosition event arrives and reduces free balance.
+        self._position_open: bool = False
+        self._position_guard_skips: int = 0
 
     @staticmethod
     def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
@@ -327,7 +349,21 @@ class AnalysisEngine:
                         bid_vwap,
                         VWAP_THRESHOLD_MULTIPLIER,
                     )
+                elif self._position_open:
+                    # Position guard: already holding a strategy-opened position.
+                    # Prevents stacking multiple overlapping BUY LIMIT orders
+                    # (grid behaviour) in both REST-fallback mode (balance never
+                    # updated) and the WS race window (balance update arrives late).
+                    # Mirrors the identical guard in backtest/pnl.py.
+                    self._position_guard_skips += 1
+                    logging.info(
+                        "HFT #%d [buy] — skipped: position already open "
+                        "(guard skips so far this session: %d)",
+                        iteration,
+                        self._position_guard_skips,
+                    )
                 else:
+                    self._position_open = True
                     self.order_executor.execute("BUY", best_buy)
             if best_sell:
                 micro_price = best_sell[5]
@@ -356,11 +392,17 @@ class AnalysisEngine:
                         VWAP_THRESHOLD_MULTIPLIER,
                     )
                 else:
+                    self._position_open = False  # reset guard — strategy is now flat
                     self.order_executor.execute("SELL", best_sell)
 
             self.stop_event.wait(HFT_INTERVAL)  # sleep AFTER work, not before
 
-        logging.info("HFT analysis loop stopped after %d iteration(s).", iteration)
+        logging.info(
+            "HFT analysis loop stopped after %d iteration(s) "
+            "(%d BUY signal(s) suppressed by position guard).",
+            iteration,
+            self._position_guard_skips,
+        )
 
     def historical_analysis(self):
         """

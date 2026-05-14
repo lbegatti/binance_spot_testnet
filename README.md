@@ -39,6 +39,22 @@ The WebSocket path runs the full strategy pipeline (metrics → indicators → s
 
 ---
 
+## 🚀 Four Entry Points — Start Here
+
+The project is driven by **four standalone scripts**. Everything else (strategy, core, execution, backtest modules) is support code called by one of these.
+
+| # | Script | Purpose | Typical runtime | Command |
+|---|--------|---------|----------------|---------|
+| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM, and places LIMIT orders when the VWAP gate and regime filter both pass. | 10 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
+| 2 | `backtest/runner.py` | **Offline backtest** — replays 180 days of 1-minute BTCUSDT klines through the exact same production pipeline and prints P&L, Sharpe ratio, max drawdown, and filter hit-rates. | ~45–90 min on a laptop (180-day window, ~259,200 candles) | `python -m backtest.runner` |
+| 3 | `backtest/sensitivity.py` | **Parameter optimisation** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` to find the best-Sharpe parameter set. Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~5–8 h on a laptop (~8–12 min per trial; use `--n-trials 20` for a ~2.5–4 h run) | `python -m backtest.sensitivity` |
+| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 365 days of data and runs six statistical tests (direction test, Welch's t-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~15–30 min on a laptop (365-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
+
+> **Recommended order for a new setup:**
+> `regime_validation` → `sensitivity` → `runner` → `websocket_main`
+
+---
+
 ## Project Structure
 
 ```
@@ -270,7 +286,7 @@ Binance REST API                   Binance WebSocket (production)
 | `OrderBookState` | `core/order_book_state.py` | Single source of truth — owns `local_book`, `history_order_book`, `balance_status`, `thread_lock`, and `thread_balance_lock` |
 | `MessageHandler` | `core/message_handler.py` | One active WebSocket callback: `handle_depth_message` (merges diff-depth ticks into `local_book`, appends snapshots, calls `calculate_best_quote` every 10th tick).  `handle_balance_message` is preserved but superseded — see `OrderExecutor` |
 | `RegimeDirector` | `strategy/regime_director.py` | Detects the current market regime via a `GaussianHMM` fitted on recent 1-minute klines.  Features are z-score scaled (`StandardScaler`, fitted on the first `HMM_TRAIN_ROWS` rows only).  Fitted once at pre-session startup; then updated every `HIST_INTERVAL` (60 s) via a **two-speed** scheme: cheap Viterbi prediction on most iterations, full model re-fit every `HMM_REFIT_INTERVAL` (300 s).  Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability from `predict_proba()`), both protected by `_regime_lock` |
-| `AnalysisEngine` | `strategy/analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks; applies VWAP, regime-confidence, and regime-direction filters before delegating order placement to `OrderExecutor` |
+| `AnalysisEngine` | `strategy/analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks; applies VWAP, regime-confidence, and regime-direction filters before delegating order placement to `OrderExecutor`.  Enforces a **single-open-position guard** (`_position_open` flag): BUY fires only when flat; SELL resets the guard.  Prevents order stacking in both the WS-mode race window and REST-fallback mode. Counts suppressed BUYs in `_position_guard_skips` (logged at session end) |
 | `OrderExecutor` | `execution/order_executor.py` | Places LIMIT GTC orders **and** maintains real-time balance updates via a single Binance WebSocket API connection.  On connect: `session.logon` (HMAC-signed) → `userDataStream.subscribe` → receives `outboundAccountPosition` push events on the **same** socket.  Falls back to REST for orders if WS is unavailable; balances fall back to startup REST snapshot |
 | `websocket_main` | `websocket_main.py` | Session driver — instantiates all classes, seeds initial balances into `state`, runs pre-session regime detection, opens WebSocket streams, starts all threads, manages session lifetime and shutdown |
 
@@ -737,9 +753,9 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/data.py` | ✅ done | Download historical klines |
 | `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
 | `backtest/signals.py` | ✅ done | Signal replay loop (full pipeline + filters) |
-| `backtest/pnl.py` | ✅ done | Simulated P&L — balance guard, bps-based `half_spread` fill model (`BACKTEST_FILL_SPREAD_BPS`), per-trade position cap (`BACKTEST_MAX_POSITION_PCT`), equity curve, FIFO round-trip pairing, Step 5 metrics |
-| `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7 |
-| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored |
+| `backtest/pnl.py` | ✅ done | Simulated P&L — **single-position mean-reversion guard** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY fires only when flat, SELL closes the full open position in one shot and resets to flat; suppressed BUY count tracked in `n_position_guard_skips`.  Also: balance guard, bps-based `half_spread` fill model (`BACKTEST_FILL_SPREAD_BPS`), per-trade position cap (`BACKTEST_MAX_POSITION_PCT`), equity curve, FIFO round-trip pairing, Step 5 metrics |
+| `backtest/runner.py` | ✅ done | Top-level orchestration — chains all modules, delegates report/CSV to `reporting/`; exposes `plot` and `save_png` flags for Step 7.  Loads `fee_rate` from `best_params.json` and passes it to `simulate_pnl()` (falls back to `BACKTEST_FEE_RATE`) |
+| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored.  `print_report()` SIGNALS section now shows `HOLD (position open) : N ← BUY suppressed by position guard` |
  `backtest/regime_validation.py`  ✅ done  Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands (Panel 3 rebuild: `_REGIME_NUMERIC` step-line + confidence ×3 scaling), VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
 | `backtest/sensitivity.py` | ✅ done (Use Case A) | **Bayesian optimisation via Optuna TPE (default, 40 trials)**, OAT sweep (`--oat`, 8 runs), and deprecated full-grid (`--full-grid`, 30 combos) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER`. `fee_rate` fixed at `SENSITIVITY_FEE_RATE` (0.001) in **all** modes — not a strategy knob, not in the param grid. `--lookback` flag overrides `SENSITIVITY_LOOKBACK` per run. `_check_existing_best_params()` guard prompts `[y/N]` before overwriting. Human-readable output (sensitivity CSVs, Optuna HTML charts) written to **`backtest/reporting/`**; machine-readable artefacts (`best_params.json`, `optuna.db`) remain in `backtest/results/`. Console report formatting delegated to `backtest/reporting/formatters.py` (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`). Writes `best_params.json` — loaded by **both** `websocket_main.py` (live, at startup) **and** `runner.py` (backtest, before `run_signals()`). Use Case B (180-day window) deferred. |
@@ -878,5 +894,5 @@ and threading safety summary — see:
 
 ---
 
-*Document last updated: 2026-05-07*
+*Document last updated: 2026-05-15*
 

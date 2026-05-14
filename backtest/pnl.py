@@ -42,8 +42,9 @@ Usage
     from backtest.pnl import simulate_pnl
 
     signals  = run_signals()
-    trades, equity, stats = simulate_pnl(signals)
-    print(stats)
+    # fee_rate defaults to BACKTEST_FEE_RATE; override to use best_params.json value:
+    trades, equity, stats = simulate_pnl(signals, fee_rate=0.001)
+    print(stats["n_position_guard_skips"])   # BUY signals suppressed by position guard
 """
 
 import logging
@@ -63,6 +64,14 @@ from config_parameters import (
 )
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Position guard constant
+# ---------------------------------------------------------------------------
+# BTC amounts below this are treated as "flat" (position closed).
+# Prevents floating-point dust from keeping the position guard permanently
+# engaged after a full close (e.g. 1e-15 BTC from rounding).
+_POSITION_DUST_BTC: float = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +182,26 @@ def simulate_pnl(
     to the live ``OrderExecutor``, and marking the portfolio to market at
     every candle (including HOLD rows) to build a continuous equity curve.
 
+    Position model — single open position at a time
+    ------------------------------------------------
+    The strategy is mean-reversion: enter on a dip, exit on a rally, repeat.
+    To prevent grid-trading accumulation (stacking many small BUY legs on
+    every dip signal), ``simulate_pnl`` enforces a **one-position-at-a-time**
+    rule via ``open_strategy_qty``:
+
+    * **BUY** fires only when ``open_strategy_qty == 0`` (flat).
+      If already long, the signal is skipped and logged at DEBUG level.
+    * **SELL** always closes the **full open position** in one shot
+      (``qty = open_strategy_qty``), ignoring the synthetic book quantity
+      for the exit leg.  This guarantees the strategy returns to flat on
+      every SELL signal regardless of book depth, so the BUY gate reopens
+      on the very next qualifying signal.
+
+    The initial BTC balance (``initial_btc``) is excluded from position
+    tracking.  Any SELL that fires before the first strategy BUY sells
+    from the pre-existing BTC balance as an "orphan SELL" (a warning is
+    logged; the equity curve and cash flows remain correct).
+
     Parameters
     ----------
     signals : pd.DataFrame
@@ -208,6 +237,17 @@ def simulate_pnl(
     usdt = float(initial_usdt)
     btc = float(initial_btc)
 
+    # Tracks BTC opened exclusively by strategy BUY signals.
+    # Does NOT include initial_btc (pre-existing balance).
+    # BUY: only fires when this is 0 (flat).
+    # SELL: closes this entire amount in one shot, then resets to 0.
+    open_strategy_qty: float = 0.0
+
+    # Count of BUY signals suppressed by the position guard (already long).
+    # Reported in stats and the summary report so the user can see how many
+    # signals the position guard absorbed vs. how many actually executed.
+    n_position_guard_skips: int = 0
+
     trade_rows: list[dict] = []
     equity_rows: list[dict] = []
 
@@ -222,63 +262,78 @@ def simulate_pnl(
 
         # BUY
         if sig == 1:
-            raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0  # type: ignore[union-attr]
-            half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
-
-            # Fill at the synthetic ask: close + half_spread.
-            # This is the natural taker cost — you cross the spread when buying.
-            # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
-            eff_price = close + half_spread
-
-            # Balance guard: cannot spend more USDT than available.
-            # Total debit per unit = eff_price × (1 + fee_rate).
-            # Also cap at BACKTEST_MAX_POSITION_PCT of available USDT so the
-            # strategy never bets 100 % of its balance on a single signal —
-            # the old all-in behaviour caused full fee erosion over 180 days.
-            usdt_budget = usdt * BACKTEST_MAX_POSITION_PCT
-            max_affordable = (
-                usdt_budget / (eff_price * (1.0 + fee_rate)) if eff_price > 0 else 0.0
-            )
-            qty = min(raw_qty, max_affordable)
-
-            if qty > 0:
-                gross = qty * eff_price
-                fee = gross * fee_rate
-                net_cost = gross + fee  # total USDT debited
-                usdt -= net_cost
-                btc += qty
-                trade_rows.append(
-                    {
-                        "timestamp": ts,
-                        "side": "BUY",
-                        "fill_price": eff_price,
-                        "quantity": qty,
-                        "gross": gross,
-                        "fee": fee,
-                        "net_cost": net_cost,
-                        "net_proceeds": None,
-                        "regime": getattr(row, "regime", None),
-                    }
-                )
-                log.debug(
-                    "BUY  %s | qty=%.6f | price=%.2f | cost=%.2f USDT | fee=%.4f",
+            # Position guard: skip if already holding a strategy-opened position.
+            # Prevents stacking multiple overlapping BUY legs (grid behaviour)
+            # and converts the strategy to proper single-position mean-reversion.
+            if open_strategy_qty > _POSITION_DUST_BTC:
+                n_position_guard_skips += 1
+                log.info(
+                    "HOLD │ position open │ %s │ held=%.6f BTC │ BUY opportunity suppressed",
                     ts,
-                    qty,
-                    eff_price,
-                    net_cost,
-                    fee,
+                    open_strategy_qty,
                 )
             else:
-                log.warning(
-                    "BUY skipped at %s — USDT %.2f insufficient at price %.2f",
-                    ts,
-                    usdt,
-                    close,
+                raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0  # type: ignore[union-attr]
+                half_spread = (
+                    float(row.half_spread) if pd.notna(row.half_spread) else 0.0
+                )  # type: ignore[union-attr]
+
+                # Fill at the synthetic ask: close + half_spread.
+                # This is the natural taker cost — you cross the spread when buying.
+                # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
+                eff_price = close + half_spread
+
+                # Balance guard: cannot spend more USDT than available.
+                # Total debit per unit = eff_price × (1 + fee_rate).
+                # Also cap at BACKTEST_MAX_POSITION_PCT of available USDT so the
+                # strategy never bets 100 % of its balance on a single signal —
+                # the old all-in behaviour caused full fee erosion over 180 days.
+                usdt_budget = usdt * BACKTEST_MAX_POSITION_PCT
+                max_affordable = (
+                    usdt_budget / (eff_price * (1.0 + fee_rate))
+                    if eff_price > 0
+                    else 0.0
                 )
+                qty = min(raw_qty, max_affordable)
+
+                if qty > 0:
+                    gross = qty * eff_price
+                    fee = gross * fee_rate
+                    net_cost = gross + fee  # total USDT debited
+                    usdt -= net_cost
+                    btc += qty
+                    open_strategy_qty += qty  # track position opened by this BUY
+                    trade_rows.append(
+                        {
+                            "timestamp": ts,
+                            "side": "BUY",
+                            "fill_price": eff_price,
+                            "quantity": qty,
+                            "gross": gross,
+                            "fee": fee,
+                            "net_cost": net_cost,
+                            "net_proceeds": None,
+                            "regime": getattr(row, "regime", None),
+                        }
+                    )
+                    log.info(
+                        "BUY  │ ENTERED LONG  │ %s │ qty=%.6f BTC │ price=%.2f │ cost=%.2f USDT │ fee=%.4f",
+                        ts,
+                        qty,
+                        eff_price,
+                        net_cost,
+                        fee,
+                    )
+                else:
+                    log.warning(
+                        "BUY skipped at %s — USDT %.2f insufficient at price %.2f",
+                        ts,
+                        usdt,
+                        close,
+                    )
 
         # SELL
         elif sig == -1:
-            raw_qty = float(row.sell_qty) if pd.notna(row.sell_qty) else 0.0  # type: ignore[union-attr]
             half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic bid: close - half_spread.
@@ -286,8 +341,19 @@ def simulate_pnl(
             # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
             eff_price = close - half_spread
 
-            # Balance guard: cannot sell more BTC than held.
-            qty = min(raw_qty, btc)
+            if open_strategy_qty > _POSITION_DUST_BTC:
+                # Close the FULL strategy-opened position in one shot.
+                # Using the full open_strategy_qty (not the synthetic book qty)
+                # ensures the strategy returns to flat immediately so the BUY
+                # gate reopens on the very next qualifying signal.
+                # Safety cap against rounding: cannot sell more BTC than held.
+                qty = min(open_strategy_qty, btc)
+            else:
+                # No strategy-opened position — fall back to book-depth qty.
+                # This handles the "orphan SELL" case where initial_btc > 0
+                # and a SELL fires before the first strategy BUY.
+                raw_qty = float(row.sell_qty) if pd.notna(row.sell_qty) else 0.0  # type: ignore[union-attr]
+                qty = min(raw_qty, btc)
 
             if qty > 0:
                 gross = qty * eff_price
@@ -295,6 +361,7 @@ def simulate_pnl(
                 net_proceeds = gross - fee  # USDT credited after fee
                 usdt += net_proceeds
                 btc -= qty
+                open_strategy_qty = max(0.0, open_strategy_qty - qty)  # reset to flat
                 trade_rows.append(
                     {
                         "timestamp": ts,
@@ -308,8 +375,8 @@ def simulate_pnl(
                         "regime": getattr(row, "regime", None),
                     }
                 )
-                log.debug(
-                    "SELL %s | qty=%.6f | price=%.2f | proceeds=%.2f USDT | fee=%.4f",
+                log.info(
+                    "SELL │ EXITED  LONG  │ %s │ qty=%.6f BTC │ price=%.2f │ proceeds=%.2f USDT │ fee=%.4f",
                     ts,
                     qty,
                     eff_price,
@@ -338,6 +405,11 @@ def simulate_pnl(
         )
 
     # Post-loop bookkeeping
+    log.info(
+        "Position guard SKIP: %d BUY signal(s) suppressed — position was already open "
+        "(single-position mean-reversion mode).",
+        n_position_guard_skips,
+    )
     final_close = float(signals["close"].iloc[-1])
     final_equity = usdt + btc * final_close
 
@@ -370,6 +442,7 @@ def simulate_pnl(
         initial_usdt,
         initial_btc,
         final_equity,
+        n_position_guard_skips,
     )
 
     log.info(
@@ -541,6 +614,7 @@ def _compute_stats(
     initial_usdt: float,
     initial_btc: float,
     final_equity: float,
+    n_position_guard_skips: int = 0,
 ) -> dict[str, Any]:
     """
     Compute Step 5 performance metrics from the equity curve and round trips.
@@ -795,6 +869,9 @@ def _compute_stats(
         "n_raw_sell_candidates": int(
             raw_sell
         ),  # SELL opportunities scored by the pipeline (pre-gate)
+        # Position guard — BUY signals that fired but were suppressed because
+        # the strategy already held an open position (single-position MR mode).
+        "n_position_guard_skips": n_position_guard_skips,
         # Filter hit rates — % of raw candidates blocked by each gate (sequentially)
         # confidence_filter: model posterior < HMM_MIN_CONFIDENCE → regime too uncertain to trade
         # regime_filter:     passed confidence but regime direction unfavourable (e.g. trending_down blocks BUY)

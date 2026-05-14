@@ -35,21 +35,18 @@ namespace.  The only correct approach is to patch
     import strategy.regime_director as rd_mod
     rd_mod.HMM_MAX_REGIMES = 2     # takes effect on the next RegimeDirector()
 
-Fields NOT overridden
-----------------------
+Fields NOT overridden (live system only)
+-----------------------------------------
 - ``vwap_window``  — backtest-only constant (``backtest/signals.py``).
                      The live system does not use ``VWAP_WINDOW``.
 - ``fee_rate``     — Binance charges its own fees regardless of this value.
-                     Stored in ``best_params.json`` for *reference only* — it
-                     shows the fee level at which the sensitivity sweep was
-                     optimal, which is useful diagnostic information but should
-                     NOT be used to override the simulation fee.  The optimizer
-                     converging on the lowest tested fee (e.g. 0.00025) is a
-                     signal that strategy alpha is thin at realistic fees
-                     (0.001 = standard Binance Spot taker); simulating with the
-                     lower value produces ~4× over-optimistic P&L.
-                     ``runner.py`` deliberately ignores this field and
-                     always uses ``BACKTEST_FEE_RATE`` from ``config_parameters.py``.
+                     Stored in ``best_params.json`` for reference and used by
+                     ``runner.py`` to drive ``simulate_pnl()`` consistently with
+                     the sensitivity sweep.  Because ``fee_rate`` is NOT a tunable
+                     Optuna parameter (it is always fixed at ``SENSITIVITY_FEE_RATE``
+                     = 0.001 = standard Binance Spot taker fee), reading it from
+                     ``best_params.json`` is always safe — there is no risk of
+                     simulating with an artificially low value.
 
 Why patching ``config_parameters`` directly would NOT work
 -----------------------------------------------------------
@@ -270,7 +267,8 @@ def load_best_params_for_backtest() -> dict:
 
     No module-namespace patching is needed here because ``run_signals()``
     already accepts explicit overrides (``hmm_lookback_rows``,
-    ``hmm_max_regimes``, ``vwap_window``) as function kwargs.
+    ``hmm_max_regimes``, ``vwap_window``, ``vwap_threshold``) as function
+    kwargs, and ``simulate_pnl()`` accepts ``fee_rate`` directly.
 
     Returns
     -------

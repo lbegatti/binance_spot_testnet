@@ -316,6 +316,40 @@ signal(t) = +1 (BUY)   if Flow A produced a BUY candidate
   > `half_spread ≈ $25–$150` per trade — 10–100× the real exchange spread.
   > Over 1,000+ round trips this produces 100 % drawdown on a $10,000 portfolio.
 
+### Position model — single open position at a time
+
+`simulate_pnl()` enforces a **one-position-at-a-time** rule to prevent
+grid-trading accumulation (stacking BUY legs on every dip signal):
+
+| Variable | Role |
+|---|---|
+| `open_strategy_qty` | BTC held exclusively by strategy BUY signals (excludes `initial_btc`) |
+| `_POSITION_DUST_BTC = 1e-6` | Threshold below which the position is treated as flat (prevents floating-point dust from permanently blocking the guard) |
+| `n_position_guard_skips` | Count of BUY signals suppressed because `open_strategy_qty > 0` |
+
+**BUY** fires only when `open_strategy_qty ≤ _POSITION_DUST_BTC` (flat).
+If already long, the signal is skipped and logged at INFO level:
+`HOLD │ position open │ <ts> │ held=X.XXXXXX BTC │ BUY opportunity suppressed`
+
+**SELL** always closes the **full** `open_strategy_qty` in one shot (not the
+synthetic book-depth qty), guaranteeing the strategy returns to flat so the
+BUY gate reopens on the very next qualifying signal.
+
+The initial BTC balance (`initial_btc`) is excluded from position tracking.
+Any SELL that fires before the first strategy BUY is treated as an
+*"orphan SELL"* — a visible WARNING box is printed; equity and cash flows
+remain correct.
+
+`n_position_guard_skips` is returned in the `stats` dict and printed in the
+`SIGNALS` section of the console report:
+```
+  HOLD (position open)       :       142  ← BUY suppressed by position guard
+```
+
+This guard is mirrored exactly in `strategy/analysis.py`
+(`AnalysisEngine._position_open`) for the live system, ensuring the backtest
+and live strategy share the same single-position mean-reversion behaviour.
+
 ### Trade sizing
 - The candidate tuple from the production pipeline contains `bq` (bid quantity)
   and `aq` (ask quantity) — the same values `OrderExecutor.execute()` uses to
@@ -408,6 +442,7 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 | **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
 | **Regime filter hit rate** | `regime_filter_hit_rate_pct` | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
 | **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate) |
+| **Position guard skips** | `n_position_guard_skips` | Count of BUY signals that passed all three gates but were suppressed because the strategy already held an open position (`open_strategy_qty > 0`) — single-position mean-reversion mode |
 
 ---
 
@@ -900,23 +935,27 @@ Both consumers fall back silently to `config_parameters.py` defaults when
 
 - `vwap_window` — backtest-only (`backtest/signals.py`).  The live system does
   not use `VWAP_WINDOW`, so `websocket_main.py` ignores this field.
-- `fee_rate` — informational for the live system (Binance charges its own fees
-  regardless).  `runner.py` does pass it to `simulate_pnl()`.
+- `fee_rate` — `runner.py` loads it from `best_params.json` and passes it
+  directly to `simulate_pnl(fee_rate=...)`.  `fee_rate` is NOT a tunable Optuna
+  parameter — it is always written as `SENSITIVITY_FEE_RATE = 0.001` (standard
+  Binance Spot taker fee), so reading it from `best_params.json` is always safe.
+  Falls back to `BACKTEST_FEE_RATE` from `config_parameters.py` when absent.
 
 #### Notes on `HMM_LOOKBACK` (live) vs `HMM_LOOKBACK_ROWS` (backtest)
 
 `best_params.json` stores `hmm_lookback_rows` (an integer, used by the
 backtest).  The live system uses `HMM_LOOKBACK` (a dateutil string such as
-`"2 hours ago UTC"`).  The live loader converts via a fixed mapping:
+`"2 hours ago UTC"`).  The live loader converts via `rows_to_lookback(n)`
+in `strategy/param_loader.py`:
 
-| `hmm_lookback_rows` | `HMM_LOOKBACK` |
-|---|---|
-| 60  | `"1 hour ago UTC"` |
-| 120 | `"2 hours ago UTC"` (default) |
-| 240 | `"4 hours ago UTC"` |
+- Any `n < 60` → `"N minutes ago UTC"`
+- Exact multiples of 60 → `"H hour(s) ago UTC"` (e.g. 120 → `"2 hours ago UTC"`)
+- All other values → `"N minutes ago UTC"` (handles any Optuna-discovered value)
 
-If the JSON contains a value not in this table, `HMM_LOOKBACK` is left at
-the `config_parameters.py` default and a `WARNING` is logged.
+This replaces the previous static lookup table, which broke whenever Optuna
+discovered a value outside the hand-coded set (e.g. 40 rows → `"40 minutes ago UTC"`).
+If `hmm_lookback_rows` is absent from `best_params.json`, `HMM_LOOKBACK` is
+left at the `config_parameters.py` default.
 
 > **Important:** do **not** commit `best_params.json` to git — it is
 > sample-specific.  Add `backtest/results/best_params.json` to `.gitignore`.
@@ -985,15 +1024,23 @@ concrete file in `backtest/`.
   simulated trades (using ``bq``/``aq`` quantities and the balance guard)
   and computes the Step 5 performance metrics: total return, win rate,
   max drawdown, Sharpe, Sortino, profit factor, average holding period,
-  and regime / VWAP filter hit rates.  Round-trip pairing uses an
-  exhaustive FIFO `collections.deque` supporting scaling-in, layering, and
-  pyramiding.  Orphan SELLs emit a visible WARNING box.  *(Implemented.)*
+  and regime / VWAP filter hit rates.  **Single-position mean-reversion
+  guard** (``open_strategy_qty`` / ``_POSITION_DUST_BTC = 1e-6``): BUY
+  fires only when flat; SELL closes the full strategy-opened position in
+  one shot and resets to flat; suppressed BUY count returned as
+  ``n_position_guard_skips`` in the stats dict and reported in the console
+  summary.  Round-trip pairing uses an exhaustive FIFO ``collections.deque``
+  supporting scaling-in, layering, and pyramiding.  Orphan SELLs emit a
+  visible WARNING box.  *(Implemented.)*
 - ✅ **Step 5 — `backtest/runner.py` + `backtest/reporting/formatters.py`** —
   Top-level script that chains all four modules.  Report formatting
   (`print_report`) and CSV export (`save_csv`) are isolated in
   `backtest/reporting/formatters.py` (AI-authored; all symbols public).
-  Prints a formatted console report: SESSION info, SIGNALS breakdown, P&L
-  SUMMARY, RISK METRICS, TRADE LOG PREVIEW.  Optionally saves timestamped
+  Prints a formatted console report: SESSION info, SIGNALS breakdown
+  (including ``HOLD (position open) : N ← BUY suppressed by position guard``),
+  P&L SUMMARY, RISK METRICS, TRADE LOG PREVIEW.  `runner.py` loads
+  ``fee_rate`` from ``best_params.json`` and passes it to ``simulate_pnl()``
+  (falls back to ``BACKTEST_FEE_RATE``).  Optionally saves timestamped
   ``trades_*.csv`` and ``equity_*.csv`` to ``backtest/results/``.
   Run with ``python -m backtest.runner``.  *(Implemented.)*
 - ✅ **Step 6a — Inline regime validation** (`strategy/regime_director.py`) —
@@ -1112,5 +1159,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-05-07*
+*Document last updated: 2026-05-15*
 

@@ -149,6 +149,7 @@ def print_report(
     n_buy = stats["n_buy_signals"]
     n_sell = stats["n_sell_signals"]
     n_hold = int((signals["signal"] == 0).sum())
+    n_guard = stats.get("n_position_guard_skips", 0)
     conf_hit = stats.get("confidence_filter_hit_rate_pct", float("nan"))
     regime_hit = stats["regime_filter_hit_rate_pct"]
     vwap_hit = stats["vwap_filter_hit_rate_pct"]
@@ -161,6 +162,9 @@ def print_report(
     print(f"  Executed BUY               :  {n_buy:>8,}")
     print(f"  Executed SELL              :  {n_sell:>8,}")
     print(f"  HOLD (no signal)           :  {n_hold:>8,}")
+    print(
+        f"  HOLD (position open)       :  {n_guard:>8,}  ← BUY suppressed by position guard"
+    )
     print(f"  Confidence filter blocked  :  {fmt(conf_hit, '.1f')} % of raw candidates")
     print(
         f"  Regime    filter blocked   :  {fmt(regime_hit, '.1f')} % of raw candidates"

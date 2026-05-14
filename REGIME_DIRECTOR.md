@@ -138,8 +138,17 @@ if best_buy:
     elif bid_vwap is not None and micro_price >= bid_vwap * (1.0 - VWAP_THRESHOLD_MULTIPLIER):
         # VWAP dead-zone blocks BUY — dip too shallow to cover fees (inside ±δ of bid_vwap)
         pass
+    elif self._position_open:
+        # Position guard — already holding a strategy-opened position.
+        # Prevents order stacking (grid behaviour) in both REST-fallback mode
+        # (balance never updated) and the WS race window (balance update arrives late).
+        # Mirrors the identical guard in backtest/pnl.py.
+        self._position_guard_skips += 1
+        logging.info("HFT #%d [buy] — skipped: position already open (guard skips: %d)",
+                     iteration, self._position_guard_skips)
     else:
-        executor.execute("BUY", best_buy)      # both filters passed
+        self._position_open = True        # mark position as open BEFORE calling execute
+        executor.execute("BUY", best_buy)      # all filters passed
 
 if best_sell:
     if current_regime in ("trending_up", "high_volatility"):
@@ -149,6 +158,7 @@ if best_sell:
         # VWAP dead-zone blocks SELL — rally too weak to cover fees (inside ±δ of ask_vwap)
         pass
     else:
+        self._position_open = False           # reset guard — strategy is now flat
         executor.execute("SELL", best_sell)    # both filters passed
 ```
 
@@ -186,16 +196,20 @@ historical_analysis()                       low_latency_analysis()
   ② write VWAPs under _vwap_lock              ③ build levels, score candidates
   ③ get_klines_data()    ← outside lock       ④ read regime_label
      if iter % 5 == 0:                              under _regime_lock
-       select_hmm_model()← full refit         ⑤ REGIME FILTER
-     else:                                         BUY  blocked if "trending_down"
-       predict_current_regime()                         or "high_volatility"
-                          ← Viterbi only           SELL blocked if "trending_up"
-  ④ assign_regime_labels()                          or "high_volatility"
-         under _regime_lock                    ⑥ VWAP FILTER (mean-reversion + dead zone)
-         (fast write only)                          BUY  blocked if micro ≥ bid_vwap × (1−δ)
-                                                    SELL blocked if micro < ask_vwap × (1+δ)
-                                              ⑦ OrderExecutor.execute()
-                                                   LIMIT GTC via WebSocket API
+                                               ⑤ REGIME FILTER
+                                                     BUY  blocked if "trending_down"
+                                                          or "high_volatility"
+                                                     SELL blocked if "trending_up"
+                                                          or "high_volatility"
+                                               ⑥ VWAP FILTER (mean-reversion + dead zone)
+                                                     BUY  blocked if micro ≥ bid_vwap × (1−δ)
+                                                     SELL blocked if micro < ask_vwap × (1+δ)
+                                               ⑦ POSITION GUARD (single-open-position MR)
+                                                     BUY  blocked if _position_open == True
+                                                          → _position_guard_skips++
+                                                     SELL resets _position_open = False
+                                               ⑧ OrderExecutor.execute()
+                                                    LIMIT GTC via WebSocket API
 ```
 
 ---

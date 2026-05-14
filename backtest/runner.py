@@ -42,6 +42,7 @@ from backtest.pnl import simulate_pnl
 from backtest.reporting.formatters import HEAVY, print_report, save_csv
 from backtest.signals import run_signals
 from backtest.visualization import plot_backtest
+from config_parameters import BACKTEST_FEE_RATE
 from strategy.param_loader import load_best_params_for_backtest
 
 logging.basicConfig(
@@ -123,16 +124,14 @@ def run_backtest(
     )
 
     # Step 4: simulate P&L
-    # fee_rate is intentionally NOT loaded from best_params.json here.
-    # Rationale: fee_rate is a fixed exchange cost (Binance Spot taker = 0.10 %
-    # by default), NOT a tunable strategy parameter.  The sensitivity sweep
-    # includes fee_rate to find the break-even fee level, but the optimizer
-    # converging on the lowest tested value (0.00025) signals that profitability
-    # is marginal at realistic fees — it does NOT mean we should simulate with
-    # an unrealistically cheap fee.  Using 0.00025 while actually paying 0.10 %
-    # would make the backtest ~4× optimistic.
-    # simulate_pnl() always uses BACKTEST_FEE_RATE from config_parameters.py.
-    trades, equity, stats = simulate_pnl(signals)
+    # fee_rate is loaded from best_params.json when present (always written as
+    # SENSITIVITY_FEE_RATE = 0.001 by sensitivity.py — fee_rate is NOT a tunable
+    # Optuna parameter, so it will never be an artificially low value).
+    # Falls back to BACKTEST_FEE_RATE from config_parameters.py when absent.
+    trades, equity, stats = simulate_pnl(
+        signals,
+        fee_rate=best.get("fee_rate", BACKTEST_FEE_RATE),
+    )
 
     # Step 5: print summary report
     print_report(signals, trades, equity, stats)

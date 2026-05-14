@@ -47,7 +47,7 @@ best_quotes = []
 initial_id = client.get_order_book(symbol=symbol)["lastUpdateId"]
 
 
-# TODO change the logic to use websockets instead of REST API to avoid the update gap issue and get real-time data.
+# use websockets instead of REST API to avoid the update gap issue and get real-time data.
 for d in depths_limit:
     order_book = client.get_order_book(symbol=symbol, limit=d)
     current_id = order_book["lastUpdateId"]

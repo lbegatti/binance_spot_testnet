@@ -189,6 +189,15 @@ FILES
                                        a two-speed scheme: cheap Viterbi prediction
                                        on most iterations, full re-fit every
                                        HMM_REFIT_INTERVAL (300 s).
+    _position_open  : bool          — single-open-position guard; set True after
+                                       any strategy BUY dispatch, reset False after
+                                       any strategy SELL dispatch.  Prevents order
+                                       stacking in REST-fallback mode (balance never
+                                       updated) and the WS race window (balance
+                                       update arrives before the next BUY tick).
+                                       Mirrors open_strategy_qty in backtest/pnl.py.
+    _position_guard_skips : int     — count of BUY signals suppressed by
+                                       _position_open this session; logged at exit.
   _bid_vwap and _ask_vwap start as None (no historical data yet).
   regime_director.regime_label is set BEFORE threads start (initial fit in
   websocket_main.py step 4b) so the very first low_latency iteration has a
@@ -240,10 +249,20 @@ FILES
         Gate 1 is evaluated BEFORE Gate 2; if confidence is too low, the
         direction label is irrelevant.  VWAP check is evaluated AFTER both
         regime gates pass.
+      • POSITION GUARD (single-open-position mean-reversion mode) —
+        evaluated AFTER all three gates (confidence, regime, VWAP):
+          BUY:  suppressed if _position_open == True.
+                → _position_guard_skips incremented; logged at INFO level.
+                "HFT #N [buy] — skipped: position already open (guard skips: M)"
+          BUY executes: _position_open set to True BEFORE calling execute().
+          SELL executes: _position_open reset to False (strategy is now flat).
+        Prevents order stacking in two real failure modes:
+          1. REST-fallback mode: balance_status never updated → balance guard
+             alone cannot stop repeated full-size BUY dispatches.
+          2. WS-mode race window: a second tick fires before the
+             outboundAccountPosition event arrives and reduces free balance.
+        Session-end log: "%d BUY signal(s) suppressed by position guard."
       • Delegates to OrderExecutor.execute("BUY"|"SELL", opportunity).
-        The executor validates strategy, checks balances, computes quantity
-        (aq for BUY, bq for SELL), and sends a LIMIT GTC order via its own
-        SpotWebsocketAPIClient.  Response handled async in handle_order_response.
 
   ▸ historical_analysis()  [HIST thread — every HIST_INTERVAL seconds = 60 s / 1 min]
       • Sleeps HIST_INTERVAL first (self.stop_event.wait(HIST_INTERVAL)).
@@ -607,6 +626,16 @@ FILES
                                     (default 5 bps → ~$20 at $80 k BTC).
                                     NOT (high-low)/2 — the candle range is
                                     10-100× the real spread and causes 100% drawdown.
+                                    POSITION GUARD (single-open-position MR mode):
+                                      open_strategy_qty tracks BTC opened by strategy
+                                      BUY signals only (excludes initial_btc).
+                                      _POSITION_DUST_BTC = 1e-6 is the flat threshold
+                                      (prevents FP dust from blocking the guard).
+                                      BUY fires only when open_strategy_qty ≤ dust.
+                                      SELL closes full open_strategy_qty in one shot
+                                      (not book-depth qty), resetting to flat.
+                                      n_position_guard_skips counted + returned in
+                                      stats dict; shown in console report.
                                     Per-trade position cap: BACKTEST_MAX_POSITION_PCT
                                     (default 10 % of available USDT per BUY).
                                     Marks the portfolio to market at every candle
@@ -615,6 +644,7 @@ FILES
                                     and a stats dict with Step 5 metrics (total
                                     return, win rate, max drawdown, Sharpe,
                                     Sortino, profit factor, avg holding period,
+                                    n_position_guard_skips,
                                     regime/VWAP filter hit rates).
                                     Sharpe and Sortino use excess returns over
                                     BACKTEST_RISK_FREE_RATE (default 0.0) and
@@ -638,6 +668,10 @@ FILES
   backtest/runner.py             — run_backtest(): top-level orchestrator.
                                     Chains run_signals() → simulate_pnl() →
                                     print_report() → (opt-in) plot_backtest().
+                                    Loads best_params.json via
+                                    load_best_params_for_backtest() and passes
+                                    fee_rate to simulate_pnl() (falls back to
+                                    BACKTEST_FEE_RATE when absent).
                                     Parameters:
                                       export_csv (bool, default False) — saves
                                         trades_*.csv + equity_*.csv.
