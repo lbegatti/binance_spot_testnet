@@ -50,7 +50,7 @@ Fields NOT overridden (live system only)
 
 Why patching ``config_parameters`` directly would NOT work
 -----------------------------------------------------------
-A common misconception: if ``config_parameters.HMM_LOOKBACK = "2 hours ago UTC"``
+A common misconception: if ``config_parameters.HMM_LOOKBACK = "10 hours ago UTC"``
 is the source, why not just do::
 
     import config_parameters
@@ -61,7 +61,7 @@ When Python executes::
     # inside regime_director.py (top of file, at import time)
     from config_parameters import HMM_LOOKBACK
 
-it **copies** the string value ``"2 hours ago UTC"`` into a new name living
+it **copies** the string value ``"10 hours ago UTC"`` into a new name living
 inside the ``strategy.regime_director`` module namespace.  After that point,
 ``config_parameters.HMM_LOOKBACK`` and ``strategy.regime_director.HMM_LOOKBACK``
 are **two independent variables** that happen to hold the same string.
@@ -71,25 +71,25 @@ The correct target is therefore the copy that ``regime_director.py`` actually
 reads at runtime::
 
     import strategy.regime_director as rd_mod
-    rd_mod.HMM_LOOKBACK = "1 hour ago UTC"   # ← patches the copy RegimeDirector reads
+    rd_mod.HMM_LOOKBACK = "5 hours ago UTC"   # ← patches the copy RegimeDirector reads
 
-Step-by-step: how ``"2 hours ago UTC"`` becomes ``"1 hour ago UTC"``
----------------------------------------------------------------------
+Step-by-step: how ``"10 hours ago UTC"`` becomes ``"5 hours ago UTC"``
+-----------------------------------------------------------------------
 1. **At import time** — ``regime_director.py`` is first imported:
 
    * ``from config_parameters import HMM_LOOKBACK`` runs.
-   * Python creates ``strategy.regime_director.HMM_LOOKBACK = "2 hours ago UTC"``
+   * Python creates ``strategy.regime_director.HMM_LOOKBACK = "10 hours ago UTC"``
      (a separate copy).
-   * ``config_parameters.HMM_LOOKBACK`` is also ``"2 hours ago UTC"`` and
+   * ``config_parameters.HMM_LOOKBACK`` is also ``"10 hours ago UTC"`` and
      stays that way **forever**.
 
 2. **``load_best_params()`` is called** (before ``RegimeDirector()``):
 
    * ``import strategy.regime_director as rd_mod`` fetches the already-imported
      module from ``sys.modules`` — no re-execution, just a reference.
-   * ``rd_mod.HMM_LOOKBACK = "1 hour ago UTC"`` overwrites the **copy**
+   * ``rd_mod.HMM_LOOKBACK = "5 hours ago UTC"`` overwrites the **copy**
      inside ``strategy.regime_director``'s namespace.
-   * ``config_parameters.HMM_LOOKBACK`` is still ``"2 hours ago UTC"``.
+   * ``config_parameters.HMM_LOOKBACK`` is still ``"10 hours ago UTC"``.
 
 3. **``RegimeDirector()`` is instantiated**:
 
@@ -102,8 +102,8 @@ Step-by-step: how ``"2 hours ago UTC"`` becomes ``"1 hour ago UTC"``
    * Python resolves the bare name ``HMM_LOOKBACK`` by looking it up in
      ``regime_director``'s **own** module namespace (the LEGB rule: Local →
      Enclosing → **Global** → Built-in, where "Global" means the module).
-   * That namespace now holds ``"1 hour ago UTC"`` (from step 2).
-   * Result: ``self.lookback = "1 hour ago UTC"``.
+   * That namespace now holds ``"5 hours ago UTC"`` (from step 2).
+   * Result: ``self.lookback = "5 hours ago UTC"``.
 
 Why the ``None`` sentinel matters
 ----------------------------------
@@ -122,11 +122,11 @@ HMM_LOOKBACK conversion
 ------------------------
 ``best_params.json`` stores ``hmm_lookback_rows`` (``int``) because
 ``sensitivity.py`` is a backtest tool that counts rows.  The live system
-uses ``HMM_LOOKBACK`` (a dateutil string, e.g. ``"40 minutes ago UTC"``).
-Since 1 candle = 1 minute, the conversion is: ``rows_to_lookback(n)``
-which produces ``"N minutes ago UTC"`` for any positive integer N.
-This means any value Optuna discovers (30, 40, 70, …) is applied correctly
-without a static lookup table.
+uses ``HMM_LOOKBACK`` (a dateutil string, e.g. ``"10 hours ago UTC"``).
+Since the live system uses 5-minute klines, 1 candle = 5 minutes.
+The conversion is: ``rows_to_lookback(n)`` which multiplies by 5 then
+formats as a time string.  For example, 120 rows × 5 min = 600 min = 10 h
+→ ``"10 hours ago UTC"``.
 """
 
 import json
@@ -142,22 +142,34 @@ BEST_PARAMS_PATH = (
 )
 
 
-# Converts hmm_lookback_rows (int, 1-minute candles) → HMM_LOOKBACK dateutil
-# string used by the live system.  1 row = 1 minute, so the conversion is
-# direct: 40 rows → "40 minutes ago UTC".
+# Converts hmm_lookback_rows (int, 5-minute candles) → HMM_LOOKBACK dateutil
+# string used by the live system.  At 5-minute resolution, 1 row = 5 minutes,
+# so the conversion multiplies rows × 5 before formatting as a time string.
+# Example: 120 rows × 5 min = 600 min = 10 hours → "10 hours ago UTC".
 # A static lookup table was used previously but broke whenever Optuna discovered
 # a value outside the hand-coded set (e.g. 40). The function below handles any
 # positive integer correctly.
+_INTERVAL_MINUTES = 5  # matches HMM_INTERVAL = KLINE_INTERVAL_5MINUTE
 
 
-def rows_to_lookback(rows: int) -> str:
-    """Convert a candle count to a dateutil lookback string (1 row = 1 minute)."""
-    if rows < 60:
-        return f"{rows} minutes ago UTC"
-    hours, mins = divmod(rows, 60)
+def rows_to_lookback(rows: int, interval_minutes: int = _INTERVAL_MINUTES) -> str:
+    """Convert a candle count to a dateutil lookback string.
+
+    Args:
+        rows: Number of kline rows (candles).
+        interval_minutes: Duration of each candle in minutes (default: 5).
+
+    Returns:
+        A dateutil-compatible string such as ``"10 hours ago UTC"`` or
+        ``"35 minutes ago UTC"``.
+    """
+    total_minutes = rows * interval_minutes
+    if total_minutes < 60:
+        return f"{total_minutes} minutes ago UTC"
+    hours, mins = divmod(total_minutes, 60)
     if mins == 0:
         return f"{hours} hour{'s' if hours != 1 else ''} ago UTC"
-    return f"{rows} minutes ago UTC"
+    return f"{total_minutes} minutes ago UTC"
 
 
 # ---------------------------------------------------------------------------

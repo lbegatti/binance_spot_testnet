@@ -42,7 +42,7 @@ from backtest.pnl import simulate_pnl
 from backtest.reporting.formatters import HEAVY, print_report, save_csv
 from backtest.signals import run_signals
 from backtest.visualization import plot_backtest
-from config_parameters import BACKTEST_FEE_RATE
+from config_parameters import BACKTEST_FEE_RATE, BACKTEST_OOS_START
 from strategy.param_loader import load_best_params_for_backtest
 
 logging.basicConfig(
@@ -112,15 +112,17 @@ def run_backtest(
     best = load_best_params_for_backtest()
 
     # Steps 1–3: fetch klines → synthetic books → signals
+    # OOS window: BACKTEST_OOS_START → today (90 days, ~25,920 rows at 5 m).
+    # sensitivity.py was trained on the IS window (days −360 → −90) and never
+    # saw this data — genuine out-of-sample validation.
     # best.get() returns None when a key is absent → run_signals() uses its
     # config_parameters.py default for that parameter automatically.
     signals = run_signals(
         hmm_lookback_rows=best.get("hmm_lookback_rows"),
         hmm_max_regimes=best.get("hmm_max_regimes"),
         vwap_window=best.get("vwap_window"),
-        vwap_threshold=best.get(
-            "vwap_threshold"
-        ),  # from best_params.json (Bayesian-optimised)
+        vwap_threshold=best.get("vwap_threshold"),
+        lookback=BACKTEST_OOS_START,  # OOS window: 60 days ago → today
     )
 
     # Step 4: simulate P&L

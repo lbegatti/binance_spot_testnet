@@ -13,7 +13,7 @@ No API key is required; kline data is a public endpoint.
 import pandas as pd
 from binance.client import Client
 
-from config_parameters import SYMBOL, BACKTEST_LOOKBACK
+from config_parameters import SYMBOL, BACKTEST_LOOKBACK, BACKTEST_INTERVAL
 
 # Column names returned by get_historical_klines — fixed by the Binance API.
 _KLINE_COLUMNS = [
@@ -34,8 +34,9 @@ _KLINE_COLUMNS = [
 
 def fetch_klines(
     symbol: str = SYMBOL,
-    interval: str = Client.KLINE_INTERVAL_1MINUTE,
+    interval: str = BACKTEST_INTERVAL,
     start_str: str = BACKTEST_LOOKBACK,
+    end_str: str | None = None,
 ) -> pd.DataFrame:
     """
     Download historical klines from Binance and return a clean DataFrame.
@@ -48,11 +49,20 @@ def fetch_klines(
         Trading pair, e.g. ``"BTCUSDT"``.
     interval : str
         Kline interval constant from ``binance.client.Client``,
-        e.g. ``Client.KLINE_INTERVAL_1MINUTE``.  Defaults to 1 minute.
+        e.g. ``Client.KLINE_INTERVAL_5MINUTE``.  Defaults to ``BACKTEST_INTERVAL``
+        (5 minutes).
     start_str : str
         How far back to fetch, in plain English understood by the
-        ``python-binance`` library, e.g. ``"30 days ago UTC"``.
-        At 1 m resolution, 30 days ≈ 43 200 rows.
+        ``python-binance`` library, e.g. ``"180 days ago UTC"``.
+        At 5 m resolution, 180 days ≈ 51,840 rows.
+    end_str : str | None
+        Optional end date/time string.  When provided, only klines up to
+        (but not including) this point are returned.  Use this to create a
+        clean in-sample window that does not overlap with the OOS period.
+        Example: ``BACKTEST_OOS_START = "60 days ago UTC"`` → returns rows
+        from ``start_str`` to 60 days ago, leaving the last 60 days for
+        out-of-sample validation in ``runner.py``.
+        ``None`` (default) → fetch up to the most recent complete candle.
 
     Returns
     -------
@@ -68,19 +78,24 @@ def fetch_klines(
 
     Examples
     --------
-    >>> df = fetch_klines()          # 30 days of BTCUSDT 1 m klines
-    >>> df.shape                     # (~43 200, 10)
+    >>> df = fetch_klines()          # 180 days of BTCUSDT 5 m klines
+    >>> df.shape                     # (~51 840, 10)
     >>> df.columns.tolist()
     ['open', 'high', 'low', 'close', 'volume', 'close_time',
      'quote_volume', 'num_trades', 'taker_buy_base_vol', 'taker_buy_quote_vol']
     """
     client = Client()  # public endpoint — no api_key / api_secret needed
 
-    raw = client.get_historical_klines(
-        symbol=symbol,
-        interval=interval,
-        start_str=start_str,
-    )
+    klines_kwargs: dict = {
+        "symbol": symbol,
+        "interval": interval,
+        "start_str": start_str,
+    }
+    if end_str is not None:
+        klines_kwargs["end_str"] = end_str  # omit entirely when None — avoids
+        # library versions that treat explicit None differently from absent arg
+
+    raw = client.get_historical_klines(**klines_kwargs)
 
     df = pd.DataFrame(raw, columns=_KLINE_COLUMNS)
 

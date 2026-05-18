@@ -14,8 +14,8 @@ No magic numbers appear anywhere else in the strategy code.
 | Constant | Value | Purpose |
 |---|---|---|
 | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to `GaussianHMM` |
-| `HMM_INTERVAL` | `Client.KLINE_INTERVAL_1MINUTE` | Kline granularity (1 min — intra-session resolution) |
-| `HMM_LOOKBACK` | `"2 hours ago UTC"` | Rolling window (~120 rows); responsive to intra-day BTC shifts while keeping enough data for stable EM convergence |
+| `HMM_INTERVAL` | `Client.KLINE_INTERVAL_5MINUTE` | Kline granularity (5 min — consistent with backtest; 12 bars/h) |
+| `HMM_LOOKBACK` | `"10 hours ago UTC"` | Rolling window (~120 rows at 5 m); keeps enough data for stable EM convergence while tracking intra-day regime shifts |
 | `HMM_MAX_REGIMES` | `3` | Upper bound on hidden states evaluated during BIC search (2 … 3, = `len(HMM_FEATURE_COLS) − 1`) |
 | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | `46` | Seed for reproducible state numbering across fits |
@@ -23,12 +23,13 @@ No magic numbers appear anywhere else in the strategy code.
 | `HMM_N_INIT` | `10` | Random-seed restarts per candidate `n_components`; reduces degenerate EM solutions on flat windows |
 | `HMM_REFIT_INTERVAL` | `300` | Full re-fit cadence (s).  Between re-fits only Viterbi prediction runs |
 
-> **Why 2 hours and not 4?**  
-> A market regime persists for minutes to hours, but Bitcoin's direction can
-> shift quickly.  A 4-hour window means a regime change 30 minutes ago barely
-> moves the model (the session's own data is only ~8 % of the training set).
-> 2 hours (~120 candles) is reactive enough to capture intra-day shifts while
-> keeping enough data points for stable EM convergence with up to 4 states.
+> **Why 10 hours and not 2?**  
+> Switching from 1-minute to 5-minute klines requires a proportionally longer
+> lookback to keep the same number of bars (~120) that HMM needs for stable EM
+> convergence: 2 h × 5 = 10 h.  The 5-minute resolution is less noisy than 1-minute
+> — each bar aggregates 5 minutes of tick data — while the 10-hour window still
+> captures sharp intra-day regime shifts.  A 4-hour window at 5 m would give only
+> 48 rows, which is insufficient for reliable multi-state EM with 4 features.
 
 ---
 
@@ -98,7 +99,7 @@ only the instant label assignment is locked:
 
 ```python
 # OUTSIDE _regime_lock — slow: network download + CPU model fit/predict
-self.regime_director.get_klines_data()         # re-fetch latest 2 h of klines
+self.regime_director.get_klines_data()         # re-fetch latest 10 h of 5-min klines
 
 # Two-speed update: full re-fit every HMM_REFIT_INTERVAL (300 s),
 # cheap Viterbi prediction on all other iterations.

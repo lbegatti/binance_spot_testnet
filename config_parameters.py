@@ -65,9 +65,9 @@ HMM_FEATURE_COLS = ["return", "volatility", "obi_proxy", "trade_density"]
 HMM_N_ITERATIONS = 1000
 HMM_MAX_REGIMES = len(HMM_FEATURE_COLS) - 1  # BIC search: 2 … 3 states
 HMM_RANDOM_STATE = 46
-HMM_INTERVAL = Client.KLINE_INTERVAL_1MINUTE
-HMM_LOOKBACK = "2 hours ago UTC"  # 120 candles — responsive to intraday BTC shifts
-# while keeping enough data for stable EM convergence
+HMM_INTERVAL = Client.KLINE_INTERVAL_5MINUTE
+HMM_LOOKBACK = "10 hours ago UTC"  # 120 candles at 5 m — provides stable EM convergence
+# while remaining responsive to intraday BTC shifts (10 h × 12 bars/h = 120 rows).
 # Regularisation floor added to the diagonal of every state's covariance
 # matrix.  Prevents "covars must be symmetric, positive-definite" errors
 # when a hidden state has few observations relative to the feature count.
@@ -95,10 +95,26 @@ HMM_REFIT_INTERVAL = 300  # seconds (= 5 min)
 # Backtesting — all parameters used by backtest/ in one place
 # ---------------------------------------------------------------------------
 
-# -- Data window -----------------------------------------------------------
-# 180 calendar days at 1 m resolution → 259,200 rows.
-# Crypto trades 24/7 so there are no weekend gaps.
-BACKTEST_LOOKBACK = "180 days ago UTC"
+# -- Candle resolution -----------------------------------------------------
+# 5-minute bars: 180 days × 24 h × 12 bars/h = 51,840 rows.
+# Chosen over 1-minute (259,200 rows) to reduce noise / overfitting risk
+# while keeping intraday regime granularity.
+# The Binance REST and live system both support 5 m natively.
+from binance.client import Client as _Client  # local re-import for the constant
+BACKTEST_INTERVAL: str = _Client.KLINE_INTERVAL_5MINUTE  # "5m"
+
+# -- In-sample / out-of-sample split (Option B) ----------------------------
+# ALL 360 days (1 year) are covered.  The pipeline is split cleanly:
+#
+#   |─── days −360 → −90 (270 days, ~77,760 rows) ──|── days −90 → today (90 days, ~25,920 rows) ──|
+#              IN-SAMPLE (sensitivity.py)                  OUT-OF-SAMPLE (runner.py validation)
+#
+# sensitivity.py fetches [BACKTEST_LOOKBACK … BACKTEST_OOS_START) — never sees OOS data.
+# runner.py      fetches [BACKTEST_OOS_START … today]             — genuinely fresh data.
+# 360-day IS window captures ~3 full market cycles (bull / bear / sideways), reducing
+# the risk that Optuna fits parameters to a single regime.
+BACKTEST_LOOKBACK = "360 days ago UTC"    # IS start  — used by sensitivity.py (~1 year)
+BACKTEST_OOS_START = "90 days ago UTC"    # OOS start — used by runner.py; IS end cutoff
 
 # Set to an integer to cap the number of replay candles for quick debug runs;
 # None = use all candles in the window (full production backtest).
@@ -113,29 +129,22 @@ VOLUME_DECAY_FACTOR = 0.80
 # -- HMM cadence inside the signal replay (backtest/signals.py) -----------
 # Mirrors the live system's HMM_LOOKBACK_ROWS / REFIT_EVERY constants so
 # the backtest uses the same rolling-window logic as websocket_main.py.
-HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 2 h at 1 m
-VWAP_WINDOW = 5  # rolling VWAP window (rows) — 5 min at 1 m
-REFIT_EVERY = 120  # full BIC re-fit every N replay candles (= 2 h at 1 m)
+HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 10 h at 5 m (120 × 5 min)
+VWAP_WINDOW = 5           # rolling VWAP window (rows) — 25 min at 5 m
+REFIT_EVERY = 120         # full BIC re-fit every N replay candles (= 10 h at 5 m)
 
 # Speed-up override used ONLY inside backtest/sensitivity.py.
-# At 1 m candles: 480 iterations = 8 h between refits → ~90 refits per 30-day
-# run instead of ~360, giving a ~4× speedup.  The relative ranking of parameter
-# combinations is preserved; only absolute P&L numbers change slightly.
-# config_parameters.py defaults and the live system are NEVER affected.
+# At 5 m candles: 480 iterations = 40 h between refits → ~72 refits over the
+# 120-day IS window instead of ~288, giving a ~4× speedup.  The relative
+# ranking of parameter combinations is preserved; only absolute P&L changes
+# slightly.  config_parameters.py defaults and the live system are NEVER affected.
 SENSITIVITY_REFIT_EVERY = 480
-# Data fetch window used by sensitivity.py — shorter than BACKTEST_LOOKBACK
-# (180 days) to keep each of the 6 OAT runs fast (~36–108 min total).
-# 30 days ≈ 43,200 rows at 1 m resolution.
-# IMPORTANT: this is passed as start_str to fetch_klines() inside run_signals()
-# only when called from sensitivity.py.  runner.py always uses
-# BACKTEST_LOOKBACK and is completely unaffected.
-SENSITIVITY_LOOKBACK = "90 days ago UTC"
 # How many candles to skip between cheap Viterbi passes (predict_current_regime)
 # in sensitivity.py.  Between two predict calls the last known regime label is
-# reused.  1-min candles → regime changes in ≤5 min are missed, but the
+# reused.  5-min candles → regime changes in ≤25 min are missed, but the
 # RELATIVE ranking of parameter combinations is preserved (all runs use the
 # same cadence).  runner.py always uses predict_every=1 (every candle).
-SENSITIVITY_PREDICT_EVERY = 5  # ~5 min at 1 m — sensitivity-sweep override only
+SENSITIVITY_PREDICT_EVERY = 5  # ~25 min at 5 m — sensitivity-sweep override only
 # Between two full-BIC refit calls, predict_current_regime() is called only every
 # 5 candles; the last known regime label is reused (~5× Viterbi speedup).
 # runner.py always uses predict_every=1 (every candle).
@@ -144,6 +153,7 @@ SENSITIVITY_PREDICT_EVERY = 5  # ~5 min at 1 m — sensitivity-sweep override on
 # Must match BACKTEST_FEE_RATE — Binance charges what it charges regardless.
 # Kept as a separate constant so changing BACKTEST_FEE_RATE does not silently
 # affect sensitivity results (and vice versa), making any deliberate change obvious.
+# IS window: BACKTEST_LOOKBACK → BACKTEST_OOS_START (270 days at 5 m ≈ 77,760 rows).
 SENSITIVITY_FEE_RATE: float = 0.001  # 0.10 % — standard Binance Spot taker fee
 
 # Metric used to rank parameter combinations and select best_params.json.

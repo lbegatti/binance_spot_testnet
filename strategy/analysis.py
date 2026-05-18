@@ -432,8 +432,8 @@ class AnalysisEngine:
 
            * **Every ``HIST_INTERVAL`` (60 s)** — cheap path:
 
-             - ``regime_director.get_klines_data()`` — fetches the latest
-               ``HMM_LOOKBACK`` (2 h) of ``HMM_INTERVAL`` (1 m) klines.
+              - ``regime_director.get_klines_data()`` — fetches the latest
+                ``HMM_LOOKBACK`` (10 h) of ``HMM_INTERVAL`` (5 m) klines.
              - ``regime_director.predict_current_regime()`` — runs the Viterbi
                algorithm on the already-fitted model (O(n × k)), extracts the
                state of the last candle.  No re-training.

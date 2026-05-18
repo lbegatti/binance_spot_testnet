@@ -144,6 +144,59 @@ def plot_backtest(
     """
     log.info("Building backtest visualisation (Plotly)…")
 
+    # ── One-time debug: print exact P&L math for first winning round-trip ─────
+    # This fires only when plot_backtest() is called (i.e. from runner.py).
+    # The equivalent block in pnl.py/_pair_round_trips fires on EVERY
+    # simulate_pnl() call — including each Optuna trial in sensitivity.py which
+    # uses a different data window (SENSITIVITY_LOOKBACK, typically 90 days) and
+    # different trial parameters.  Comparing numbers across those two log entries
+    # is meaningless: they represent the first winner from two SEPARATE runs on
+    # different price windows.  Only compare entries that share the same log
+    # timestamp prefix.
+    if trades is not None and not trades.empty:
+        _buys = trades[trades["side"] == "BUY"].copy()
+        _sells = trades[trades["side"] == "SELL"].copy()
+        _buy_queue: list = list(_buys.iterrows())
+        _sell_idx: int = 0
+        for _buy_ts, _buy_row in _buy_queue:
+            if _sell_idx >= len(_sells):
+                break
+            _sell_row = _sells.iloc[_sell_idx]
+            _qty = min(float(_buy_row["quantity"]), float(_sell_row["quantity"]))
+            _gross = (float(_sell_row["fill_price"]) - float(_buy_row["fill_price"])) * _qty
+            if _gross > 0:
+                # Prorate the recorded fees to the matched quantity.
+                _entry_fee = float(_buy_row["fee"]) * (_qty / float(_buy_row["quantity"]))
+                _exit_fee = float(_sell_row["fee"]) * (_qty / float(_sell_row["quantity"]))
+                _total_fees = _entry_fee + _exit_fee
+                _net = _gross - _total_fees
+                log.info(
+                    "\n"
+                    "  ╔════════════════════════════════════════════════════════════╗\n"
+                    "  ║  [VISUALIZATION.PY — runner.py path] First winning trade  ║\n"
+                    "  ║  (runner.py window; compare only with pnl.py log from     ║\n"
+                    "  ║   the SAME run — same timestamp prefix in the log)        ║\n"
+                    "  ╠════════════════════════════════════════════════════════════╣\n"
+                    "  ║  Entry Price : %10.4f USDT                              ║\n"
+                    "  ║  Exit  Price : %10.4f USDT                              ║\n"
+                    "  ║  Size        : %10.6f BTC                               ║\n"
+                    "  ╠════════════════════════════════════════════════════════════╣\n"
+                    "  ║  1) Gross Profit  = (%.4f - %.4f) × %.6f             ║\n"
+                    "  ║                   = %+.4f USDT                            ║\n"
+                    "  ║  2) Total Fees    = entry_fee %.4f + exit_fee %.4f     ║\n"
+                    "  ║     (from trades_df[\"fee\"] column, prorated to matched qty)║\n"
+                    "  ║                   = %.4f USDT                             ║\n"
+                    "  ║  3) Net Profit    = %.4f - %.4f = %+.4f USDT          ║\n"
+                    "  ╚════════════════════════════════════════════════════════════╝",
+                    float(_buy_row["fill_price"]), float(_sell_row["fill_price"]), _qty,
+                    float(_sell_row["fill_price"]), float(_buy_row["fill_price"]), _qty, _gross,
+                    _entry_fee, _exit_fee, _total_fees,
+                    _gross, _total_fees, _net,
+                )
+                break
+            _sell_idx += 1
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Build subplot grid ────────────────────────────────────────────────────
     # Rows 1–5: full-width single subplot (colspan=2).
     # Row 6:    two side-by-side bar-chart subplots.

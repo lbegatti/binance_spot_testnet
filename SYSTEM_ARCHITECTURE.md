@@ -30,8 +30,8 @@ FILES
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
 
-  backtest/                           — Offline backtesting framework (see BACKTESTING.md)
-    data.py                           — Historical kline downloader (180 days, 1 m BTCUSDT; ~259,200 candles)
+    backtest/                           — Offline backtesting framework (see BACKTESTING.md)
+    data.py                           — Historical kline downloader (5 m BTCUSDT; IS: 360→90 days ago ~77,760 rows, OOS: 90 days ago→today ~25,920 rows; end_str enforces IS boundary)
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
     signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
     pnl.py                            — P&L simulation: balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), per-trade position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics
@@ -79,12 +79,14 @@ FILES
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
-    BACKTEST_LOOKBACK    = "180 days ago UTC"  # kline fetch window for backtest dataset (~259,200 candles;
-                                               # 180-day window for broad regime coverage)
+    BACKTEST_INTERVAL    = "5m"                       # 5-minute klines (Client.KLINE_INTERVAL_5MINUTE)
+                                                       # 270-day IS window → ~77,760 rows; 90-day OOS → ~25,920 rows
+    BACKTEST_LOOKBACK    = "360 days ago UTC"          # IS start — used by sensitivity.py (270-day IS period)
+    BACKTEST_OOS_START   = "90 days ago UTC"           # OOS start / IS end — used by runner.py; never seen by sensitivity.py
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
-    HMM_LOOKBACK_ROWS    = 120    # warm-up window for backtest HMM (2 h at 1 m — matches HMM_LOOKBACK)
-    VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (5 min at 1 m)
-    REFIT_EVERY          = 120    # iterations between full HMM BIC re-fits (live: every 2 h; backtest: ~1,080 refits over 180 days)
+    HMM_LOOKBACK_ROWS    = 120    # warm-up window — 10 h at 5 m (120 × 5 min)
+    VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (25 min at 5 m)
+    REFIT_EVERY          = 120    # iterations between full HMM BIC re-fits (10 h at 5 m → ~288 refits over 270-day IS)
     BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 500 for fast debug)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
@@ -99,9 +101,13 @@ FILES
                                          # Default 5 bps → ~$20 at $80 k BTC.
     BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
     SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py ONLY.
-                                         # 480 iterations = 8 h at 1 m → ~90 refits
-                                         # per 90-day run (~4× faster than REFIT_EVERY=120).
+                                         # 480 iterations = 40 h at 5 m → ~72 refits
+                                         # over the 270-day IS window (~4× faster than REFIT_EVERY=120).
                                          # config_parameters defaults unchanged.
+    # NOTE: SENSITIVITY_LOOKBACK has been removed.  The IS window is now defined
+    # by BACKTEST_LOOKBACK (IS start) and BACKTEST_OOS_START (IS end / OOS start).
+    # sensitivity.py passes end_str=BACKTEST_OOS_START to fetch_klines(); runner.py
+    # passes start_str=BACKTEST_OOS_START to fetch only the OOS window.
     # NOTE: BACKTEST_FEE_RATE is also imported by execution/order_executor.py
     # for the live BUY quantity cap: usdt / (micro_price × (1 + BACKTEST_FEE_RATE)).
     # Binance charges the taker fee on top of the order notional at fill time;
@@ -566,11 +572,17 @@ FILES
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
 
 ## 7. BACKTESTING  (backtest/)
-  Offline replay of the live strategy on 180 days of historical 1-min klines
-  (~259,200 candles).  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
+  Offline replay of the live strategy using a clean **IS/OOS split** on **5-minute BTCUSDT klines**
+  (IS: 360→90 days ago, 270 days, ~77,760 rows; OOS: 90 days ago→today, 90 days, ~25,920 rows; total ~103,680 rows).
+  Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
-  backtest/data.py            — fetch_klines(): downloads ~259,200 candles via
-                                Client.get_historical_klines() (public, no auth).
+  backtest/data.py            — fetch_klines(start_str, end_str): downloads klines
+                                at 5-minute resolution (`BACKTEST_INTERVAL = "5m"`)
+                                via Client.get_historical_klines() (public, no auth).
+                                `end_str` is injected only when set, enforcing the
+                                IS/OOS boundary: sensitivity.py passes
+                                `end_str=BACKTEST_OOS_START`; runner.py uses
+                                `start_str=BACKTEST_OOS_START` for the OOS window.
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +
                                 exponential volume decay + OBI asymmetry injection).
@@ -652,20 +664,31 @@ FILES
                                     hourly, or √105120 5-min depending on window
                                     length.  Total return denominator includes
                                     initial BTC valued at first-candle close.
-                                    _pair_round_trips(): exhaustive FIFO BUY→SELL
-                                    matching via collections.deque — supports
-                                    scaling-in, layering, and pyramiding (multiple
-                                    concurrent open legs).  Partial closes push
-                                    the remaining qty back to the front of the
-                                    queue (appendleft); over-sells consume as many
-                                    legs as the SELL qty allows.  Orphan SELLs
-                                    (no open BUY leg — only possible when
-                                    initial_btc > 0) emit a visible WARNING box.
-                                    NOTE: open_buys deque is a pure accounting
-                                    cursor — all trades in trades_df are already
-                                    settled by simulate_pnl() before pairing runs.
+                                     _pair_round_trips(fee_rate=...): exhaustive FIFO
+                                     BUY→SELL matching via collections.deque —
+                                     supports scaling-in, layering, and pyramiding
+                                     (multiple concurrent open legs).  Partial closes
+                                     push the remaining qty back to the front of the
+                                     queue (appendleft); over-sells consume as many
+                                     legs as the SELL qty allows.  FEE FIX: per-trade
+                                     P&L now deducts both taker fees explicitly:
+                                       pnl_usdt = gross_pnl − entry_fee − exit_fee
+                                     where entry_fee = entry_price × qty × fee_rate
+                                     and   exit_fee  = exit_price  × qty × fee_rate.
+                                     Accepts fee_rate parameter (passed through from
+                                     simulate_pnl).  Previously only the half-spread
+                                     was reflected; fees are now properly subtracted
+                                     in round-trip stats (equity curve always correct).
+                                     Orphan SELLs (no open BUY leg — only possible when
+                                     initial_btc > 0) emit a visible WARNING box.
+                                     NOTE: open_buys deque is a pure accounting
+                                     cursor — all trades in trades_df are already
+                                     settled by simulate_pnl() before pairing runs.
 
   backtest/runner.py             — run_backtest(): top-level orchestrator.
+                                    Fetches the OOS window (BACKTEST_OOS_START →
+                                    today, ~25,920 rows at 5 m) via
+                                    run_signals(lookback=BACKTEST_OOS_START).
                                     Chains run_signals() → simulate_pnl() →
                                     print_report() → (opt-in) plot_backtest().
                                     Loads best_params.json via
@@ -795,15 +818,18 @@ FILES
                                      Overrides passed as keyword args to
                                      run_signals() / simulate_pnl() — no changes
                                      to config_parameters.py or the live system.
-                                    Three sensitivity-only speed-up constants
-                                    (all in config_parameters.py, no effect on
-                                    runner.py or the live system):
-                                      SENSITIVITY_REFIT_EVERY = 480  (~4× fewer refits)
-                                      SENSITIVITY_LOOKBACK = "90 days ago UTC"
-                                                             (~2× fewer rows than 180d)
-                                      SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi)
-                                    --lookback flag overrides SENSITIVITY_LOOKBACK
-                                    per run (no config change needed).
+                                     Three sensitivity-only speed-up constants
+                                     (all in config_parameters.py, no effect on
+                                     runner.py or the live system):
+                                       SENSITIVITY_REFIT_EVERY = 480  (40 h at 5 m → ~72 refits over IS window; ~4× speedup)
+                                       SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi calls)
+                                    IS/OOS split (SENSITIVITY_LOOKBACK removed; IS window defined by):
+                                       IS window: BACKTEST_LOOKBACK ("360 days ago UTC") → BACKTEST_OOS_START ("90 days ago UTC")
+                                                  270 days, ~77,760 rows at 5 m
+                                                  fetch_klines(start_str=BACKTEST_LOOKBACK, end_str=BACKTEST_OOS_START)
+                                       OOS window: runner.py only — never touched by sensitivity.py
+                                     --lookback flag overrides IS start only;
+                                     IS end always = BACKTEST_OOS_START.
                                     _check_existing_best_params() guard: reads
                                     best_params.json age/Sharpe/params and
                                     prompts [y/N] before every run (all modes).
@@ -817,7 +843,7 @@ FILES
                                           reporting/optuna_history_<ts>.html
                                           reporting/optuna_importance_<ts>.html
                                           reporting/optuna_contour_<ts>.html
-                                       ~5–8 h for 40 trials (~8–12 min/trial, 90-day window).
+                                        ~3–6 h for 40 trials (~5–8 min/trial, IS 270-day window at 5 m).
                                      Console report formatting delegated to
                                      reporting/formatters.py:
                                        print_sensitivity_table()    ← all modes
@@ -846,8 +872,8 @@ FILES
                                                         hmm_max_regimes, vwap_window, vwap_threshold, fee_rate);
                                                         falls back to defaults if absent.
                                         results/optuna.db  ← Bayes mode only (SQLite study)
-                                     Use Case B (180-day window) DEFERRED —
-                                     ~4–12 h OAT runtime on a laptop.
+                                     Use Case B (OOS robustness validation) DEFERRED —
+                                     ~4–12 h OAT runtime on a laptop; requires dedicated compute.
 
   Implementation status: data.py ✅, synthetic_book.py ✅, signals.py ✅,
                          pnl.py ✅, runner.py ✅, reporting/ ✅,

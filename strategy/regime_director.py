@@ -215,8 +215,8 @@ class RegimeDirector:
 
         * **Training set** — the first ``HMM_TRAIN_ROWS`` rows of
           ``klines_df`` (older, in-sample data).  All ``fit()`` and ``bic()``
-          calls use only this slice.  At the default ``HMM_LOOKBACK`` of 2 h
-          (≈ 120 rows) and ``HMM_TRAIN_ROWS = 80``, roughly the oldest ⅔ of
+          calls use only this slice.  At the default ``HMM_LOOKBACK`` of 10 h
+          (≈ 120 rows at 5 m) and ``HMM_TRAIN_ROWS = 80``, roughly the oldest ⅔ of
           the window is used for training.
         * **Test set (prediction set)** — ``features[HMM_TRAIN_ROWS:]`` — the
           most-recent ~40 rows that the model has **never seen** during

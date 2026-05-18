@@ -434,7 +434,7 @@ def simulate_pnl(
     equity_df["drawdown_pct"] = (equity_df["equity"] - peak) / peak * 100
 
     # Summary statistics
-    round_trips = _pair_round_trips(trades_df, final_close)
+    round_trips = _pair_round_trips(trades_df, final_close, fee_rate=fee_rate)
     stats = _compute_stats(
         signals,
         equity_df,
@@ -460,6 +460,7 @@ def simulate_pnl(
 def _pair_round_trips(
     trades_df: pd.DataFrame,
     last_close: float,
+    fee_rate: float = 0.0,
 ) -> list[dict]:
     """
     Pair each BUY with the subsequent SELL to form round-trip trades.
@@ -500,6 +501,7 @@ def _pair_round_trips(
     # Each entry: {"ts": pd.Timestamp, "price": float, "qty": float}
     # A new BUY always appends to the right; a SELL pops from the left (oldest).
     open_buys: deque[dict] = deque()
+    _first_winner_logged: bool = False  # debug flag — log once per call
 
     for ts, row in trades_df.iterrows():
         if row["side"] == "BUY":
@@ -563,9 +565,47 @@ def _pair_round_trips(
 
                 remaining_sell -= matched_qty
 
-                # P&L in USDT: (exit − entry) × matched_qty.  Fees are
-                # already embedded in fill prices via half_spread / fee_rate.
-                pnl_usdt: float = (exit_price - entry["price"]) * matched_qty
+                # P&L in USDT: (exit − entry) × matched_qty, then deduct both
+                # taker fees.  fill_price = close ± half_spread embeds only the
+                # synthetic bid-ask spread cost; the explicit fee_rate is charged
+                # separately by simulate_pnl and must be subtracted here too.
+                gross_pnl: float = (exit_price - entry["price"]) * matched_qty
+                entry_fee: float = entry["price"] * matched_qty * fee_rate
+                exit_fee_: float = exit_price * matched_qty * fee_rate
+                total_fees_: float = entry_fee + exit_fee_
+                pnl_usdt: float = gross_pnl - total_fees_
+
+                # ── One-time debug log (first winner) ─────────────────────
+                # NOTE: this fires on EVERY simulate_pnl() call (runner.py,
+                # sensitivity.py, unit tests, …).  Numbers will differ across
+                # runs that use different data windows or parameters — that is
+                # expected and is NOT a bug.  Compare only logs from the same
+                # run (identical timestamp prefix).
+                if not _first_winner_logged and gross_pnl > 0:
+                    log.info(
+                        "\n"
+                        "  ╔════════════════════════════════════════════════════════════╗\n"
+                        "  ║  [PNL.PY — _pair_round_trips] First winning round-trip    ║\n"
+                        "  ║  (fires on every simulate_pnl call; values are run-specific)║\n"
+                        "  ╠════════════════════════════════════════════════════════════╣\n"
+                        "  ║  Entry Price : %10.4f USDT                              ║\n"
+                        "  ║  Exit  Price : %10.4f USDT                              ║\n"
+                        "  ║  Size        : %10.6f BTC                               ║\n"
+                        "  ╠════════════════════════════════════════════════════════════╣\n"
+                        "  ║  1) Gross Profit  = (%.4f - %.4f) × %.6f             ║\n"
+                        "  ║                   = %+.4f USDT                            ║\n"
+                        "  ║  2) Total Fees    = entry_fee %.4f + exit_fee %.4f     ║\n"
+                        "  ║     (fee_rate used here = %.5f)                           ║\n"
+                        "  ║                   = %.4f USDT                             ║\n"
+                        "  ║  3) Net Profit    = %.4f - %.4f = %+.4f USDT          ║\n"
+                        "  ╚════════════════════════════════════════════════════════════╝",
+                        entry["price"], exit_price, matched_qty,
+                        exit_price, entry["price"], matched_qty, gross_pnl,
+                        entry_fee, exit_fee_, fee_rate, total_fees_,
+                        gross_pnl, total_fees_, pnl_usdt,
+                    )
+                    _first_winner_logged = True
+                # ─────────────────────────────────────────────────────────
 
                 try:
                     holding_min: float = (
@@ -591,7 +631,10 @@ def _pair_round_trips(
     # price so that unrealized P&L is captured in the statistics.
     while open_buys:
         entry = open_buys.popleft()
-        pnl_usdt = (last_close - entry["price"]) * entry["qty"]
+        gross_pnl_mtm = (last_close - entry["price"]) * entry["qty"]
+        # Only the entry fee was paid (no actual SELL → no exit fee charged).
+        entry_fee_mtm = entry["price"] * entry["qty"] * fee_rate
+        pnl_usdt = gross_pnl_mtm - entry_fee_mtm
         round_trips.append(
             {
                 "entry_ts": entry["ts"],

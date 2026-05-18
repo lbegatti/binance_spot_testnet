@@ -89,8 +89,9 @@ from backtest.reporting.formatters import (
 )
 from backtest.signals import _add_hmm_features, run_signals
 from config_parameters import (
+    BACKTEST_LOOKBACK,
+    BACKTEST_OOS_START,
     SENSITIVITY_REFIT_EVERY,
-    SENSITIVITY_LOOKBACK,
     SENSITIVITY_PREDICT_EVERY,
     SENSITIVITY_FEE_RATE,
     SENSITIVITY_RANK_METRIC,
@@ -481,11 +482,12 @@ def _run_sensitivity_optuna_study(
     ``load_if_exists=True`` means the study resumes automatically if it was
     interrupted — previously completed trials are not re-run.
     """
-    effective_lookback = lookback if lookback is not None else SENSITIVITY_LOOKBACK
+    effective_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
     log.info(
-        "Bayesian optimisation — %d trials  (window: '%s')",
+        "Bayesian optimisation — %d trials  (IS window: '%s' → '%s')",
         n_trials,
         effective_lookback,
+        BACKTEST_OOS_START,
     )
 
     # Warn if a previous result exists — bayes resumes the study so it adds
@@ -499,17 +501,20 @@ def _run_sensitivity_optuna_study(
 
     # ── Pre-fetch data ONCE — shared across all n_trials calls to _run_one ──
     log.info(
-        "Pre-fetching klines for %d trials (window: '%s')…",
+        "Pre-fetching IS klines for %d trials (window: '%s' → '%s')…",
         n_trials,
         effective_lookback,
+        BACKTEST_OOS_START,
     )
-    _klines = fetch_klines(start_str=effective_lookback)
+    _klines = fetch_klines(start_str=effective_lookback, end_str=BACKTEST_OOS_START)
     prefetched_df = _add_hmm_features(_klines)
     log.info(
-        "Data ready: %d klines → %d rows after HMM features. "
+        "IS data ready: %d klines → %d rows after HMM features (window: '%s' → '%s'). "
         "Shared across all %d trials — no further API calls.",
         len(_klines),
         len(prefetched_df),
+        effective_lookback,
+        BACKTEST_OOS_START,
         n_trials,
     )
 
@@ -818,15 +823,16 @@ def run_sensitivity(
         If ``True`` (default), run the full 36-combination factorial grid.
         If ``False``, run the OAT sweep (8 combinations, ~15–35 min).
     lookback : str | None
-        dateutil string overriding ``SENSITIVITY_LOOKBACK`` for this run only.
-        ``None`` → use ``SENSITIVITY_LOOKBACK`` from ``config_parameters.py``.
+        dateutil string overriding ``BACKTEST_LOOKBACK`` (IS start) for this
+        run only.  ``None`` → use ``BACKTEST_LOOKBACK`` from
+        ``config_parameters.py``.  The IS end is always ``BACKTEST_OOS_START``.
 
     Returns
     -------
     pd.DataFrame
         One row per combination, sorted by ``SENSITIVITY_RANK_METRIC`` descending.
     """
-    effective_lookback = lookback if lookback is not None else SENSITIVITY_LOOKBACK
+    effective_lookback = lookback if lookback is not None else BACKTEST_LOOKBACK
     if full_grid:
         grid = _build_full_grid()
         mode = "full-grid"
@@ -842,21 +848,21 @@ def run_sensitivity(
         return pd.DataFrame()
 
     log.info(
-        "NOTE: Use Case A only ('%s').  "
-        "Use Case B (180-day backtest validation) is DEFERRED — "
-        "runtime would be ~4–12 h for OAT alone on a laptop.",
+        "IS window: '%s' → '%s'.  OOS validation is runner.py's responsibility.",
         effective_lookback,
+        BACKTEST_OOS_START,
     )
 
     log.info(
-        "Pre-fetching klines for all %d runs (window: '%s')…",
+        "Pre-fetching IS klines for all %d runs (window: '%s' → '%s')…",
         len(grid),
         effective_lookback,
+        BACKTEST_OOS_START,
     )
-    _klines = fetch_klines(start_str=effective_lookback)
+    _klines = fetch_klines(start_str=effective_lookback, end_str=BACKTEST_OOS_START)
     prefetched_df = _add_hmm_features(_klines)
     log.info(
-        "Data ready: %d klines → %d rows after HMM features. "
+        "IS data ready: %d klines → %d rows after HMM features. "
         "Shared across all %d runs — no further API calls.",
         len(_klines),
         len(prefetched_df),
@@ -964,9 +970,11 @@ if __name__ == "__main__":
             "--oat        Phase 1 OAT sweep (8 combinations, ~1–2 h).\n"
             "--full-grid  Deprecated full factorial grid (30 combinations, ~4–6 h).\n"
             "--bayes      Explicit Bayesian search (same as default, accepts --n-trials).\n\n"
-            "NOTE — Use Case B (180-day window) is DEFERRED due to runtime:\n"
-            "  OAT 8 runs × ~8–12 min/run = ~1–2 h on a laptop.\n"
-            "  Only Use Case A (90-day window) is run here."
+            "Data window (Option B — IS/OOS split at 5 m resolution):\n"
+            "  IS  (optimisation): BACKTEST_LOOKBACK → BACKTEST_OOS_START\n"
+            "      (360 days ago → 90 days ago = 270 days, ~77,760 rows at 5 m).\n"
+            "  OOS (validation):   runner.py uses BACKTEST_OOS_START → today\n"
+            "      (90 days, ~25,920 rows at 5 m) — sensitivity.py never sees it."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1006,7 +1014,7 @@ if __name__ == "__main__":
             "Override the data window for this run only. "
             "Accepts any dateutil string, e.g. '180 days ago UTC' for a deep-calibration "
             "run (~2× slower but more robust). "
-            f"Default: SENSITIVITY_LOOKBACK from config_parameters.py ('{SENSITIVITY_LOOKBACK}')."
+            f"Default: BACKTEST_LOOKBACK from config_parameters.py ('{BACKTEST_LOOKBACK}')."
         ),
     )
     args = parser.parse_args()

@@ -4,7 +4,9 @@
 > ``signals.py``, ``pnl.py``, ``runner.py``, ``regime_validation.py``,
 > ``visualization.py``).  Step 8 (sensitivity analysis, Use Case A) is implemented with
 > **Bayesian optimisation via Optuna as the default execution mode**; OAT sweep retained
-> as `--oat`; full-grid deprecated.  Use Case B (180-day window) is deferred.
+> as `--oat`; full-grid deprecated.  IS/OOS split implemented: `sensitivity.py` tunes on
+> the 270-day IS window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`);
+> `runner.py` validates on the 90-day OOS window.  Use Case B (OOS robustness validation) deferred.
 > See the Implementation Roadmap at the bottom for a per-module progress tracker.
 
 ---
@@ -45,9 +47,10 @@ prices or queue position.
 
 ### Suggested window
 - **Instrument:** BTCUSDT
-- **Interval:** 1 minute  (matches the `HMM_INTERVAL` already used in production)
-- **Lookback:** 180 days  (~259,200 candles — captures a broad range of market
-  regimes; crypto trades 24/7 so all 30 days are fully populated with no weekend gaps)
+- **Interval:** 5 minutes (`BACKTEST_INTERVAL = Client.KLINE_INTERVAL_5MINUTE`) — reduces noise vs 1-minute without losing intraday regime granularity
+- **IS window:** 360 days ago → 90 days ago (270 days, ~77,760 candles) — used by `sensitivity.py` for parameter tuning
+- **OOS window:** 90 days ago → today (90 days, ~25,920 candles) — used by `runner.py` for validation (never seen during tuning)
+- **Total:** ~103,680 candles at 5 m (~1 year); captures multiple market cycles; 3:1 IS:OOS ratio follows standard quant practice
 
 ### Columns returned per candle
 ```
@@ -138,18 +141,17 @@ live system.  No simplified proxy rules are needed.
 
 ### Per-candle procedure
 
-The dataset contains **~259,200 rows** (180 days × 1,440 candles/day at 1 m).
+The dataset contains **~77,760 IS rows** (270 days × 288 candles/day at 5 m; OOS: ~25,920 rows over 90 days).
 For **each row** a fresh synthetic 50-level order book is constructed (Step 2c),
 and the full production pipeline is run on it.  This produces one signal
-decision per minute — the exact equivalent of one `low_latency_analysis()`
-iteration in the live system (which runs every 1 s, but at 1 m kline resolution
-the minimum granularity is 1 candle = 1 min).
+decision per 5-minute candle — the equivalent of one `low_latency_analysis()`
+iteration in the live system.
 
-> **Memory note:** 259,200 candles × 100 rows per book (50 bids + 50 asks) = 25,920,000
-> order book rows in total — but they are **never all in memory at once**.  The loop
+> **Memory note:** 77,760 IS candles × 100 rows per book (50 bids + 50 asks) = 7,776,000
+> order book rows — but they are **never all in memory at once**.  The loop
 > constructs one 100-row DataFrame, runs the pipeline on it, records the signal,
 > then discards it before moving to the next candle.  Peak memory at any moment is
-> one synthetic book (100 rows) plus the 259,200-row klines DataFrame — well under
+> one synthetic book (100 rows) plus the ~77,760-row klines DataFrame — well under
 > 200 MB and entirely manageable.
 
 There are **three independent data flows** running in parallel at every candle
@@ -707,11 +709,12 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 
 | Attribute | Value |
 |---|---|
-| Window | `SENSITIVITY_LOOKBACK = "90 days ago UTC"` (~129,600 rows at 1 m) |
-| Rationale | The live HMM refits every 5 min on the latest 2 h of data. Tuning on 90 days of **recent** data gives a broader regime sample while still being 2× faster than the full 180-day backtest window. |
-| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (8 h at 1 m) — ~90 refits per run vs ~360 at the default, giving a ~4× speedup while preserving relative rankings. |
+| IS window | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m) |
+| OOS window | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py` |
+| Rationale | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`. |
+| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (40 h at 5 m) — ~72 refits over the IS window vs ~288 at the default, giving a ~4× speedup while preserving relative rankings. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `runner.py` always predicts every candle. |
-| Runtime (Bayes, 40 trials) | ~5–8 h on a laptop (~8–12 min/trial; klines pre-fetched once, shared across all trials) |
+| Runtime (Bayes, 40 trials) | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials) |
 | Runtime (OAT, 8 runs) | ~1–2 h on a laptop |
 | Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `runner.py`) |
 | Run (Bayes, default) | `python -m backtest.sensitivity` or `python -m backtest.sensitivity --bayes` |
@@ -721,7 +724,7 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 
 | Attribute | Value |
 |---|---|
-| Window | Must match the main backtest (`"180 days ago UTC"`, ~259,200 rows) to avoid window-mismatch bias. A shorter window here would optimise for conditions not representative of the 180-day evaluation horizon. |
+| Window | Must match the OOS validation window used by `runner.py` (`BACKTEST_OOS_START → today`) to avoid window-mismatch bias. |
 | Runtime (OAT, 6 runs) | ~4–12 hours on a laptop — impractical without dedicated compute |
 | Status | Revisit if compute resources allow |
 
@@ -752,7 +755,7 @@ range is the **default** used by the baseline run.
 Uses the **Tree-structured Parzen Estimator (TPE)** sampler to intelligently
 navigate the parameter space rather than exhaustively enumerating it.
 
-- **40 trials** by default (~5–8 h, ~8–12 min/trial, 90-day window).
+- **40 trials** by default (~3–6 h on a laptop, ~5–8 min/trial on the 270-day IS window at 5 m).
 - Data pre-fetched **once** before the study begins and shared across all trials
   via a `_make_objective(prefetched_df)` factory closure — no redundant API calls.
 - The study is persisted to `backtest/results/optuna.db` (SQLite) with
@@ -764,9 +767,9 @@ navigate the parameter space rather than exhaustively enumerating it.
   - `optuna_contour_<ts>.html` — 2-D Sharpe surface for `hmm_lookback_rows × vwap_window` (the two highest-importance parameters per fANOVA).
 
 ```bash
-python -m backtest.sensitivity                         # 40 trials (default)
+python -m backtest.sensitivity                         # 40 trials (default, IS window)
 python -m backtest.sensitivity --bayes --n-trials 50  # custom trial count
-python -m backtest.sensitivity --lookback "180 days ago UTC"  # deep calibration
+python -m backtest.sensitivity --lookback "720 days ago UTC"  # longer IS start
 ```
 
 **Bayesian search space (`_OPTUNA_SPACE`):**
@@ -805,12 +808,13 @@ python -m backtest.sensitivity --full-grid   # ⚠️ deprecated — use --bayes
 
 #### `--lookback` override
 
-Any execution mode accepts `--lookback` to override `SENSITIVITY_LOOKBACK` for
-a single run without editing `config_parameters.py`:
+Any execution mode accepts `--lookback` to override the IS start (`BACKTEST_LOOKBACK`)
+for a single run without editing `config_parameters.py`.  The IS end is always
+`BACKTEST_OOS_START` — it cannot be overridden via CLI to preserve the OOS boundary:
 
 ```bash
-python -m backtest.sensitivity --lookback "180 days ago UTC"   # deep calibration
-python -m backtest.sensitivity --oat --lookback "30 days ago UTC"  # fast smoke-test
+python -m backtest.sensitivity --lookback "720 days ago UTC"   # longer IS window
+python -m backtest.sensitivity --oat --lookback "180 days ago UTC"  # shorter IS smoke-test
 ```
 
 #### Guard — existing `best_params.json`
@@ -849,11 +853,11 @@ _, _, stats = simulate_pnl(signals, fee_rate=params["fee_rate"])
 > result is informational only since Binance charges its fixed taker fee regardless.
 > The sensitivity optimizer's choice of fee rate is diagnostic, not prescriptive.
 
-**Combined speedup per OAT run (90-day window vs naïve 180-day run):**
+**Combined speedup per OAT run (270-day IS window at 5 m vs naïve full-fetch run):**
 
 | Optimisation | Constant | Factor |
 |---|---|---|
-| Shorter fetch window | `SENSITIVITY_LOOKBACK = "90 days ago UTC"` | ~2× fewer rows |
+| IS/OOS split | `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START` (270-day IS, 5 m) | defines the window |
 | Less frequent HMM refit | `SENSITIVITY_REFIT_EVERY = 480` | ~4× fewer full BIC fits |
 | Less frequent Viterbi | `SENSITIVITY_PREDICT_EVERY = 5` | ~5× fewer predict calls |
 | `itertuples()` in P&L loop | — (code change in `pnl.py`) | ~5× faster P&L walk |
@@ -1003,9 +1007,14 @@ left at the `config_parameters.py` default.
 Progress tracker for the modules described above.  Each step maps to a
 concrete file in `backtest/`.
 
-- ✅ **Step 1 — `backtest/data.py`** — Downloads 180 days of 1 m BTCUSDT
-  klines via `binance.client.Client.get_historical_klines()` and returns a
-  clean `pandas.DataFrame` (~259,200 rows).  *(Implemented.)*
+- ✅ **Step 1 — `backtest/data.py`** — Downloads klines from Binance via
+  `binance.client.Client.get_historical_klines()` at **5-minute resolution**
+  (`BACKTEST_INTERVAL = "5m"`).  `fetch_klines(start_str, end_str)` enforces
+  the IS/OOS boundary: `sensitivity.py` passes `end_str=BACKTEST_OOS_START`
+  so it never fetches OOS data; `runner.py` passes
+  `start_str=BACKTEST_OOS_START` to fetch only the OOS window.
+  Returns a clean `pandas.DataFrame` (~77,760 IS rows, ~25,920 OOS rows).
+  *(Implemented.)*
 - ✅ **Step 2 — `backtest/synthetic_book.py`** — Given a single kline row
   (`pd.Series`), constructs a 50-level synthetic order book with exponential
   volume decay and OBI asymmetry injection.  Returns a
@@ -1031,9 +1040,13 @@ concrete file in `backtest/`.
   ``n_position_guard_skips`` in the stats dict and reported in the console
   summary.  Round-trip pairing uses an exhaustive FIFO ``collections.deque``
   supporting scaling-in, layering, and pyramiding.  Orphan SELLs emit a
-  visible WARNING box.  *(Implemented.)*
+  visible WARNING box.  **Fee fix** — ``_pair_round_trips(fee_rate=...)``
+  now explicitly deducts both taker fees from per-trade P&L stats:
+  ``pnl_usdt = gross_pnl − entry_fee − exit_fee``.  *(Implemented.)*
 - ✅ **Step 5 — `backtest/runner.py` + `backtest/reporting/formatters.py`** —
-  Top-level script that chains all four modules.  Report formatting
+  Top-level script that chains all four modules.  Fetches the **OOS window**
+  (`BACKTEST_OOS_START = "90 days ago UTC"` → today, ~25,920 rows at 5 m)
+  via `run_signals(lookback=BACKTEST_OOS_START)`.  Report formatting
   (`print_report`) and CSV export (`save_csv`) are isolated in
   `backtest/reporting/formatters.py` (AI-authored; all symbols public).
   Prints a formatted console report: SESSION info, SIGNALS breakdown
@@ -1114,9 +1127,12 @@ concrete file in `backtest/`.
 - ✅ **Step 8 — `backtest/sensitivity.py`** — Sensitivity analysis with three
   execution modes: **Bayesian optimisation via Optuna TPE (default)**, OAT sweep
   (`--oat`), and deprecated full-grid (`--full-grid`).  Tunes
-  `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, and `VWAP_WINDOW` over a continuous
-  search space (`_OPTUNA_SPACE`).  `fee_rate` is fixed at `0.001` (not a
-  strategy knob).
+  `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER`
+  over the **IS window** (`BACKTEST_LOOKBACK → BACKTEST_OOS_START`, 270 days, ~77,760
+  rows at 5 m).  `SENSITIVITY_LOOKBACK` **removed** — IS window is now defined by
+  `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START`.  `end_str=BACKTEST_OOS_START` is passed
+  to `fetch_klines()` to enforce the IS boundary.  `fee_rate` is fixed at `0.001`
+  (not a strategy knob).
 
   **Bayesian mode** (`python -m backtest.sensitivity`):
   - Optuna TPE sampler, 40 trials by default (`--n-trials N` to change).
@@ -1132,8 +1148,8 @@ concrete file in `backtest/`.
     suggestion to run `--bayes`.
 
   **Common features (all modes):**
-  - `--lookback` flag overrides `SENSITIVITY_LOOKBACK` for one run without
-    editing `config_parameters.py`.
+  - `--lookback` flag overrides `BACKTEST_LOOKBACK` (IS start) for one run without
+    editing `config_parameters.py`.  IS end always = `BACKTEST_OOS_START`.
   - `_check_existing_best_params()` guard: shows age, Sharpe and params of any
     existing `best_params.json`; requires `[y/N]` confirmation before proceeding.
   - Sensitivity CSVs (`sensitivity_<mode>_<ts>.csv`) written to **`backtest/reporting/`**;
@@ -1154,10 +1170,11 @@ concrete file in `backtest/`.
   > after `load_best_params()` has already patched that namespace.
   > Full explanation in `strategy/param_loader.py` docstring.
 
-  **Use Case B (180-day backtest validation) deferred** — runtime ~4–12 h for
-  OAT alone on a laptop.  *(Use Case A implemented; Use Case B deferred.)*
+  **Use Case B (OOS robustness validation) deferred** — running sensitivity on the OOS window
+  (~4–12 h for OAT alone on a laptop) is impractical without dedicated compute.
+  *(Use Case A on the 270-day IS window implemented; Use Case B deferred.)*
 
 ---
 
-*Document last updated: 2026-05-15*
+*Document last updated: 2026-05-17*
 
