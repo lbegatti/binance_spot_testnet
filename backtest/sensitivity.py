@@ -61,9 +61,10 @@ Notes
 -----
 - config_parameters.py and the live system are NEVER modified by this script.
   All overrides are passed as keyword arguments to run_signals() / simulate_pnl().
-- SENSITIVITY_REFIT_EVERY (480 iterations = 8 h at 1 m) is used instead of
-  REFIT_EVERY (120) to cut per-run cost from ~360 to ~90 refits (~4× speedup)
-  while preserving the relative ranking of parameter combinations.
+- SENSITIVITY_REFIT_EVERY (480 iterations = 40 h at 5 m) equals REFIT_EVERY so the IS
+  optimisation and OOS validation (runner.py) share the same HMM refit cadence — ~162
+  refits over the 270-day IS window, ~54 over the 90-day OOS window.  IS↔OOS Sharpe
+  figures are therefore directly comparable.
 - Do NOT commit best_params.json to git — it is sample-specific.
 """
 
@@ -74,21 +75,23 @@ import itertools
 import json
 import logging
 import pathlib
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
 import optuna
 import pandas as pd
 
-from backtest.data import fetch_klines
+from backtest.data import fetch_macro_klines, fetch_micro_klines, flush_kline_cache
 from backtest.pnl import compute_buy_and_hold, simulate_pnl
 from backtest.reporting.formatters import (
     print_bnh_comparison,
     print_oat_sensitivity_report,
     print_sensitivity_table,
 )
-from backtest.signals import _add_hmm_features, run_signals
+from backtest.signals import run_signals
 from config_parameters import (
+    BACKTEST_INITIAL_BTC,
     BACKTEST_LOOKBACK,
     BACKTEST_OOS_START,
     SENSITIVITY_REFIT_EVERY,
@@ -286,9 +289,10 @@ def _build_full_grid() -> list[dict[str, Any]]:
     ]
 
 
-def _make_objective(prefetched_df: pd.DataFrame):
+def _make_objective(prefetched_macro: pd.DataFrame, prefetched_micro: pd.DataFrame):
     """
-    Factory that closes over ``prefetched_df`` and returns the Optuna objective.
+    Factory that closes over ``prefetched_macro`` and ``prefetched_micro`` and
+    returns the Optuna objective.
 
     The inner ``objective`` function is called once per trial by
     ``study.optimize()``.  It builds the parameter dict from Optuna's
@@ -297,9 +301,9 @@ def _make_objective(prefetched_df: pd.DataFrame):
 
     Parameters tuned by Optuna
     --------------------------
-    ``hmm_lookback_rows`` — rolling HMM warm-up window (rows).
+    ``hmm_lookback_rows`` — rolling HMM warm-up window (5-minute bars).
     ``hmm_max_regimes``   — upper bound on hidden states in BIC search.
-    ``vwap_window``       — rolling VWAP window (rows / candles).
+    ``vwap_window``       — rolling VWAP window (1-minute bars).
     ``vwap_threshold``    — dead-zone half-width around VWAP (fraction; e.g. 0.003 = 0.30 %).
                             Controls how selective the BUY/SELL gate is.  Higher values →
                             fewer but higher-quality signals → less fee drag in trending markets.
@@ -329,7 +333,7 @@ def _make_objective(prefetched_df: pd.DataFrame):
         # fee_rate is fixed; vwap_threshold is now tuned by Optuna (in params above).
         log.info("Trial %d starting: %s", trial.number, params)
         try:
-            result = _run_one(params, prefetched_df)
+            result = _run_one(params, prefetched_macro, prefetched_micro)
         except Exception:
             log.warning(
                 "Trial %d failed (params=%s) — returning -inf so Optuna skips "
@@ -346,15 +350,16 @@ def _make_objective(prefetched_df: pd.DataFrame):
     return objective
 
 
-def _compute_bnh(prefetched_df: pd.DataFrame) -> dict[str, Any]:
+def _compute_bnh(df_micro: pd.DataFrame) -> dict[str, Any]:
     """
     Compute the buy-and-hold benchmark exactly once for a fixed price window.
 
     Parameters
     ----------
-    prefetched_df : pd.DataFrame
-        Feature-enriched klines DataFrame (output of ``_add_hmm_features``).
-        The ``close`` column is used for entry/exit prices.
+    df_micro : pd.DataFrame
+        Raw 1-minute klines DataFrame (execution frame).  The ``close``
+        column is used for entry/exit prices.  Passed to
+        ``compute_buy_and_hold()`` which only requires ``close``.
 
     Returns
     -------
@@ -362,7 +367,9 @@ def _compute_bnh(prefetched_df: pd.DataFrame) -> dict[str, Any]:
         Keys: ``bnh_entry_price``, ``bnh_exit_price``, ``bnh_btc_held``,
         ``bnh_final_equity_usdt``, ``bnh_total_return_pct``.
     """
-    bnh = compute_buy_and_hold(prefetched_df)
+    # Pass the same initial_btc as simulate_pnl so BnH and strategy share
+    # the same initial-portfolio denominator — makes the % figures comparable.
+    bnh = compute_buy_and_hold(df_micro, initial_btc=BACKTEST_INITIAL_BTC)
     log.info(
         "Buy-and-hold benchmark: entry=%.2f  exit=%.2f  return=%.2f%%",
         bnh["bnh_entry_price"],
@@ -501,25 +508,30 @@ def _run_sensitivity_optuna_study(
 
     # ── Pre-fetch data ONCE — shared across all n_trials calls to _run_one ──
     log.info(
-        "Pre-fetching IS klines for %d trials (window: '%s' → '%s')…",
+        "Pre-fetching IS macro (5 m) + micro (1 m) klines for %d trials "
+        "(window: '%s' → '%s')…",
         n_trials,
         effective_lookback,
         BACKTEST_OOS_START,
     )
-    _klines = fetch_klines(start_str=effective_lookback, end_str=BACKTEST_OOS_START)
-    prefetched_df = _add_hmm_features(_klines)
+    df_macro = fetch_macro_klines(
+        lookback=effective_lookback, end_str=BACKTEST_OOS_START
+    )
+    df_micro = fetch_micro_klines(
+        lookback=effective_lookback, end_str=BACKTEST_OOS_START
+    )
     log.info(
-        "IS data ready: %d klines → %d rows after HMM features (window: '%s' → '%s'). "
-        "Shared across all %d trials — no further API calls.",
-        len(_klines),
-        len(prefetched_df),
+        "IS data ready: macro=%d 5-min bars, micro=%d 1-min bars "
+        "(window: '%s' → '%s'). Shared across all %d trials — no further API calls.",
+        len(df_macro),
+        len(df_micro),
         effective_lookback,
         BACKTEST_OOS_START,
         n_trials,
     )
 
     # ── Buy-and-hold benchmark — computed ONCE (price window is fixed) ────
-    bnh = _compute_bnh(prefetched_df)
+    bnh = _compute_bnh(df_micro)
 
     # ── Create / resume study ─────────────────────────────────────────────
     # The study name encodes the data window's START date so that every unique
@@ -542,10 +554,10 @@ def _run_sensitivity_optuna_study(
 
     _m = _re.match(r"(\d+)\s+days?\s+ago", effective_lookback, _re.IGNORECASE)
     if _m:
-        window_start_dt = pd.Timestamp.utcnow() - pd.Timedelta(days=int(_m.group(1)))
+        window_start_dt = pd.Timestamp.now("UTC") - pd.Timedelta(days=int(_m.group(1)))
     else:
         # Fallback: use today as tag (study is still isolated per calendar day)
-        window_start_dt = pd.Timestamp.utcnow()
+        window_start_dt = pd.Timestamp.now("UTC")
     window_tag = window_start_dt.strftime("%Y%m%d")
     study_name = f"btcusdt_sensitivity_{window_tag}"
 
@@ -573,7 +585,7 @@ def _run_sensitivity_optuna_study(
         log.info("Fresh study '%s' — no prior trials for this window.", study_name)
 
     study.optimize(
-        _make_objective(prefetched_df=prefetched_df),
+        _make_objective(prefetched_macro=df_macro, prefetched_micro=df_micro),
         n_trials=n_trials,
         show_progress_bar=True,
     )
@@ -636,7 +648,7 @@ def _run_sensitivity_optuna_study(
             "Re-running best trial params to compute full stats for B&H comparison…"
         )
         try:
-            best_full = _run_one(study.best_params, prefetched_df)
+            best_full = _run_one(study.best_params, df_macro, df_micro)
             best_series = pd.Series({**best_full, **bnh})
             # Save using the CURRENT-data stats so source_value is honest.
             _save_best_params(best_series)
@@ -658,7 +670,11 @@ def _run_sensitivity_optuna_study(
 # ---------------------------------------------------------------------------
 
 
-def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, Any]:
+def _run_one(
+    params: dict[str, Any],
+    prefetched_macro: pd.DataFrame,
+    prefetched_micro: pd.DataFrame,
+) -> dict[str, Any]:
     """
     Execute one full backtest with the given parameter overrides.
 
@@ -669,10 +685,13 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
         May optionally contain ``vwap_threshold`` (Bayes trials supply it;
         OAT / full-grid runs do not — defaults to ``VWAP_THRESHOLD_MULTIPLIER``).
         ``fee_rate`` is always fixed at ``SENSITIVITY_FEE_RATE`` regardless.
-    prefetched_df : pd.DataFrame
-        Feature-enriched klines DataFrame fetched once before the grid loop.
-        Passed directly to ``run_signals()`` via ``prefetched_df=`` to avoid
+    prefetched_macro : pd.DataFrame
+        Raw 5-minute OHLCV klines pre-fetched once before the grid loop.
+        Passed to ``run_signals()`` via ``prefetched_macro=`` to avoid
         one Binance API call per combination.
+    prefetched_micro : pd.DataFrame
+        Raw 1-minute OHLCV klines pre-fetched once before the grid loop.
+        Passed to ``run_signals()`` via ``prefetched_micro=``.
 
     Returns
     -------
@@ -690,10 +709,9 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
         _fee * 100,
     )
 
-    # run_signals() uses SENSITIVITY_REFIT_EVERY (480) for a ~4× speedup.
-    # This cuts refits from ~360 to ~90 per 30-day run without changing
-    # the relative ranking of parameter combinations.
-    # prefetched_df is passed directly — no redundant fetch_klines() call.
+    # run_signals() uses SENSITIVITY_REFIT_EVERY for a speedup: fewer full BIC
+    # refits on the 5-minute macro walk-forward without changing relative rankings.
+    # prefetched_macro / prefetched_micro are passed directly — no API calls.
     signals = run_signals(
         hmm_lookback_rows=params["hmm_lookback_rows"],
         hmm_max_regimes=params["hmm_max_regimes"],
@@ -701,7 +719,8 @@ def _run_one(params: dict[str, Any], prefetched_df: pd.DataFrame) -> dict[str, A
         vwap_threshold=_threshold,
         refit_every=SENSITIVITY_REFIT_EVERY,
         predict_every=SENSITIVITY_PREDICT_EVERY,
-        prefetched_df=prefetched_df,
+        prefetched_macro=prefetched_macro,
+        prefetched_micro=prefetched_micro,
     )
 
     _, _, stats = simulate_pnl(signals, fee_rate=_fee)
@@ -854,29 +873,36 @@ def run_sensitivity(
     )
 
     log.info(
-        "Pre-fetching IS klines for all %d runs (window: '%s' → '%s')…",
+        "Pre-fetching IS macro (5 m) + micro (1 m) klines for all %d runs "
+        "(window: '%s' → '%s')…",
         len(grid),
         effective_lookback,
         BACKTEST_OOS_START,
     )
-    _klines = fetch_klines(start_str=effective_lookback, end_str=BACKTEST_OOS_START)
-    prefetched_df = _add_hmm_features(_klines)
+    df_macro = fetch_macro_klines(
+        lookback=effective_lookback, end_str=BACKTEST_OOS_START
+    )
+    df_micro = fetch_micro_klines(
+        lookback=effective_lookback, end_str=BACKTEST_OOS_START
+    )
     log.info(
-        "IS data ready: %d klines → %d rows after HMM features. "
+        "IS data ready: macro=%d 5-min bars, micro=%d 1-min bars. "
         "Shared across all %d runs — no further API calls.",
-        len(_klines),
-        len(prefetched_df),
+        len(df_macro),
+        len(df_micro),
         len(grid),
     )
 
     # ── Buy-and-hold benchmark — computed ONCE (price window is fixed) ────
-    bnh = _compute_bnh(prefetched_df)
+    bnh = _compute_bnh(df_micro)
 
     all_results: list[dict[str, Any]] = []
     for i, params in enumerate(grid, 1):
         log.info("── Run %d / %d ──", i, len(grid))
         try:
-            result = _run_one(params, prefetched_df=prefetched_df)
+            result = _run_one(
+                params, prefetched_macro=df_macro, prefetched_micro=df_micro
+            )
             all_results.append(result)
         except Exception:
             # Broad catch is intentional: lets the sweep continue even if one
@@ -1017,7 +1043,22 @@ if __name__ == "__main__":
             f"Default: BACKTEST_LOOKBACK from config_parameters.py ('{BACKTEST_LOOKBACK}')."
         ),
     )
+    parser.add_argument(
+        "--flush-cache",
+        action="store_true",
+        help=(
+            "Delete all cached kline Parquet files under cache/klines/ and exit. "
+            "Use this whenever BACKTEST_LOOKBACK or BACKTEST_OOS_START change "
+            "to force a fresh download on the next run."
+        ),
+    )
     args = parser.parse_args()
+
+    # --flush-cache: clear Parquet cache and exit immediately (no backtest run).
+    if args.flush_cache:
+        flush_kline_cache()
+        print("Cache flushed. Run sensitivity.py again to fetch fresh klines.")
+        sys.exit(0)
 
     if args.oat:
         run_sensitivity(full_grid=False, lookback=args.lookback)

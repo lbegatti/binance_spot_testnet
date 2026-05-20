@@ -14,7 +14,7 @@ No magic numbers appear anywhere else in the strategy code.
 | Constant | Value | Purpose |
 |---|---|---|
 | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to `GaussianHMM` |
-| `HMM_INTERVAL` | `Client.KLINE_INTERVAL_5MINUTE` | Kline granularity (5 min — consistent with backtest; 12 bars/h) |
+| `HMM_INTERVAL` | `Client.KLINE_INTERVAL_5MINUTE` | Kline granularity (5 min — consistent with `BACKTEST_MACRO_INTERVAL`; 12 bars/h) |
 | `HMM_LOOKBACK` | `"10 hours ago UTC"` | Rolling window (~120 rows at 5 m); keeps enough data for stable EM convergence while tracking intra-day regime shifts |
 | `HMM_MAX_REGIMES` | `3` | Upper bound on hidden states evaluated during BIC search (2 … 3, = `len(HMM_FEATURE_COLS) − 1`) |
 | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
@@ -22,6 +22,7 @@ No magic numbers appear anywhere else in the strategy code.
 | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices (1e-1 recommended safe default for z-scored financial features) |
 | `HMM_N_INIT` | `10` | Random-seed restarts per candidate `n_components`; reduces degenerate EM solutions on flat windows |
 | `HMM_REFIT_INTERVAL` | `300` | Full re-fit cadence (s).  Between re-fits only Viterbi prediction runs |
+| `HMM_TRAIN_ROWS` | `80` | Legacy constant — **no longer used** to cap the train/test split inside `regime_director.py`.  The split is now computed adaptively as `train_end = max(2, int(n_rows × 2/3))` per window.  Retained in `config_parameters.py` for reference and diagnostic use |
 
 > **Why 10 hours and not 2?**  
 > Switching from 1-minute to 5-minute klines requires a proportionally longer
@@ -43,9 +44,10 @@ in the single-threaded startup block of `websocket_main.py`:
 from strategy.regime_director import RegimeDirector
 
 regime_director = RegimeDirector()             # 1. instantiate — no data yet
-regime_director.get_klines_data()              # 2. download ~120 rows, compute features
+regime_director.get_klines_data()              # 2. download ~120 rows of 5-min klines
+                                               #    (last 10 h, HMM_INTERVAL="5m", public endpoint)
 regime_director.select_hmm_model()             # 3. fit HMM n=2..4, pick best BIC
-regime_director.assign_regime_labels()        # 4. map state int → label string
+regime_director.assign_regime_labels()         # 4. map state int → label string
 # → regime_director.regime_label == e.g. "trending_up"
 
 engine = AnalysisEngine(
@@ -93,29 +95,45 @@ Two background threads then interact with it in opposite roles:
 
 ### Thread A — `historical_analysis()` every 60 s → **writer**
 
-After computing VWAPs from the live order book, this thread re-fits the model
-on the latest 4 hours of klines.  The expensive work runs **outside** the lock;
-only the instant label assignment is locked:
+After computing VWAPs from the live order book, this thread updates the HMM
+regime **only when a new 5-minute clock boundary has elapsed** (i.e. the
+current Unix timestamp crossed a multiple of 300 s since the last update).
+The expensive work runs **outside** the lock; only the instant label assignment
+is locked:
 
 ```python
-# OUTSIDE _regime_lock — slow: network download + CPU model fit/predict
-self.regime_director.get_klines_data()         # re-fetch latest 10 h of 5-min klines
+import time
 
-# Two-speed update: full re-fit every HMM_REFIT_INTERVAL (300 s),
-# cheap Viterbi prediction on all other iterations.
-if iteration % refit_every == 0:
-    self.regime_director.select_hmm_model()    # full re-fit — slow
-else:
-    self.regime_director.predict_current_regime()  # Viterbi only — fast
+# VWAP update — runs every HIST_INTERVAL (60 s), unchanged
+...
 
-# INSIDE _regime_lock — fast: dict lookup + string assignment only
-with self._regime_lock:
-    self.regime_director.assign_regime_labels()   # write regime_label
+# HMM update — gated on 5-minute clock boundary (aligns to backtest merge_asof cadence)
+now = int(time.time())
+current_5m_boundary = now - (now % 300)          # round down to nearest 5-min mark
+
+if current_5m_boundary > _last_hmm_boundary:     # a new 5-min bar has closed
+    _last_hmm_boundary = current_5m_boundary
+    hmm_iteration += 1
+
+    # OUTSIDE _regime_lock — slow: network download + CPU model fit/predict
+    self.regime_director.get_klines_data()       # re-fetch latest 10 h of 5-min klines
+
+    # Two-speed update: full re-fit every hmm_refit_every boundaries (default 1 = every 5 min),
+    # cheap Viterbi prediction on all other boundaries.
+    if hmm_iteration % hmm_refit_every == 0:
+        self.regime_director.select_hmm_model()          # full re-fit — slow
+    else:
+        self.regime_director.predict_current_regime()    # Viterbi only — fast
+
+    # INSIDE _regime_lock — fast: dict lookup + string assignment only
+    with self._regime_lock:
+        self.regime_director.assign_regime_labels()      # write regime_label
 ```
 
 This split means `low_latency_analysis` is **never blocked** waiting for a
 model fit to finish — it only waits for the lock during the microsecond string
-write.
+write.  The clock-boundary gate ensures the backtest and live system fire the
+HMM pulse at exactly the same 5-minute cadence.
 
 ---
 
@@ -195,17 +213,17 @@ historical_analysis()                       low_latency_analysis()
   ① compute bid_vwap / ask_vwap               ① balance guard
     (from live order book deque)               ② copy order book under lock
   ② write VWAPs under _vwap_lock              ③ build levels, score candidates
-  ③ get_klines_data()    ← outside lock       ④ read regime_label
-     if iter % 5 == 0:                              under _regime_lock
-                                               ⑤ REGIME FILTER
-                                                     BUY  blocked if "trending_down"
-                                                          or "high_volatility"
-                                                     SELL blocked if "trending_up"
-                                                          or "high_volatility"
-                                               ⑥ VWAP FILTER (mean-reversion + dead zone)
-                                                     BUY  blocked if micro ≥ bid_vwap × (1−δ)
-                                                     SELL blocked if micro < ask_vwap × (1+δ)
-                                               ⑦ POSITION GUARD (single-open-position MR)
+  ③ 5-min clock-boundary check:              ④ read regime_label
+       now = int(time.time())                      under _regime_lock
+       boundary = now - (now % 300)           ⑤ REGIME FILTER
+       if boundary > _last_hmm_boundary:            BUY  blocked if "trending_down"
+         get_klines_data()  ← outside lock               or "high_volatility"
+         if hmm_iter%refit_every==0:               SELL blocked if "trending_up"
+           select_hmm_model()    ← slow                   or "high_volatility"
+         else:                                 ⑥ VWAP FILTER (mean-reversion + dead zone)
+           predict_current_regime() ← fast          BUY  blocked if micro ≥ bid_vwap × (1−δ)
+         assign_regime_labels()                     SELL blocked if micro < ask_vwap × (1+δ)
+           under _regime_lock                  ⑦ POSITION GUARD (single-open-position MR)
                                                      BUY  blocked if _position_open == True
                                                           → _position_guard_skips++
                                                      SELL resets _position_open = False
@@ -231,9 +249,9 @@ historical_analysis()                       low_latency_analysis()
 
 | Operation | Lock held | Duration |
 |---|---|---|
-| `get_klines_data()` | none | ~1–2 s (network I/O) |
-| `select_hmm_model()` | none | ~2–5 s (CPU — EM iterations) — every 5 min |
-| `predict_current_regime()` | none | < 50 ms (single Viterbi pass) — every 60 s |
+| `get_klines_data()` | none | ~1–2 s (network I/O) — fires on each 5-min clock boundary |
+| `select_hmm_model()` | none | ~2–5 s (CPU — EM iterations) — every 5 min (default `hmm_refit_every = 1`) |
+| `predict_current_regime()` | none | < 50 ms (single Viterbi pass) — between full refits |
 | `assign_regime_labels()` | `_regime_lock` | < 1 ms (dict lookup + string write) |
 | Read `regime_label` in `low_latency_analysis` | `_regime_lock` | < 1 ms |
 

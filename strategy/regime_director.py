@@ -11,7 +11,6 @@ from config_parameters import (
     HMM_INTERVAL,
     HMM_LOOKBACK,
     HMM_MIN_COVAR,
-    HMM_TRAIN_ROWS,
     HMM_N_INIT,
     SYMBOL,
 )
@@ -21,7 +20,18 @@ import logging
 class RegimeDirector:
     """
     Detects the current market regime by training a Gaussian Hidden Markov
-    Model (``GaussianHMM``) on recent Binance kline data.
+    Model (``GaussianHMM``) on recent **5-minute** Binance kline data.
+
+    **Resolution**: ``HMM_INTERVAL = Client.KLINE_INTERVAL_5MINUTE`` (5 m).
+    ``HMM_LOOKBACK = "10 hours ago UTC"`` → 120 bars per fetch.
+    5-minute bars are intentionally coarser than the 1-minute execution bars
+    used by the backtest PnL loop:
+
+    * Fewer rows → faster EM convergence (EM sees 5× fewer data points).
+    * Regime shifts occur over hours, not seconds — 5-minute granularity
+      captures the structural signal while ignoring microstructure noise.
+    * The live system mirrors this via ``HMM_INTERVAL`` and the backtest
+      mirrors it via ``BACKTEST_MACRO_INTERVAL`` (both set to ``"5m"``).
 
     The model is fitted on four features derived from OHLCV candles:
 
@@ -41,11 +51,12 @@ class RegimeDirector:
     with the lowest BIC is retained.
 
     A **train / predict split** is applied in ``select_hmm_model()``: the model
-    is fitted only on the first ``HMM_TRAIN_ROWS`` rows of the downloaded
-    window (older, in-sample data).  Regime inference (Viterbi) and posterior
-    confidence then run on ``features[HMM_TRAIN_ROWS:]`` only — the most-recent
-    rows the model has **never seen** during training — so ``current_regime``
-    and ``regime_confidence`` always reflect a genuinely out-of-sample candle.
+    is fitted only on the first **2/3** of the window rows (older, in-sample data).
+    Regime inference (Viterbi) and posterior confidence then run on the remaining
+    **1/3** only — the most-recent rows the model has **never seen** during
+    training — so ``current_regime`` and ``regime_confidence`` always reflect a
+    genuinely out-of-sample candle.  At the default ``HMM_LOOKBACK`` of 10 h
+    (≈ 120 rows at 5 m) this yields 80 train / 40 test rows.
 
     State labels are assigned in ``assign_regime_labels()`` using a rank-based
     directional assignment and volatility thresholds.  Possible labels:
@@ -71,8 +82,10 @@ class RegimeDirector:
 
     Attributes:
         symbol (str): Trading pair (default ``"BTCUSDT"``).
-        interval (str): Kline interval for data download (``HMM_INTERVAL``).
-        lookback (str): How far back to fetch klines (``HMM_LOOKBACK``).
+        interval (str): Kline interval for data download — ``"5m"``
+            (``HMM_INTERVAL = Client.KLINE_INTERVAL_5MINUTE``).
+        lookback (str): How far back to fetch klines — ``"10 hours ago UTC"``
+            (``HMM_LOOKBACK``; yields ~120 bars at 5 m).
         max_states (int): Maximum number of HMM states to evaluate (``HMM_MAX_REGIMES``).
         random_state (int): Random seed for reproducible HMM initialisation.
         n_iterations (int): Maximum EM iterations per model fit.
@@ -82,7 +95,7 @@ class RegimeDirector:
         klines_df (pd.DataFrame | None): Feature DataFrame; ``None`` until
             ``get_klines_data()`` is called.
         regimes (np.ndarray | None): Predicted state sequence for the **test
-            rows only** (``klines_df[HMM_TRAIN_ROWS:]``); ``None`` until
+            rows only** (the most-recent ~1/3 of the window); ``None`` until
             ``select_hmm_model()`` is called.
         current_regime (int | None): State index of the most recent candle.
         regime_label (str | None): Human-readable label for ``current_regime``;
@@ -111,8 +124,10 @@ class RegimeDirector:
         """
         Args:
             symbol (str): Binance trading pair to fetch klines for.
-            interval (str): Kline granularity (e.g. ``Client.KLINE_INTERVAL_1MINUTE``).
-                Pulled from ``HMM_INTERVAL`` in ``config_parameters.py``.
+            interval (str): Kline granularity — always ``Client.KLINE_INTERVAL_5MINUTE``
+                (``"5m"``) for the live system.  Pulled from ``HMM_INTERVAL`` in
+                ``config_parameters.py``.  The backtest uses ``BACKTEST_MACRO_INTERVAL``
+                (also ``"5m"``) and never passes this argument directly.
             lookback (str | None): How far back to download data
                 (e.g. ``"2 hours ago UTC"``).  Defaults to ``None``, in which
                 case the module-level ``HMM_LOOKBACK`` is read **at call time**
@@ -140,9 +155,13 @@ class RegimeDirector:
         self.max_states = max_regimes if max_regimes is not None else HMM_MAX_REGIMES
         self.random_state = random_state
         self.n_iterations = n_iterations
-        self.client = Client()
+        # Lazy — created only when get_klines_data() is called.
+        # This avoids an unnecessary Binance REST connection during backtest /
+        # sensitivity runs where klines_df is injected directly.
+        self._client: Client | None = None
 
         self.model: GaussianHMM | None = None
+
         self.klines_df: pd.DataFrame | None = None
         self.regimes: np.ndarray | None = None
         self.current_regime: int | None = None
@@ -153,7 +172,15 @@ class RegimeDirector:
 
     def get_klines_data(self):
         """
-        Download recent klines from Binance and compute the four HMM features.
+        Download recent **5-minute** klines from Binance and compute the four
+        HMM features.
+
+        Uses ``self.interval`` (= ``HMM_INTERVAL`` = ``"5m"``) and
+        ``self.lookback`` (= ``HMM_LOOKBACK`` = ``"10 hours ago UTC"``),
+        yielding ~120 bars per call.  5-minute resolution is intentional:
+        regime shifts are structural (hours-long), so coarser bars give the
+        EM algorithm a stable covariance estimate while reducing noise from
+        1-minute microstructure.
 
         Uses the public Binance REST endpoint (no API key required).  Fetches
         ``HMM_LOOKBACK`` worth of ``HMM_INTERVAL`` candles for ``self.symbol``
@@ -171,7 +198,9 @@ class RegimeDirector:
             Any exception raised by ``binance.client.Client.get_historical_klines``
             (e.g. network errors, rate-limit violations) propagates to the caller.
         """
-        raw_data = self.client.get_historical_klines(
+        if self._client is None:
+            self._client = Client()
+        raw_data = self._client.get_historical_klines(
             symbol=self.symbol,
             interval=self.interval,
             start_str=self.lookback,
@@ -213,16 +242,15 @@ class RegimeDirector:
         A **train / predict split** is applied to avoid overfitting the model
         to the most recent candles:
 
-        * **Training set** — the first ``HMM_TRAIN_ROWS`` rows of
-          ``klines_df`` (older, in-sample data).  All ``fit()`` and ``bic()``
-          calls use only this slice.  At the default ``HMM_LOOKBACK`` of 10 h
-          (≈ 120 rows at 5 m) and ``HMM_TRAIN_ROWS = 80``, roughly the oldest ⅔ of
-          the window is used for training.
-        * **Test set (prediction set)** — ``features[HMM_TRAIN_ROWS:]`` — the
-          most-recent ~40 rows that the model has **never seen** during
-          ``fit()``.  ``model.predict()`` and ``predict_proba()`` run on these
-          rows only, so ``self.current_regime`` and ``self.regime_confidence``
-          always reflect a candle that was genuinely out-of-sample.
+        * **Training set** — the first **2/3** of the rows in ``klines_df``
+          (older, in-sample data).  All ``fit()`` and ``bic()`` calls use only
+          this slice.  At the default ``HMM_LOOKBACK`` of 10 h (≈ 120 rows at
+          5 m) this is 80 rows; for smaller sensitivity-sweep windows the count
+          scales proportionally (e.g. 70 rows → 46 train, 60 rows → 40 train).
+        * **Test set (prediction set)** — the most-recent **~1/3** of rows —
+          candles the model has **never seen** during ``fit()``.  ``model.predict()``
+          and ``predict_proba()`` run on these rows only, so ``self.current_regime``
+          and ``self.regime_confidence`` always reflect a genuinely out-of-sample candle.
 
         **Feature scaling** via ``StandardScaler`` is applied before any
         model call:
@@ -274,20 +302,19 @@ class RegimeDirector:
 
         features = self.klines_df[HMM_FEATURE_COLS].values
 
-        # --- train / predict split ---
-        # Train only on the older in-sample rows; the most recent rows are
-        # intentionally held out so that self.current_regime reflects a regime
-        # that the model has never "seen" during fitting.
-        # --- adaptive train / test split ---
-        # Normally split at HMM_TRAIN_ROWS (80).  When the window is smaller
-        # than HMM_TRAIN_ROWS + 1 (e.g. sensitivity sweep uses
-        # hmm_lookback_rows=60 < 80), features[HMM_TRAIN_ROWS:] would be empty
-        # (shape (0, 4)) and StandardScaler raises ValueError.
-        # Guard: always leave at least 1 test row for prediction regardless
-        # of window size.  The ~2/3 train / 1/3 test ratio is preserved when
-        # the window is ≥ HMM_TRAIN_ROWS + 1 (the normal live-system case).
+        # --- adaptive 2/3 train / 1/3 test split ---
+        # train_end is always floor(n_rows × 2/3), clamped to at least 2 rows
+        # so the HMM has enough observations to fit a covariance matrix.
+        # This keeps a ~1/3 test set at every window size:
+        #   n_rows=120 → train_end=80  (= HMM_TRAIN_ROWS, live-system default)
+        #   n_rows=70  → train_end=46  → 24 test rows
+        #   n_rows=60  → train_end=40  → 20 test rows
+        #   n_rows=30  → train_end=20  → 10 test rows
+        # The old guard (min(HMM_TRAIN_ROWS, max(1, n_rows-1))) collapsed to
+        # 1 test row whenever n_rows < HMM_TRAIN_ROWS+1, making regime_confidence
+        # meaningless for small sensitivity-sweep windows.
         n_rows = len(features)
-        train_end = min(HMM_TRAIN_ROWS, max(1, n_rows - 1))
+        train_end = max(2, int(n_rows * 2 / 3))
         train_features = features[:train_end]
 
         # --- feature scaling ---
@@ -462,10 +489,9 @@ class RegimeDirector:
         features = self.klines_df[HMM_FEATURE_COLS].values
         # Reuse the scaler fitted during select_hmm_model() so the feature
         # distribution seen by the model is identical to training time.
-        # Use the same adaptive split as select_hmm_model() — always leave
-        # at least 1 test row regardless of window size.
+        # Same 2/3 train / 1/3 test split as select_hmm_model().
         n_rows = len(features)
-        train_end = min(HMM_TRAIN_ROWS, max(1, n_rows - 1))
+        train_end = max(2, int(n_rows * 2 / 3))
         test_features = features[train_end:]
         test_features_scaled = self.scaler.transform(test_features)
         self.regimes = self.model.predict(test_features_scaled)
@@ -476,7 +502,7 @@ class RegimeDirector:
         proba = self.model.predict_proba(test_features_scaled)
         self.regime_confidence = float(proba[-1, self.current_regime])
 
-        logging.info(
+        logging.debug(
             "RegimeDirector: predict (no refit) → current_regime=%d confidence=%.2f",
             self.current_regime,
             self.regime_confidence,
@@ -578,7 +604,7 @@ class RegimeDirector:
             else:
                 labels[state] = "neutral"
 
-            logging.info(
+            logging.debug(
                 "RegimeDirector: state=%d label='%s' | r=%.5f vol=%.5f obi=%.4f td=%.6f"
                 " | direction_score=%.2f",
                 state,
@@ -596,12 +622,12 @@ class RegimeDirector:
         self.state_labels: dict[int, str] = labels
 
         self.regime_label = labels[self.current_regime]
-        logging.info(
+        logging.debug(
             "RegimeDirector: current_regime state=%d → label='%s'",
             self.current_regime,
             self.regime_label,
         )
-        logging.info("RegimeDirector: state labels → %s", labels)
-        logging.info("RegimeDirector: current regime → '%s'", self.regime_label)
+        logging.debug("RegimeDirector: state labels → %s", labels)
+        logging.debug("RegimeDirector: current regime → '%s'", self.regime_label)
 
         return self.regime_label

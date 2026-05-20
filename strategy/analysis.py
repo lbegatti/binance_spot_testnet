@@ -1,5 +1,6 @@
 from core.order_book_state import OrderBookState
 import threading
+import time
 import logging
 import numpy as np
 
@@ -411,10 +412,9 @@ class AnalysisEngine:
 
         Runs every ``HIST_INTERVAL`` seconds (default 60 s / 1 min) until
         ``stop_event`` is set.  If fewer than ``MIN_SNAPSHOTS`` (100) snapshots
-        have accumulated the iteration is skipped and a warm-up log message is
-        emitted.
+        have accumulated the iteration is skipped.
 
-        **On each iteration:**
+        **On each iteration (every 60 s):**
 
         1. **VWAP computation** — copies ``state.history_order_book`` under
            ``thread_lock``, converts to numpy arrays, and computes:
@@ -427,50 +427,61 @@ class AnalysisEngine:
            Both VWAPs are published under ``_vwap_lock`` so that
            ``low_latency_analysis`` can read them safely on the next iteration.
 
-        2. **HMM regime update** — two-speed update to avoid re-training on
-           nearly identical data every minute:
+        2. **HMM regime update — clock-boundary pulse (every 5 min)**
 
-           * **Every ``HIST_INTERVAL`` (60 s)** — cheap path:
+           The HMM block fires **only when a new 5-minute candle has closed**,
+           detected by comparing the current UTC epoch floored to 300 s against
+           the last processed boundary (``_last_hmm_boundary``).
 
-              - ``regime_director.get_klines_data()`` — fetches the latest
-                ``HMM_LOOKBACK`` (10 h) of ``HMM_INTERVAL`` (5 m) klines.
-             - ``regime_director.predict_current_regime()`` — runs the Viterbi
-               algorithm on the already-fitted model (O(n × k)), extracts the
-               state of the last candle.  No re-training.
+           **Why clock-boundary instead of every 60 s?**
 
-           * **Every ``HMM_REFIT_INTERVAL`` (300 s, i.e. every 5th iteration)** — full path:
+           * ``get_klines_data()`` fetches ``HMM_INTERVAL = 5m`` candles.  A new
+             candle only closes every 300 s, so calling it on 4 out of every 5
+             HIST_INTERVAL wakeups downloads identical data and wastes a Binance
+             API call and O(n×k) Viterbi compute.
+           * Aligning to the 5-minute candle close guarantees the HMM always
+             sees a fresh, **complete** candle on every call — the last bar in
+             the response is never a partial candle.
+           * VWAP is unaffected and continues updating every 60 s.
 
-             - ``regime_director.get_klines_data()`` — same as above.
-             - ``regime_director.select_hmm_model()`` — fits all candidate
-               ``GaussianHMM`` models (2 … ``HMM_MAX_REGIMES``), selects best
-               by BIC, and replaces the stored model.
-               O(n × k × ``HMM_N_ITERATIONS``) per candidate — expensive.
+           **Two-speed refit within HMM pulses:**
 
-           Then, inside ``_regime_lock`` on **every** iteration:
+           * **Every HMM pulse (every 5 min)** — cheap path:
+             ``get_klines_data()`` → ``predict_current_regime()`` (Viterbi,
+             O(n×k)) → ``assign_regime_labels()``.
+           * **Every ``hmm_refit_every`` pulses** — full path:
+             ``get_klines_data()`` → ``select_hmm_model()`` (BIC search,
+             O(n×k×iters)) → ``assign_regime_labels()``.
+             ``hmm_refit_every = max(1, HMM_REFIT_INTERVAL // 300)``
+             (default 1 at ``HMM_REFIT_INTERVAL = 300 s`` → full re-fit on
+             every 5-minute boundary; increase ``HMM_REFIT_INTERVAL`` in
+             ``config_parameters.py`` to space re-fits further apart).
 
-           - ``regime_director.assign_regime_labels()`` — maps the current
-             state integer to a human-readable label using cross-state mean/std
-             thresholds on ``model.means_``.  Writes
-             ``regime_director.regime_label``.
+           The slow network + CPU work runs **outside** ``_regime_lock``; only
+           ``assign_regime_labels()`` is called inside the lock to minimise
+           contention with ``low_latency_analysis``.
 
-           The slow network + CPU work (kline download + model fitting) runs
-           **outside** ``_regime_lock``; only the fast label assignment is
-           performed inside the lock to minimise contention with
-           ``low_latency_analysis``.
-
-        Exits cleanly when ``stop_event`` is set, logging how many iterations
-        were completed.
+        Exits cleanly when ``stop_event`` is set, logging iteration and pulse
+        counts.
         """
         iteration = 0
-        refit_every = max(
-            1, HMM_REFIT_INTERVAL // HIST_INTERVAL
-        )  # constant for the session
+        hmm_iteration = 0
+        _last_hmm_boundary: int = 0  # epoch seconds of the last processed 5m candle
+
+        # Full BIC re-fit cadence among HMM pulses.
+        # HMM_REFIT_INTERVAL = 300 s; pulse fires every 300 s → hmm_refit_every = 1
+        # meaning every 5-minute boundary triggers a full re-fit.
+        # Increase HMM_REFIT_INTERVAL in config_parameters.py to space re-fits apart
+        # (e.g. 600 s → full re-fit every second pulse = every 10 min).
+        hmm_refit_every = max(1, HMM_REFIT_INTERVAL // 300)
 
         logging.info(
-            "Historical analysis loop started (interval: %ds / %.0f min, refit every %d iteration(s)).",
+            "Historical analysis loop started "
+            "(VWAP interval: %ds, HMM pulse: 5-min boundaries, "
+            "full refit every %d pulse(s) = every %d min).",
             HIST_INTERVAL,
-            HIST_INTERVAL / 60,
-            refit_every,
+            hmm_refit_every,
+            hmm_refit_every * 5,
         )
         while not self.stop_event.is_set():
             self.stop_event.wait(HIST_INTERVAL)  # interruptible sleep
@@ -492,7 +503,7 @@ class AnalysisEngine:
                 continue
 
             iteration += 1
-            # snaps is a plain list — lock is already released, safe to convert to numpy arrays or a pandas DataFrame.
+            # snaps is a plain list — lock is already released, safe to convert.
             # Bid-VWAP
             bids = np.array([s["best_bid"] for s in snaps])
             vols_bids = np.array([s["volume_best_bid"] for s in snaps])
@@ -512,24 +523,50 @@ class AnalysisEngine:
                 ask_vwap,
             )
 
-            self.regime_director.get_klines_data()  # fetch latest 2h of 1m candles
+            # ── HMM regime update — 5-minute candle-boundary pulse ────────────
+            # Only fire when UTC time has crossed a new 5-minute candle boundary
+            # since the last HMM update.  This prevents redundant API calls and
+            # Viterbi passes when the kline data has not yet changed.
+            now = int(time.time())
+            current_5m_boundary = now - (now % 300)  # floor to nearest 5m candle
 
-            # Full re-fit every HMM_REFIT_INTERVAL seconds (default 5 min);
-            # cheap Viterbi inference on every other iteration.
-            if iteration % refit_every == 0:
-                self.regime_director.select_hmm_model()  # O(n × k × iters) — slow
-                logging.info("Historical #%d — full HMM re-fit completed.", iteration)
+            if current_5m_boundary > _last_hmm_boundary:
+                _last_hmm_boundary = current_5m_boundary
+                hmm_iteration += 1
+
+                # Fetch latest 10 h of 5-minute klines (~120 bars).
+                self.regime_director.get_klines_data()
+
+                if hmm_iteration % hmm_refit_every == 0:
+                    self.regime_director.select_hmm_model()  # full BIC re-fit
+                    logging.info(
+                        "Historical #%d HMM pulse #%d — full re-fit completed.",
+                        iteration,
+                        hmm_iteration,
+                    )
+                else:
+                    self.regime_director.predict_current_regime()  # cheap Viterbi
+
+                with self._regime_lock:
+                    self.regime_director.assign_regime_labels()  # write label
+                logging.info(
+                    "Historical #%d HMM pulse #%d — regime → '%s'",
+                    iteration,
+                    hmm_iteration,
+                    self.regime_director.regime_label,
+                )
             else:
-                self.regime_director.predict_current_regime()  # O(n × k) — fast
-
-            with self._regime_lock:
-                self.regime_director.assign_regime_labels()  # write regime label
-            logging.info(
-                "Historical #%d — regime updated → '%s'",
-                iteration,
-                self.regime_director.regime_label,
-            )
+                logging.debug(
+                    "Historical #%d — no new 5m candle boundary (boundary=%d, "
+                    "last=%d); HMM pulse skipped.",
+                    iteration,
+                    current_5m_boundary,
+                    _last_hmm_boundary,
+                )
 
         logging.info(
-            "Historical analysis loop stopped after %d iteration(s).", iteration
+            "Historical analysis loop stopped after %d iteration(s) "
+            "(%d HMM pulse(s) fired).",
+            iteration,
+            hmm_iteration,
         )

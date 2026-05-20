@@ -17,7 +17,7 @@ FILES
   strategy/
     analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter)
     book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity) — NumPy-vectorised; shape-mismatch guard
-    regime_director.py                — RegimeDirector: GaussianHMM regime detection on 1-min klines
+    regime_director.py                — RegimeDirector: GaussianHMM regime detection on 5-min klines (HMM_INTERVAL="5m", HMM_LOOKBACK="10 hours ago UTC", 120 bars)
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
     metrics.py                        — Order book depth metrics
     indicators.py                     — Technical indicators (trend confirmation, VWAP helper, etc.)
@@ -31,10 +31,10 @@ FILES
     plot_helpers.py                   — Charting utilities for the REST snapshot path
 
     backtest/                           — Offline backtesting framework (see BACKTESTING.md)
-    data.py                           — Historical kline downloader (5 m BTCUSDT; IS: 360→90 days ago ~77,760 rows, OOS: 90 days ago→today ~25,920 rows; end_str enforces IS boundary)
+    data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
-    signals.py                        — Signal replay loop: full pipeline + regime & VWAP filters → signal DataFrame
-    pnl.py                            — P&L simulation: balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), per-trade position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics
+    signals.py                        — Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m, Phase 2 merge_asof stitch, Phase 3 1m execution loop + regime/VWAP gates
+    pnl.py                            — P&L simulation: balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), intra-candle whipsaw guard (SELL_WHIPSAW at low−half_spread), position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
     regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 70/30 train-test split on 1 year (~525k rows), self-contained BIC search + label assignment (no RegimeDirector), vectorised single Viterbi pass on ~157k test candles, six checks
     reporting/                        — Console report formatting and CSV export (AI-authored)
@@ -65,28 +65,39 @@ FILES
                                   # (BIC search: 2…3 states); capped at n_features-1 to
                                   # avoid under-populated states with only 4 features
     HMM_RANDOM_STATE     = 46     # seed for reproducible HMM initialisation
-    HMM_INTERVAL         = KLINE_INTERVAL_1MINUTE  # kline granularity (1 m)
-    HMM_LOOKBACK         = "2 hours ago UTC"        # ~120 rows at 1 m
+    HMM_INTERVAL         = KLINE_INTERVAL_5MINUTE  # kline granularity (5 m — aligned with backtest MACRO frame)
+    HMM_LOOKBACK         = "10 hours ago UTC"       # ~120 rows at 5 m (120 × 5 min = 600 min)
+                                  # ratio kept identical to the previous 1m design (2h × 5 = 10h)
+                                  # so the HMM still operates on 120 bars; 5m granularity
+                                  # is less noisy and converges faster.
     HMM_MIN_COVAR        = 1e-1   # regularisation floor for covariance matrices
                                   # (1e-1 recommended safe default for z-scored financial features)
     HMM_N_INIT           = 10     # random-seed restarts per candidate n_components value
                                   # inside select_hmm_model(); reduces degenerate EM solutions
                                   # (e.g. transmat row summing to 0) on flat/low-variance windows
-    HMM_TRAIN_ROWS       = 80     # in-sample rows for fit(); remaining ~40 rows are out-of-sample
-                                  # scaler is fit_transform'd on [:HMM_TRAIN_ROWS], transform'd on full window
+    HMM_TRAIN_ROWS       = 80     # legacy constant — retained for reference and diagnostics.
+                                  # NO LONGER used to cap the live train/test split.
+                                  # regime_director.py computes train_end = max(2, int(n_rows*2/3))
+                                  # adaptively per window (equals 80 at the default 120-row window).
     HMM_MIN_CONFIDENCE   = 0.70  # min posterior probability (predict_proba) to allow an order;
                                   # below this threshold both BUY and SELL are skipped
     HMM_REFIT_INTERVAL   = 300    # full re-fit cadence (s); cheap Viterbi prediction between refits
     ORDER_REPORT_LIMIT   = 100    # max orders shown at head/tail of end-of-session report
     # Backtesting
-    BACKTEST_INTERVAL    = "5m"                       # 5-minute klines (Client.KLINE_INTERVAL_5MINUTE)
-                                                       # 270-day IS window → ~77,760 rows; 90-day OOS → ~25,920 rows
+    BACKTEST_MACRO_INTERVAL = "5m"                    # 5-minute klines — HMM regime classification
+    BACKTEST_MICRO_INTERVAL = "1m"                    # 1-minute klines — VWAP, signal generation, PnL
+    # Row counts per window:
+    #   IS  5m : 270d × 288  rows/day ≈  77,760 rows  (HMM input)
+    #   IS  1m : 270d × 1440 rows/day ≈ 388,800 rows  (PnL input)
+    #   OOS 5m :  90d × 288  rows/day ≈  25,920 rows
+    #   OOS 1m :  90d × 1440 rows/day ≈ 129,600 rows
     BACKTEST_LOOKBACK    = "360 days ago UTC"          # IS start — used by sensitivity.py (270-day IS period)
     BACKTEST_OOS_START   = "90 days ago UTC"           # OOS start / IS end — used by runner.py; never seen by sensitivity.py
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window — 10 h at 5 m (120 × 5 min)
-    VWAP_WINDOW          = 5      # rolling candle window for backtest VWAP (25 min at 5 m)
-    REFIT_EVERY          = 120    # iterations between full HMM BIC re-fits (10 h at 5 m → ~288 refits over 270-day IS)
+    VWAP_WINDOW          = 5      # rolling VWAP window (rows) — 25 min at 5 m (used on micro 1m frame via merge_asof forward-fill)
+    REFIT_EVERY          = 480    # macro-bar iterations between full HMM BIC re-fits (= 40 h at 5 m → ~54 refits over 90-day OOS; ~162 over 270-day IS)
+                                   # Aligned with SENSITIVITY_REFIT_EVERY so IS optimisation and OOS validation share the same cadence.
     BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 500 for fast debug)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
@@ -100,9 +111,10 @@ FILES
                                          # half_spread = close × BPS / 20 000.
                                          # Default 5 bps → ~$20 at $80 k BTC.
     BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
-    SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py ONLY.
-                                         # 480 iterations = 40 h at 5 m → ~72 refits
-                                         # over the 270-day IS window (~4× faster than REFIT_EVERY=120).
+    SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py.
+                                         # Now equal to REFIT_EVERY (480) — IS optimisation
+                                         # and OOS validation share the same 40-h cadence
+                                         # (~162 refits over 270-day IS; ~54 over 90-day OOS).
                                          # config_parameters defaults unchanged.
     # NOTE: SENSITIVITY_LOOKBACK has been removed.  The IS window is now defined
     # by BACKTEST_LOOKBACK (IS start) and BACKTEST_OOS_START (IS end / OOS start).
@@ -280,27 +292,36 @@ FILES
           ask_vwap = volume_weighted_average_price(asks, vols_asks)
         using the helper from indicators.py.
         Publishes bid_vwap and ask_vwap under _vwap_lock.
-      • HMM REGIME UPDATE (two-speed — outside _regime_lock for the slow work):
-          Every iteration (60 s):
-            regime_director.get_klines_data()            — fetches last 2 h of 1-min klines,
-                                                           computes return, volatility,
-                                                           obi_proxy, trade_density.
-          If iteration % refit_every == 0 (every 5 min / 300 s):
-            regime_director.select_hmm_model()           — fits GaussianHMM for n=2..4 on
-                                                           first HMM_TRAIN_ROWS (scaled) rows,
-                                                           selects the best BIC model; runs
-                                                           predict() + predict_proba() on the
-                                                           full scaled window; sets
-                                                           current_regime + regime_confidence.
+      • HMM REGIME UPDATE (two-speed, 5-min clock-boundary gated — outside _regime_lock for the slow work):
+          Every HIST_INTERVAL (60 s) the VWAP is refreshed; the HMM block
+          additionally checks whether a new 5-minute clock boundary has elapsed:
+            now = int(time.time())
+            current_5m_boundary = now - (now % 300)
+            if current_5m_boundary > _last_hmm_boundary:
+              _last_hmm_boundary = current_5m_boundary
+              hmm_iteration += 1
+              regime_director.get_klines_data()       — fetches last 10 h of 5-min klines,
+                                                         computes return, volatility,
+                                                         obi_proxy, trade_density.
+          If hmm_iteration % hmm_refit_every == 0 (default every boundary = every 5 min):
+            regime_director.select_hmm_model()        — fits GaussianHMM for n=2..3 on
+                                                         first train_end rows (scaled), where
+                                                         train_end = max(2, int(n_rows*2/3));
+                                                         selects the best BIC model; runs
+                                                         predict() + predict_proba() on the
+                                                         full scaled window; sets
+                                                         current_regime + regime_confidence.
           Otherwise (cheap path):
-            regime_director.predict_current_regime()     — reuses existing model + scaler;
-                                                           single Viterbi pass (predict) and
-                                                           predict_proba() on full window;
-                                                           updates current_regime + regime_confidence.
-                                                           ~1000× cheaper than select_hmm_model.
+            regime_director.predict_current_regime()  — reuses existing model + scaler;
+                                                         single Viterbi pass (predict) and
+                                                         predict_proba() on full window;
+                                                         updates current_regime + regime_confidence.
+                                                         ~1000× cheaper than select_hmm_model.
         (inside _regime_lock — fast label assignment only):
           regime_director.assign_regime_labels() — maps state int → label string,
                                                     writes regime_label.
+        Clock-boundary alignment ensures the live HMM pulse fires at the same
+        5-minute cadence as the backtest's merge_asof stitch — no drift.
 
   ▸ Deque fill-up math (at WS_SPEED = 100 ms → ~10 entries/sec):
 
@@ -339,7 +360,7 @@ FILES
                 stop_event set → both threads exit
 
 4b. REGIME DETECTION  (strategy/regime_director.py — RegimeDirector)
-  Trains a Gaussian Hidden Markov Model on recent Binance 1-minute klines
+  Trains a Gaussian Hidden Markov Model on recent Binance 5-minute klines
   to classify the current market into a hidden regime.  The result is exposed
   as a plain string label AND a posterior confidence float consumed by
   AnalysisEngine.low_latency_analysis.
@@ -356,7 +377,9 @@ FILES
   FEATURE SCALING (StandardScaler):
     Before any fit() / predict() / predict_proba() call:
       scaler = StandardScaler()
-      train_features = features[:HMM_TRAIN_ROWS]      (oldest ~⅔ of the 2-h window)
+      n_rows     = len(features)
+      train_end  = max(2, int(n_rows * 2 / 3))   (adaptive ~⅔ split; = 80 at default 120 rows)
+      train_features = features[:train_end]        (oldest ~⅔ of the 10-h window)
       train_scaled   = scaler.fit_transform(train_features)   (fit on in-sample only)
       full_scaled    = scaler.transform(features)             (applied to entire window)
     The scaler is stored as self.scaler and reused in predict_current_regime()
@@ -364,13 +387,13 @@ FILES
     Without scaling, trade_density can dominate the covariance structure.
 
   TRAIN / PREDICT SPLIT:
-    Model is fitted on train_scaled (first HMM_TRAIN_ROWS rows).
+    Model is fitted on train_scaled (first train_end rows, ~⅔).
     Regime is inferred on full_scaled (all rows including held-out recent ones).
     self.current_regime = regimes[-1]  (last candle — genuinely out-of-sample)
 
   MODEL SELECTION (BIC):
     GaussianHMM fitted for n = 2 … HMM_MAX_REGIMES (3) states.
-    Best model selected by lowest BIC = -2 ln L̂ + k ln N  (N = HMM_TRAIN_ROWS).
+    Best model selected by lowest BIC = -2 ln L̂ + k ln N  (N = train_end).
     current_regime set to state index of the last candle.
 
   REGIME CONFIDENCE (predict_proba):
@@ -418,15 +441,18 @@ FILES
     frozen at import time.  Full explanation: strategy/param_loader.py.
     Initial fit: get_klines_data() + select_hmm_model() + assign_regime_labels().
 
-    Every HIST_INTERVAL (60 s) in historical_analysis():
-      get_klines_data()           — refresh features (outside _regime_lock)
-      predict_current_regime()    — cheap Viterbi + predict_proba (outside _regime_lock)
-      assign_regime_labels()      — fast label write (inside _regime_lock)
+    Every HIST_INTERVAL (60 s) in historical_analysis() — VWAP always refreshed;
+      HMM block additionally gated on 5-minute clock boundary:
+        now = int(time.time()); boundary = now - (now % 300)
+        if boundary > _last_hmm_boundary:
+          get_klines_data()           — refresh 5-min features (outside _regime_lock)
+          predict_current_regime()    — cheap Viterbi + predict_proba (outside _regime_lock)
+          assign_regime_labels()      — fast label write (inside _regime_lock)
 
-    Every HMM_REFIT_INTERVAL (300 s) — replaces predict with full refit:
-      get_klines_data()           — refresh features (outside _regime_lock)
-      select_hmm_model()          — full EM refit + new scaler (outside _regime_lock)
-      assign_regime_labels()      — fast label write (inside _regime_lock)
+    Every HMM_REFIT_INTERVAL (300 s, i.e. every boundary by default) — replaces predict with full refit:
+        get_klines_data()           — refresh features (outside _regime_lock)
+        select_hmm_model()          — full EM refit + new scaler (outside _regime_lock)
+        assign_regime_labels()      — fast label write (inside _regime_lock)
 
 ## 5. SESSION DRIVER  (websocket_main.py)
   Orchestrates the full lifecycle:
@@ -450,9 +476,9 @@ FILES
             any thread starts (single-threaded at this point; no lock needed).
   Step 4b— Pre-session HMM regime detection (RegimeDirector):
               • regime_director.get_klines_data()     — downloads ~120 rows of
-                1-min klines (last 2 h, public endpoint, no auth).
+                5-min klines (last 10 h, public endpoint, no auth).
               • regime_director.select_hmm_model()    — fits GaussianHMM for
-                n=2..4, selects best BIC model, sets current_regime.
+                n=2..3, selects best BIC model, sets current_regime.
               • regime_director.assign_regime_labels()— assigns regime_label.
             regime_label is populated BEFORE threads start so the first
             low_latency_analysis iteration never reads None.
@@ -572,17 +598,29 @@ FILES
       • Logs formatted summary (FILLED / PARTIAL / OPEN / other).
 
 ## 7. BACKTESTING  (backtest/)
-  Offline replay of the live strategy using a clean **IS/OOS split** on **5-minute BTCUSDT klines**
-  (IS: 360→90 days ago, 270 days, ~77,760 rows; OOS: 90 days ago→today, 90 days, ~25,920 rows; total ~103,680 rows).
+  Offline replay of the live strategy using a clean **IS/OOS split** and a
+  **two-resolution architecture** (Step 9, 2026-05-18):
+
+  | Frame | Interval | Purpose | IS rows | OOS rows |
+  |---|---|---|---|---|
+  | Macro | 5 m | GaussianHMM regime classification | ~77,760 | ~25,920 |
+  | Micro | 1 m | VWAP, signal generation, PnL simulation | ~388,800 | ~129,600 |
+
   Full design, pseudo-code, data-flow diagrams, and caveats → BACKTESTING.md.
 
-  backtest/data.py            — fetch_klines(start_str, end_str): downloads klines
-                                at 5-minute resolution (`BACKTEST_INTERVAL = "5m"`)
-                                via Client.get_historical_klines() (public, no auth).
-                                `end_str` is injected only when set, enforcing the
-                                IS/OOS boundary: sensitivity.py passes
-                                `end_str=BACKTEST_OOS_START`; runner.py uses
-                                `start_str=BACKTEST_OOS_START` for the OOS window.
+  backtest/data.py            — Two typed wrappers over the low-level ``fetch_klines()``:
+                                ``fetch_macro_klines()`` (5 m, HMM) and
+                                ``fetch_micro_klines()`` (1 m, PnL).  Both route through
+                                a **Parquet cache** (``cache/klines/``, 24-hour TTL).
+                                Cache hit  → load from ``.parquet`` (no API call).
+                                Cache miss → fetch from Binance → save → return.
+                                Filename: ``<SYMBOL>_<interval>_<MD5-12>.parquet``.
+                                ``flush_kline_cache()`` (or ``--flush-cache`` CLI flag)
+                                deletes all cached files to force a fresh download.
+                                ``end_str`` injected only when set, enforcing the IS/OOS
+                                boundary: ``sensitivity.py`` passes
+                                ``end_str=BACKTEST_OOS_START``; ``runner.py`` uses
+                                ``lookback=BACKTEST_OOS_START`` for the OOS window.
   backtest/synthetic_book.py  — build_synthetic_book(row): per-kline synthetic
                                 50-level order book (spread reconstruction +
                                 exponential volume decay + OBI asymmetry injection).
@@ -596,36 +634,48 @@ FILES
                                 O(N_LEVELS) max/min key-scan, matching state.local_book
                                 format → feeds _build_levels() directly.
 
-  Three data flows per candle (mirroring the live architecture):
-    Flow A — Opportunity scoring  : synthetic book → build_levels →
-             collect_candidates → select_best_opportunity
-             (all three via strategy/book_utils.py — the same public
-             functions that AnalysisEngine._build_levels / _collect_candidates
-             / _select_best_opportunity delegate to)
-    Flow B — Regime filter        : rolling 120-candle kline window →
-             RegimeDirector (HMM)
-    Flow C — VWAP dip/strength filter : rolling 5-candle best-bid/ask → bid_vwap
+  Three phases in run_signals() (mirroring the live architecture):
+    Phase 1 — HMM walk-forward on df_macro (5 m):
+              _add_hmm_features → rolling [i−_lookback:i] slice →
+              select_hmm_model (full BIC re-fit every _refit_every bars) /
+              predict_current_regime (cheap Viterbi every _predict_every bars) →
+              assign_regime_labels → regime_df {5m_timestamp → regime, confidence}
+    Phase 2 — Temporal stitch (zero look-ahead):
+              pd.merge_asof(df_micro, regime_df, direction='backward') →
+              df_exec (1m rows, each carrying the most recent 5m regime label)
+    Phase 3 — Execution loop on df_exec (1 m):
+              build_synthetic_book → build_levels → collect_candidates →
+              select_best_opportunity (Flow A),
+              rolled VWAP on 1m top-of-book prices (Flow C),
+              regime / confidence read from stitched columns (Flow B).
 
-  backtest/signals.py             — run_signals(): orchestrates all three flows
-                                    per candle, applies the combined gate
-                                    (regime + VWAP), and returns a time-indexed
-                                    DataFrame with signal (+1/−1/0), regime
-                                    label, bid/ask VWAP, micro-price, half_spread,
-                                    and buy_qty/sell_qty details for P&L sizing.
-                                    PERFORMANCE: feature columns pre-extracted as
-                                    numpy arrays before the loop (avoids 43 k
-                                    pandas iloc calls); _best_bid/_best_ask read
-                                    directly from synthetic_book dict (no O(50)
-                                    key scan).
+  backtest/signals.py             — run_signals(): two-frame orchestrator.
+                                    Accepts ``prefetched_macro`` (5 m) and
+                                    ``prefetched_micro`` (1 m) DataFrames; fetches
+                                    from parquet cache when not provided.
+                                    Phase 1: HMM walk-forward on df_macro (5 m) —
+                                    _add_hmm_features → rolling [i−_lookback:i] slice →
+                                    select_hmm_model (full BIC re-fit every _refit_every
+                                    5m bars) / predict_current_regime (cheap Viterbi
+                                    every _predict_every bars) → assign_regime_labels
+                                    → regime_df {5m_ts → regime, confidence}.
+                                    Phase 2: temporal stitch (zero look-ahead) —
+                                    merge_asof(df_micro, regime_df, direction='backward')
+                                    → df_exec (1m rows, each carrying the most recent
+                                    5m regime label preceding its timestamp).
+                                    1m bars before the first 5m regime label are
+                                    discarded.
+                                    Phase 3: execution loop on df_exec (1m) — synthetic
+                                    book + VWAP + combined gate → signal +1/−1/0.
+                                    Output columns: close, high, low (for whipsaw guard),
+                                    half_spread, signal, regime, regime_confidence,
+                                    bid_vwap, ask_vwap, best_buy_micro, best_sell_micro,
+                                    buy_qty, sell_qty.
                                     Optional keyword overrides (all default None →
                                     fall back to config constants):
                                       hmm_lookback_rows, hmm_max_regimes,
-                                      vwap_window, refit_every, lookback,
-                                      predict_every.
-                                    predict_every: between refit calls, Viterbi is
-                                    run only every N candles; last regime reused
-                                    otherwise (sensitivity uses N=5 for ~5× speedup;
-                                    run_backtest uses N=1, every candle).
+                                      vwap_window, refit_every, predict_every,
+                                      vwap_threshold, lookback, end_str.
 
   backtest/pnl.py                — simulate_pnl(): walks the signal DataFrame
                                     candle by candle using itertuples() (~5× faster
@@ -638,6 +688,14 @@ FILES
                                     (default 5 bps → ~$20 at $80 k BTC).
                                     NOT (high-low)/2 — the candle range is
                                     10-100× the real spread and causes 100% drawdown.
+                                    INTRA-CANDLE WHIPSAW GUARD (Step 9):
+                                      Fires when open_strategy_qty > _POSITION_DUST_BTC
+                                      AND candle_low  ≤ best_buy_micro  (BUY zone touched)
+                                      AND candle_high ≥ best_sell_micro (SELL zone touched)
+                                      in the same 1-minute bar.  Pessimistic exit at
+                                      low − half_spread; records SELL_WHIPSAW trade.
+                                      n_whipsaw_exits returned in stats dict.
+                                      Guard disabled silently if high/low columns absent.
                                     POSITION GUARD (single-open-position MR mode):
                                       open_strategy_qty tracks BTC opened by strategy
                                       BUY signals only (excludes initial_btc).
@@ -656,7 +714,7 @@ FILES
                                     and a stats dict with Step 5 metrics (total
                                     return, win rate, max drawdown, Sharpe,
                                     Sortino, profit factor, avg holding period,
-                                    n_position_guard_skips,
+                                    n_position_guard_skips, n_whipsaw_exits,
                                     regime/VWAP filter hit rates).
                                     Sharpe and Sortino use excess returns over
                                     BACKTEST_RISK_FREE_RATE (default 0.0) and
@@ -690,17 +748,22 @@ FILES
                                     today, ~25,920 rows at 5 m) via
                                     run_signals(lookback=BACKTEST_OOS_START).
                                     Chains run_signals() → simulate_pnl() →
-                                    print_report() → (opt-in) plot_backtest().
+                                    print_report() → plot_backtest().
                                     Loads best_params.json via
                                     load_best_params_for_backtest() and passes
                                     fee_rate to simulate_pnl() (falls back to
                                     BACKTEST_FEE_RATE when absent).
+                                    Also calls compute_buy_and_hold() and
+                                    print_bnh_comparison() — strategy vs B&H
+                                    comparison box always appears in output.
                                     Parameters:
                                       export_csv (bool, default False) — saves
                                         trades_*.csv + equity_*.csv.
-                                      plot (bool, default False) — generates the
-                                        Step 7 Plotly figure; imported lazily so
-                                        headless runs carry zero overhead.
+                                      plot (bool, CLI default True) — generates
+                                        the Step 7 Plotly figure; pass --no-plot
+                                        on the CLI (or plot=False programmatically)
+                                        for headless / CI environments; imported
+                                        lazily so headless runs carry zero overhead.
                                       save_png (bool, default False) — persists
                                         figure as PNG (kaleido) or HTML fallback.
                                     Report formatting and CSV export delegated to
@@ -741,11 +804,13 @@ FILES
                                      VALIDATION_LOOKBACK = "365 days ago UTC"),
                                      applies a 70/30 train-test split at runtime
                                      (split_idx = int(len(df) * 0.70), ~367,500 /
-                                     ~157,500 rows).  SELF-CONTAINED: does not use
+                                     SELF-CONTAINED: does not use
                                      RegimeDirector — replicates BIC search and
                                      label-assignment directly with raw GaussianHMM
                                      + StandardScaler so the training window is not
-                                     capped at HMM_TRAIN_ROWS (80 rows).
+                                     capped at the live adaptive split (train_end =
+                                     max(2, int(n_rows*2/3))); instead fits on the
+                                     full 70 % train set for maximum regime coverage.
                                      Phase 2 scores ~157,500 test candles in a
                                      SINGLE VECTORISED VITERBI PASS:
                                        • scaler.transform(test_features) — 1 call
@@ -821,7 +886,7 @@ FILES
                                      Three sensitivity-only speed-up constants
                                      (all in config_parameters.py, no effect on
                                      runner.py or the live system):
-                                       SENSITIVITY_REFIT_EVERY = 480  (40 h at 5 m → ~72 refits over IS window; ~4× speedup)
+                                       SENSITIVITY_REFIT_EVERY = 480  (40 h at 5 m = REFIT_EVERY; IS and OOS share the same ~162/~54 refit cadence)
                                        SENSITIVITY_PREDICT_EVERY = 5  (~5× fewer Viterbi calls)
                                     IS/OOS split (SENSITIVITY_LOOKBACK removed; IS window defined by):
                                        IS window: BACKTEST_LOOKBACK ("360 days ago UTC") → BACKTEST_OOS_START ("90 days ago UTC")
@@ -879,4 +944,8 @@ FILES
                          pnl.py ✅, runner.py ✅, reporting/ ✅,
                          regime_validation.py ✅, visualization.py ✅,
                          sensitivity.py ✅ (Use Case A; Use Case B deferred),
-                         param_loader.py ✅ (load_best_params + load_best_params_for_backtest).
+                         param_loader.py ✅ (load_best_params + load_best_params_for_backtest),
+                         Step 9 ✅ (multi-timeframe decoupling + parquet cache + whipsaw guard + docs, 2026-05-18).
+
+
+

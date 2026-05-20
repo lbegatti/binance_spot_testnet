@@ -99,8 +99,9 @@ logging.basicConfig(
 # Note: BACKTEST_LOOKBACK (used by runner.py) is intentionally kept
 #       at "180 days ago UTC" — this validation script uses its own
 #       VALIDATION_LOOKBACK so the two tools remain independent.
-#       Unlike the live RegimeDirector (which trains on only HMM_TRAIN_ROWS = 80
-#       rows to avoid look-ahead bias), this diagnostic fits on the full 70%
+#       Unlike the live RegimeDirector (which trains on train_end =
+#       max(2, int(n_rows × 2/3)) rows — adaptive ~⅔ split — to avoid
+#       look-ahead bias), this diagnostic fits on the full 70%
 #       train set (~367,500 rows) for a thorough regime coverage check.
 # ---------------------------------------------------------------------------
 VALIDATION_LOOKBACK = "365 days ago UTC"  # fetch window (~1 year, ~525,000 rows)

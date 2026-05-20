@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from backtest.data import fetch_klines
+from backtest.data import fetch_macro_klines, fetch_micro_klines
 from backtest.synthetic_book import build_synthetic_book
 from strategy.book_utils import (
     build_levels,
@@ -64,138 +64,115 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_signals(
+    prefetched_macro: pd.DataFrame | None = None,
+    prefetched_micro: pd.DataFrame | None = None,
+    lookback: str | None = None,
+    end_str: str | None = None,
     hmm_lookback_rows: int | None = None,
     hmm_max_regimes: int | None = None,
     vwap_window: int | None = None,
     refit_every: int | None = None,
     predict_every: int | None = None,
-    lookback: str | None = None,
-    prefetched_df: pd.DataFrame | None = None,
     vwap_threshold: float | None = None,
 ) -> pd.DataFrame:
     """
-    Replay the full trading pipeline on historical 1-minute klines.
+    Replay the full trading pipeline on historical klines using a
+    **two-resolution architecture**:
 
-    All four optional parameters default to ``None``, in which case each falls
-    back to the module-level constant from ``config_parameters.py``.  This
-    allows ``backtest/sensitivity.py`` to override individual values per run
-    without modifying ``config_parameters.py`` or the live system.
+    * **Macro frame (5 m)** — ``GaussianHMM`` walk-forward.  Regime labels
+      are produced once per 5-minute bar and stored in ``regime_df``.
+    * **Micro frame (1 m)** — Synthetic order-book scoring, rolling VWAP,
+      and PnL signal generation.  Each 1-minute bar is annotated with
+      the most recent 5-minute regime label via ``pd.merge_asof`` (zero
+      look-ahead bias, backward direction).
+
+    Decoupling the HMM cadence from the execution cadence yields two
+    improvements over the previous single-timeframe design:
+
+    1. **Faster EM convergence** — the GaussianHMM sees 5× fewer rows
+       (5 m bars) with richer information content, so the EM algorithm
+       converges earlier and is less sensitive to microstructure noise.
+    2. **Cleaner signal gating** — the VWAP / synthetic-book signals
+       still operate at full 1-minute resolution, while the macro regime
+       filter advances only on meaningful structural changes.
 
     Parameters
     ----------
+    prefetched_macro : pd.DataFrame | None
+        Pre-fetched **raw** 5-minute OHLCV DataFrame (columns: ``open``,
+        ``high``, ``low``, ``close``, ``volume``, ``taker_buy_base_vol``,
+        ``num_trades``).  When provided, skips ``fetch_macro_klines()``.
+        Pass raw klines — HMM features are computed internally.
+    prefetched_micro : pd.DataFrame | None
+        Pre-fetched **raw** 1-minute OHLCV DataFrame.  When provided,
+        skips ``fetch_micro_klines()``.
+    lookback : str | None
+        Fetch window start passed to both ``fetch_macro_klines()`` and
+        ``fetch_micro_klines()`` when the pre-fetched frames are ``None``.
+        Defaults to ``BACKTEST_LOOKBACK`` (``"360 days ago UTC"``).
+    end_str : str | None
+        Optional fetch window end (e.g. ``BACKTEST_OOS_START``).
+        ``None`` → fetch up to the most recent complete candle.
     hmm_lookback_rows : int | None
-        Rolling window size (candles) passed to the HMM warm-up and the main
-        loop slice ``features_df.iloc[i - _lookback : i]``.
-        Defaults to ``HMM_LOOKBACK_ROWS`` (120 — 2 h at 1 m).
+        Rolling window for HMM warm-up and the macro walk-forward slice
+        ``features_macro.iloc[i - _lookback : i]``.
+        Counts **5-minute bars** (default ``HMM_LOOKBACK_ROWS`` = 120
+        → 10 h at 5 m).
     hmm_max_regimes : int | None
         Upper bound on the BIC state search inside ``select_hmm_model()``.
-        Sets ``rd.max_states`` before each fit.
         Defaults to ``HMM_MAX_REGIMES`` (3).
     vwap_window : int | None
-        ``deque(maxlen=…)`` size for the rolling VWAP.
-        Defaults to ``VWAP_WINDOW`` (5 — 5 min at 1 m).
+        ``deque(maxlen=…)`` size for the rolling VWAP on 1-minute bars.
+        Defaults to ``VWAP_WINDOW`` (5).
     refit_every : int | None
-        Full BIC re-fit cadence in iterations.  Sensitivity runs pass
-        ``SENSITIVITY_REFIT_EVERY`` (480) here for a ~4× speedup; the live
-        system cadence (``REFIT_EVERY`` = 120) is used otherwise.
-        Defaults to ``REFIT_EVERY`` (120).
-    lookback : str | None
-        Data fetch window passed to ``fetch_klines()`` as ``start_str``.
-        Sensitivity runs pass ``SENSITIVITY_LOOKBACK`` ("30 days ago UTC",
-        ~43,200 rows) so each of the 6 OAT runs only processes 30 days
-        instead of the full 180-day backtest window.
-        Defaults to ``BACKTEST_LOOKBACK`` ("180 days ago UTC").
+        Full BIC re-fit cadence counted in **5-minute macro bars**.
+        Defaults to ``REFIT_EVERY`` (120 → re-fit every 10 h).
     predict_every : int | None
-        How many candles to skip between cheap Viterbi passes
-        (``predict_current_regime()``).  1 = predict every candle (default,
-        used by ``runner.py``).  Sensitivity runs may pass a higher
-        value (e.g. ``SENSITIVITY_PREDICT_EVERY = 5``) to cut Viterbi
-        overhead by ~5× while preserving relative parameter rankings.
-    prefetched_df : pd.DataFrame | None
-        If provided, skip ``fetch_klines()`` and ``_add_hmm_features()``
-        entirely and use this DataFrame directly.  The caller is responsible
-        for passing a features-enriched DataFrame
-        (columns: ``close``, ``high``, ``low``, ``volume``,
-        ``taker_buy_base_vol``, ``return``, ``volatility``, ``obi_proxy``,
-        ``trade_density``).
-
-        **This is the key optimisation for sensitivity sweeps**: the caller
-        pre-fetches and feature-engineers the data *once* before the grid
-        loop, then passes the same ``prefetched_df`` to every run.  Without
-        this, ``fetch_klines()`` would hit the Binance API once per
-        combination (24× for the full grid, 6× for OAT) for data that is
-        identical across all runs.
-
-        When ``None`` (default), the normal fetch path runs and the
-        ``lookback`` parameter controls the window.  Existing callers
-        (``runner.py``) are completely unaffected.
+        Cheap Viterbi pass cadence in macro bars.  Sensitivity sweeps
+        may pass a higher value to cut Viterbi overhead.  Default 1
+        (predict every macro bar).
     vwap_threshold : float | None
-        Minimum fractional dip / rally required around the VWAP before a
-        signal fires.  Creates a symmetric dead zone:
+        Minimum fractional dip / rally around VWAP before a signal fires.
+        Defaults to ``VWAP_THRESHOLD_MULTIPLIER`` (0.003 → 0.30 % dead
+        zone).
 
-        - BUY  fires only when ``micro_price < bid_vwap × (1 − threshold)``.
-        - SELL fires only when ``micro_price ≥ bid_vwap × (1 + threshold)``.
+    Internal pipeline
+    -----------------
+    **Phase 1 — HMM walk-forward on df_macro (5 m)**:
+        ``_add_hmm_features`` → initial fit on warm-up window →
+        rolling ``[i-_lookback : i]`` slices → ``select_hmm_model``
+        every ``_refit_every`` bars / ``predict_current_regime`` every
+        ``_predict_every`` bars → ``assign_regime_labels`` →
+        ``regime_df (timestamp → regime, regime_confidence)``.
 
-        Rule of thumb: set to at least 2 × one-way fee to guarantee a
-        profitable round trip (e.g. 0.002 for 0.10 % / side fees).
-        Default ``VWAP_THRESHOLD_MULTIPLIER`` from ``config_parameters.py``
-        (0.003 → 0.30 % dead zone).
+    **Phase 2 — Temporal stitch**:
+        ``pd.merge_asof(df_micro, regime_df, direction='backward')`` →
+        ``df_exec``.  Each 1-minute bar receives the latest 5-minute
+        regime label that preceded it (no look-ahead bias).
+        1-minute bars that predate the first regime label are discarded.
 
-    For every candle from ``_lookback`` onward the function
-    reproduces the three concurrent flows of the live system:
+    **Phase 3 — Execution loop on df_exec (1 m)**:
+        ``build_synthetic_book`` → ``build_levels`` →
+        ``collect_candidates`` → ``select_best_opportunity`` (Flow A),
+        rolled VWAP on top-of-book prices (Flow C), regime / confidence
+        read from stitched columns (no HMM calls in this loop).
 
-    **Flow A — Order-book scoring** (mirrors ``low_latency_analysis``):
-        ``build_synthetic_book`` → ``build_levels`` → ``collect_candidates``
-        → ``select_best_opportunity`` for each side.
+    Returns
+    -------
+    pd.DataFrame
+        One row per 1-minute bar (from the first valid regime label
+        onward), indexed by ``timestamp``, with columns:
+        ``close``, ``high``, ``low``,
+        ``half_spread``, ``signal`` (+1 / −1 / 0),
+        ``regime``, ``regime_confidence``,
+        ``bid_vwap``, ``ask_vwap``,
+        ``best_buy_micro``, ``best_sell_micro``,
+        ``buy_qty``, ``sell_qty``.
 
-    **Flow B — HMM regime** (mirrors ``historical_analysis`` regime update):
-        The ``RegimeDirector`` is fitted on the initial warm-up window
-        (``HMM_LOOKBACK_ROWS`` candles).  On subsequent iterations it is
-        updated using the cheap Viterbi path, with a full BIC re-fit every
-        ``REFIT_EVERY`` iterations — identical cadence to the live system.
-
-    **Flow C — VWAP dip/strength filter** (mirrors ``historical_analysis`` VWAP):
-        A rolling ``deque(maxlen=VWAP_WINDOW)`` accumulates best-bid/ask
-        prices and volumes from the synthetic book.  ``bid_vwap`` and
-        ``ask_vwap`` are computed once the window is full; ``None`` before
-        that (filter is transparent, same as live).  Both gate conditions use
-        ``bid_vwap`` exclusively (mean-reversion strategy); ``ask_vwap`` is
-        retained in the output record for diagnostics only.
-
-    **Combined gate** (mirrors the live ``low_latency_analysis`` decision):
-        * ``signal = +1`` (BUY)  when ``best_buy`` exists **and**
-          ``regime_confidence ≥ HMM_MIN_CONFIDENCE`` (model is certain enough)
-          **and** regime ∉ {``trending_down``, ``high_volatility``}
-          **and** (``bid_vwap`` is ``None`` or
-          ``micro_price < bid_vwap × (1 − vwap_threshold)``)
-          (dip deep enough to cover fees and leave profit).
-        * ``signal = -1`` (SELL) when ``best_sell`` exists **and**
-          ``regime_confidence ≥ HMM_MIN_CONFIDENCE``
-          **and** regime ∉ {``trending_up``, ``high_volatility``}
-          **and** (``bid_vwap`` is ``None`` or
-          ``micro_price ≥ bid_vwap × (1 + vwap_threshold)``)
-          (rally strong enough to cover fees and leave profit).
-        * ``signal = 0``  otherwise (no trade).
-
-    Returns:
-        pd.DataFrame: One row per candle (from ``HMM_LOOKBACK_ROWS`` onward),
-            indexed by ``timestamp``, with columns:
-            ``close`` (candle close — VWAP anchor),
-            ``half_spread`` (bps-based fill cost: ``close × BACKTEST_FILL_SPREAD_BPS /
-            20_000``; default 5 bps ≈ $20 at $80k BTC. BUY fills at
-            ``close + half_spread``, SELL fills at ``close - half_spread``),
-            ``signal`` (+1 BUY / -1 SELL / 0 HOLD),
-            ``regime``, ``regime_confidence`` (posterior probability of the
-            predicted regime from ``predict_proba()``, ``None`` before the
-            first fit), ``bid_vwap``, ``ask_vwap``,
-            ``best_buy_micro``, ``best_sell_micro``,
-            ``buy_qty`` (ask-side quantity at the best-buy level),
-            ``sell_qty`` (bid-side quantity at the best-sell level).
-            ``buy_qty`` / ``sell_qty`` are ``None`` when no signal fired.
+        ``high`` and ``low`` are retained for the intra-candle whipsaw
+        guard in ``backtest/pnl.py`` (Step 4).
     """
-    # Resolve parameter overrides — fall back to config constants when None.
-    # This is the only place where overrides are applied; callers that pass
-    # no arguments (e.g. runner.py) are completely unaffected.
+    # ── Resolve parameter overrides ──────────────────────────────────────────
     _lookback = (
         hmm_lookback_rows if hmm_lookback_rows is not None else HMM_LOOKBACK_ROWS
     )
@@ -208,78 +185,133 @@ def run_signals(
         vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
     )
 
-    # 1. Fetch and prepare data
-    if prefetched_df is not None:
-        # Caller pre-fetched the data (e.g. sensitivity.py fetches once for all
-        # runs and passes the same DataFrame to every _run_one() call).
-        # Skip fetch_klines() and _add_hmm_features() entirely.
-        features_df = prefetched_df
-        logging.info(
-            "Using pre-fetched features_df: %d rows (no API call).", len(features_df)
-        )
+    # ── 1. Fetch / accept raw OHLCV frames ───────────────────────────────────
+    if prefetched_macro is not None:
+        df_macro_raw = prefetched_macro
+        logging.info("Using pre-fetched macro (5 m) frame: %d rows.", len(df_macro_raw))
     else:
-        klines = fetch_klines(start_str=_fetch_lookback)
-        features_df = _add_hmm_features(klines)
-        if BACKTEST_MAX_ROWS is not None:
-            features_df = features_df.iloc[-(_lookback + BACKTEST_MAX_ROWS) :]
-            logging.info(
-                "Debug mode: capped at %d rows (%d replay candles).",
-                len(features_df),
-                BACKTEST_MAX_ROWS,
-            )
-        logging.info(
-            "Fetched %d klines; %d rows after HMM features.",
-            len(klines),
-            len(features_df),
-        )
+        df_macro_raw = fetch_macro_klines(lookback=_fetch_lookback, end_str=end_str)
+        logging.info("Fetched macro (5 m) frame: %d rows.", len(df_macro_raw))
 
-    # 2. Initial HMM fit on the warm-up window (first _lookback rows)
-    # NOTE: the train/predict split and StandardScaler are applied INSIDE
-    # select_hmm_model() — no explicit split is needed here.
-    # Concretely, select_hmm_model() does:
-    #   train_features = klines_df[:HMM_TRAIN_ROWS]   (first 80 rows — in-sample)
-    #   scaler.fit_transform(train_features)            (scale fitted on training rows only;
-    #                                                    recent candles cannot leak into mean/std)
-    #   test_features  = klines_df[HMM_TRAIN_ROWS:]    (last ~40 rows — out-of-sample)
-    #   scaler.transform(test_features)                 (same scale applied to test rows)
-    #   model.fit(train_scaled)                         (EM on 80 rows only)
-    #   model.predict(test_scaled)                      (Viterbi on ~40 test rows only)
-    #   model.predict_proba(test_scaled)                (confidence on ~40 test rows only)
-    # current_regime / regime_confidence reflect the LAST of those ~40 test rows,
-    # which was genuinely out-of-sample during training (walk-forward split).
+    if prefetched_micro is not None:
+        df_micro_raw = prefetched_micro
+        logging.info("Using pre-fetched micro (1 m) frame: %d rows.", len(df_micro_raw))
+    else:
+        df_micro_raw = fetch_micro_klines(lookback=_fetch_lookback, end_str=end_str)
+        logging.info("Fetched micro (1 m) frame: %d rows.", len(df_micro_raw))
+
+    # Cap micro frame for debug / sensitivity runs.
+    # Macro frame is intentionally left uncapped so the HMM always sees the
+    # full warm-up history even when BACKTEST_MAX_ROWS is very small.
+    df_micro = df_micro_raw.copy()
+    if BACKTEST_MAX_ROWS is not None:
+        df_micro = df_micro.iloc[-BACKTEST_MAX_ROWS:]
+        logging.info("Debug mode: micro frame capped at %d rows.", len(df_micro))
+
+    # ── Phase 1 — HMM walk-forward on 5-minute macro bars ────────────────────
+    features_macro = _add_hmm_features(df_macro_raw)
+    logging.info(
+        "Macro features ready: %d rows (dropped %d NaN rows from pct_change).",
+        len(features_macro),
+        len(df_macro_raw) - len(features_macro),
+    )
+
     rd = RegimeDirector(max_regimes=_max_regimes)
-    rd.klines_df = features_df.iloc[:_lookback]
+    rd.klines_df = features_macro.iloc[:_lookback]
     rd.select_hmm_model()
     rd.assign_regime_labels()
     logging.info(
-        "Initial HMM fit complete — regime: '%s' (confidence: %.2f)",
+        "Initial HMM fit on 5 m bars — regime: '%s' (confidence: %.2f)",
         rd.regime_label,
         rd.regime_confidence or 0.0,
     )
 
-    # 3. Rolling VWAP window
+    macro_timestamps = features_macro.index
+    macro_records: list[dict] = []
+    macro_iteration = 0
+
+    for i in range(_lookback, len(features_macro)):
+        macro_iteration += 1
+        rd.klines_df = features_macro.iloc[i - _lookback : i]
+        rd.max_states = _max_regimes
+
+        if macro_iteration % _refit_every == 0:
+            try:
+                rd.select_hmm_model()  # full BIC re-fit
+            except RuntimeError as exc:
+                logging.warning(
+                    "signals: HMM refit failed at macro iteration %d — "
+                    "keeping previous model. (%s)",
+                    macro_iteration,
+                    exc,
+                )
+        elif macro_iteration % _predict_every == 0:
+            rd.predict_current_regime()  # cheap Viterbi pass
+        # else: reuse regime / confidence from the previous macro bar
+
+        rd.assign_regime_labels()
+        macro_records.append(
+            {
+                "timestamp": macro_timestamps[i],
+                "regime": rd.regime_label,
+                "regime_confidence": rd.regime_confidence,
+            }
+        )
+
+    regime_df = pd.DataFrame(macro_records).set_index("timestamp")
+    logging.info(
+        "Phase 1 complete: %d 5-minute regime labels produced.", len(regime_df)
+    )
+
+    # ── Phase 2 — Temporal stitch (5 m → 1 m, zero look-ahead) ──────────────
+    # merge_asof with direction='backward' assigns each 1-minute bar the most
+    # recent 5-minute regime label that precedes (or matches) its timestamp.
+    # 1-minute bars that predate the very first regime label are discarded so
+    # the execution loop never reads a NaN regime.
+    df_exec = pd.merge_asof(
+        df_micro.sort_index(),
+        regime_df.sort_index(),
+        left_index=True,
+        right_index=True,
+        direction="backward",
+    )
+    first_regime_ts = regime_df.index[0]
+    df_exec = df_exec[df_exec.index >= first_regime_ts].copy()
+    logging.info(
+        "Phase 2 complete: %d 1-minute execution bars after stitch "
+        "(discarded %d pre-regime bars).",
+        len(df_exec),
+        len(df_micro) - len(df_exec),
+    )
+
+    # ── Phase 3 — Execution loop on 1-minute bars ────────────────────────────
+    # Pre-extract columns as numpy arrays to avoid ~390k pandas iloc() calls.
+    close_arr = df_exec["close"].to_numpy()
+    high_arr = df_exec["high"].to_numpy()
+    low_arr = df_exec["low"].to_numpy()
+    vol_arr = df_exec["volume"].to_numpy()
+    tbv_arr = df_exec["taker_buy_base_vol"].to_numpy()
+    regime_arr = df_exec["regime"].to_numpy()
+    confidence_arr = df_exec["regime_confidence"].to_numpy(dtype=object)
+    timestamps = df_exec.index
+
     vwap_deque: deque = deque(maxlen=_vwap_window)
-
-    # 4. Pre-extract feature columns as numpy arrays so the hot loop avoids
-    #    43 k pandas iloc() calls.  Dict-style row access still works for
-    #    build_synthetic_book() — passing a plain dict is ~3× faster than
-    #    passing a pd.Series because it skips the pandas Index lookup.
-    close_arr = features_df["close"].to_numpy()
-    high_arr = features_df["high"].to_numpy()
-    low_arr = features_df["low"].to_numpy()
-    vol_arr = features_df["volume"].to_numpy()
-    tbv_arr = features_df["taker_buy_base_vol"].to_numpy()
-    timestamps = features_df.index
-
-    # 5. Main loop
     records: list[dict] = []
-    hist_iteration = 0  # counts iterations since warm-up (for refit cadence)
 
-    for i in range(_lookback, len(features_df)):
-        timestamp = timestamps[i]
-        hist_iteration += 1
+    for i in range(len(df_exec)):
+        regime = regime_arr[i]
+        # regime_confidence may be a float/NaN for the very first stitched bar;
+        # treat that the same as None (transparent gate).
+        raw_conf = confidence_arr[i]
+        regime_confidence = (
+            None
+            if (
+                raw_conf is None or (isinstance(raw_conf, float) and np.isnan(raw_conf))
+            )
+            else float(raw_conf)
+        )
 
-        # Lightweight dict — avoids pd.Series overhead inside build_synthetic_book.
+        # Flow A: synthetic order book → levels → candidates → best
         row_dict = {
             "high": high_arr[i],
             "low": low_arr[i],
@@ -287,8 +319,6 @@ def run_signals(
             "volume": vol_arr[i],
             "taker_buy_base_vol": tbv_arr[i],
         }
-
-        # Flow A: synthetic book → levels → candidates → best
         order_book = build_synthetic_book(row_dict)
         levels, median_depth, level_0_depth = build_levels(
             order_book["bids"], order_book["asks"]
@@ -296,10 +326,10 @@ def run_signals(
         buy_candidates, sell_candidates = collect_candidates(
             levels, median_depth, level_0_depth
         )
-        best_buy = select_best_opportunity(buy_candidates, "buy", hist_iteration)
-        best_sell = select_best_opportunity(sell_candidates, "sell", hist_iteration)
+        best_buy = select_best_opportunity(buy_candidates, "buy", i)
+        best_sell = select_best_opportunity(sell_candidates, "sell", i)
 
-        # Flow C: VWAP — use pre-computed top-of-book values (no max/min key scan)
+        # Flow C: rolling VWAP on top-of-book prices
         best_bid_price = order_book["_best_bid"]
         best_ask_price = order_book["_best_ask"]
         vol_best_bid = order_book["_vol_best_bid"]
@@ -314,13 +344,6 @@ def run_signals(
             }
         )
 
-        # ── Rolling VWAP ─────────────────────────────────────────────────────
-        # deque(maxlen=_vwap_window) acts as a self-evicting rolling window.
-        # The else branch (None) fires during the first _vwap_window-1 iterations
-        # while the window is still warming up.  None makes the VWAP gate
-        # transparent, mirroring the live system's warm-up behaviour.
-        #
-        # VWAP formula: bid_vwap = Σ(best_bid[t] × vol_bid[t]) / Σ(vol_bid[t])
         if len(vwap_deque) >= _vwap_window:
             bid_prices = np.array([s["best_bid"] for s in vwap_deque])
             bid_vols = np.array([s["vol_bid"] for s in vwap_deque])
@@ -332,40 +355,14 @@ def run_signals(
             bid_vwap = None
             ask_vwap = None
 
-        # Flow B: HMM regime update — two-speed refit.
-        # _predict_every lets sensitivity sweeps skip N-1 Viterbi passes
-        # between refits (reusing the previous regime label) for a speed-up
-        # proportional to _predict_every while preserving relative rankings.
-        rd.klines_df = features_df.iloc[i - _lookback : i]
-        rd.max_states = _max_regimes
-        if hist_iteration % _refit_every == 0:
-            try:
-                rd.select_hmm_model()  # full BIC re-fit
-            except RuntimeError as exc:
-                logging.warning(
-                    "signals: HMM refit failed at iteration %d — keeping "
-                    "previous model. (%s)",
-                    hist_iteration,
-                    exc,
-                )
-        elif hist_iteration % _predict_every == 0:
-            rd.predict_current_regime()  # cheap Viterbi pass
-        # else: reuse regime / confidence from the previous iteration
-        rd.assign_regime_labels()
-        regime = rd.regime_label
-        regime_confidence = rd.regime_confidence
-
         close_price = close_arr[i]
         half_spread = close_price * BACKTEST_FILL_SPREAD_BPS / 20_000.0
 
-        # Always capture raw candidate details for reporting (needed by
-        # _compute_stats in pnl.py to count raw candidates and blocked rates
-        # independently of which gates fired).
         signal = 0
         best_buy_micro = None
         best_sell_micro = None
-        buy_qty = None  # aq at the best-buy level  (ask-side qty we consume)
-        sell_qty = None  # bq at the best-sell level (bid-side qty we consume)
+        buy_qty = None
+        sell_qty = None
 
         if best_buy:
             best_buy_micro = float(best_buy[5])  # micro_price
@@ -374,24 +371,13 @@ def run_signals(
             best_sell_micro = float(best_sell[5])  # micro_price
             sell_qty = float(best_sell[6])  # bq
 
-        # --- confidence gate (mirrors low_latency_analysis in analysis.py) ---
-        # predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE means the
-        # model cannot distinguish the current state clearly enough to justify
-        # an order.  Skip both sides — ambiguous HMM signal treated as flat.
-        # While regime_confidence is None (warm-up / before first fit) the
-        # gate is transparent, matching the live system's behaviour.
+        # Confidence gate — mirrors low_latency_analysis in analysis.py.
+        # Transparent (True) when confidence is None (before first regime label).
         confidence_ok = (
             regime_confidence is None or regime_confidence >= HMM_MIN_CONFIDENCE
         )
 
-        # Combined gate (mirrors live low_latency_analysis)
-        # Threshold-gated mean-reversion: the dip / rally must be large enough
-        # to cover round-trip fees and leave a profit margin.
-        #   BUY  → price < bid_vwap × (1 − threshold)   [deep enough dip]
-        #          anchored to bid VWAP — the relevant pressure for buy-side.
-        #   SELL → price ≥ ask_vwap × (1 + threshold)   [strong enough rally]
-        #          anchored to ask VWAP — the relevant pressure for sell-side.
-        # Using separate anchors avoids cross-side VWAP bias.
+        # Combined gate — regime + VWAP dip/rally threshold.
         if confidence_ok:
             if best_buy and best_buy_micro is not None:
                 regime_ok = regime not in ("trending_down", "high_volatility")
@@ -413,24 +399,27 @@ def run_signals(
 
         records.append(
             {
-                "timestamp": timestamp,
-                "close": close_price,  # candle close — VWAP anchor
-                "half_spread": half_spread,  # bps-based taker fill cost: close × BACKTEST_FILL_SPREAD_BPS / 20_000
+                "timestamp": timestamps[i],
+                "close": close_price,
+                "high": high_arr[i],  # retained for whipsaw guard in pnl.py
+                "low": low_arr[i],  # retained for whipsaw guard in pnl.py
+                "half_spread": half_spread,
                 "signal": signal,
                 "regime": regime,
-                "regime_confidence": regime_confidence,  # posterior prob of winning state
+                "regime_confidence": regime_confidence,
                 "bid_vwap": bid_vwap,
                 "ask_vwap": ask_vwap,
                 "best_buy_micro": best_buy_micro,
                 "best_sell_micro": best_sell_micro,
-                "buy_qty": buy_qty,  # aq from best_buy candidate
-                "sell_qty": sell_qty,  # bq from best_sell candidate
+                "buy_qty": buy_qty,
+                "sell_qty": sell_qty,
             }
         )
 
     result = pd.DataFrame(records).set_index("timestamp")
     logging.info(
-        "Backtest complete: %d candles processed | BUY signals: %d | SELL signals: %d | HOLD: %d",
+        "Backtest complete: %d candles processed | BUY signals: %d | "
+        "SELL signals: %d | HOLD: %d",
         len(result),
         (result["signal"] == 1).sum(),
         (result["signal"] == -1).sum(),

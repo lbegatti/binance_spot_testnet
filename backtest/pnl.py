@@ -82,6 +82,7 @@ _POSITION_DUST_BTC: float = 1e-6
 def compute_buy_and_hold(
     signals: pd.DataFrame,
     initial_usdt: float = BACKTEST_INITIAL_CAPITAL,
+    initial_btc: float = BACKTEST_INITIAL_BTC,
     fee_rate: float = BACKTEST_FEE_RATE,
 ) -> dict[str, Any]:
     """
@@ -92,35 +93,45 @@ def compute_buy_and_hold(
         "Would simply holding BTC for the full window have been better
          or worse than the active strategy?"
 
+    The benchmark is computed on the **same initial portfolio** as the active
+    strategy (``initial_usdt`` USDT + ``initial_btc`` BTC already held), so
+    the denominator for ``bnh_total_return_pct`` matches the denominator used
+    by ``_compute_stats()`` for ``total_return_pct``.  Without this alignment
+    the two percentages are not comparable when ``initial_btc > 0``.
+
     Assumptions
     -----------
-    * Full ``initial_usdt`` capital is deployed at bar 0 (first non-NaN close).
-    * A single **entry fee** (``fee_rate × gross_buy``) is charged — you would
-      still pay a taker fee to acquire the BTC.
-    * No exit fee is applied — the position is held to session end without
-      selling.
-    * Entry price = first non-NaN ``close`` in ``signals`` (safe against HMM
-      warm-up NaN rows at the start of the window).
+    * The ``initial_usdt`` USDT is fully converted to BTC at bar 0 (first
+      non-NaN close), paying a taker fee of ``fee_rate × gross_buy``.
+    * Any BTC already held (``initial_btc``) is kept as-is — no extra fee.
+    * Total BTC = converted USDT BTC + pre-existing BTC, held to session end.
+    * No exit fee is applied — the position is held to session end.
+    * Entry price = first non-NaN ``close`` (safe against HMM warm-up NaN rows).
 
     Parameters
     ----------
     signals : pd.DataFrame
-        Output of ``backtest.signals.run_signals()``.  Must contain a
-        ``close`` column.
+        Must contain a ``close`` column.  Either the raw micro klines
+        DataFrame or the output of ``run_signals()`` works — only ``close``
+        is used.
     initial_usdt : float
-        Starting capital in USDT.  Defaults to ``BACKTEST_INITIAL_CAPITAL``.
+        Starting USDT balance.  Defaults to ``BACKTEST_INITIAL_CAPITAL``.
+    initial_btc : float
+        Starting BTC already held (NOT converted — included at no additional
+        fee).  Defaults to ``BACKTEST_INITIAL_BTC``.  Set to ``0.0`` for a
+        USDT-only portfolio.
     fee_rate : float
-        Taker fee fraction applied once at entry.  Defaults to
-        ``BACKTEST_FEE_RATE``.
+        Taker fee fraction applied once when converting USDT → BTC at entry.
+        Defaults to ``BACKTEST_FEE_RATE``.
 
     Returns
     -------
     dict with keys:
-        ``bnh_entry_price``      — close at bar 0 (first non-NaN).
-        ``bnh_exit_price``       — close at last bar.
-        ``bnh_btc_held``         — BTC quantity purchased at entry.
-        ``bnh_final_equity_usdt``— final value of the held BTC in USDT.
-        ``bnh_total_return_pct`` — net return (%), after deducting entry fee.
+        ``bnh_entry_price``       — close at bar 0 (first non-NaN).
+        ``bnh_exit_price``        — close at last bar.
+        ``bnh_btc_held``          — total BTC held (converted USDT + initial_btc).
+        ``bnh_final_equity_usdt`` — final value of all BTC in USDT.
+        ``bnh_total_return_pct``  — net return (%) vs full initial portfolio.
     """
     close_series = signals["close"].dropna()
     if close_series.empty:
@@ -134,22 +145,32 @@ def compute_buy_and_hold(
         }
 
     entry_price = float(close_series.iloc[0])
-    exit_price = float(signals["close"].dropna().iloc[-1])
+    exit_price = float(close_series.iloc[-1])
 
-    # Fee reduces the USDT available to deploy; the remaining USDT buys BTC.
-    # Equivalent to: gross_btc × (1 − fee_rate) — same result, cleaner arithmetic.
-    entry_fee = initial_usdt * fee_rate  # fee in USDT at entry
+    # Convert USDT → BTC at entry (fee charged on the gross buy).
+    entry_fee = initial_usdt * fee_rate  # USDT paid in fees
     net_usdt_deployed = initial_usdt - entry_fee  # USDT remaining after fee
-    btc_held = net_usdt_deployed / entry_price  # actual BTC held
+    btc_from_usdt = net_usdt_deployed / entry_price
+
+    # Total BTC = freshly bought BTC + pre-existing BTC (held at no extra cost).
+    btc_held = btc_from_usdt + initial_btc
 
     final_equity = btc_held * exit_price
-    total_return_pct = (final_equity - initial_usdt) / initial_usdt * 100
+
+    # Initial portfolio value = USDT + pre-existing BTC valued at entry price.
+    # This matches the denominator used by _compute_stats() so the two
+    # percentages (strategy vs BnH) are directly comparable.
+    initial_equity = initial_usdt + initial_btc * entry_price
+    total_return_pct = (final_equity - initial_equity) / initial_equity * 100
 
     log.info(
-        "Buy-and-hold: entry=%.2f  exit=%.2f  btc=%.6f  final=%.2f USDT  return=%.2f%%",
+        "Buy-and-hold: entry=%.2f  exit=%.2f  btc_total=%.6f  "
+        "(from_usdt=%.6f + initial=%.6f)  final=%.2f USDT  return=%.2f%%",
         entry_price,
         exit_price,
         btc_held,
+        btc_from_usdt,
+        initial_btc,
         final_equity,
         total_return_pct,
     )
@@ -207,7 +228,8 @@ def simulate_pnl(
     signals : pd.DataFrame
         Output of ``backtest.signals.run_signals()``.  Required columns:
         ``close``, ``signal`` (+1 / -1 / 0), ``buy_qty``, ``sell_qty``,
-        ``half_spread``, ``regime``, ``best_buy_micro``, ``ask_vwap``.
+        ``half_spread``, ``regime``, ``best_buy_micro``, ``best_sell_micro``,
+        ``ask_vwap``.  Optional (enables whipsaw guard): ``high``, ``low``.
     initial_usdt : float
         Starting USDT balance.  Defaults to ``BACKTEST_INITIAL_CAPITAL``.
     initial_btc : float
@@ -248,6 +270,16 @@ def simulate_pnl(
     # signals the position guard absorbed vs. how many actually executed.
     n_position_guard_skips: int = 0
 
+    # Count of forced pessimistic exits triggered by the intra-candle whipsaw
+    # guard (same 1-minute bar touched both BUY zone and SELL zone).
+    n_whipsaw_exits: int = 0
+
+    # Whipsaw guard requires the ``high`` and ``low`` columns added to the
+    # signals DataFrame by signals.py Step 3.  If absent (legacy frames or
+    # unit tests that construct a minimal DataFrame) the guard is silently
+    # disabled so backward-compat is preserved.
+    _has_whipsaw_cols = "high" in signals.columns and "low" in signals.columns
+
     trade_rows: list[dict] = []
     equity_rows: list[dict] = []
 
@@ -259,9 +291,75 @@ def simulate_pnl(
         ts = row.Index  # type: ignore[union-attr]
         close = float(row.close)  # type: ignore[union-attr]
         sig = int(row.signal)  # type: ignore[union-attr]
+        # Pre-extract half_spread once for use in the whipsaw guard below.
+        _half_spread_ws = (
+            float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
+        )
+
+        # ── Intra-candle whipsaw guard ─────────────────────────────────────────
+        # Fires when ALL of these hold:
+        #   • we hold an open strategy position (already long)
+        #   • the same 1-minute bar had low  ≤ best_buy_micro  (BUY zone reached)
+        #   • the same 1-minute bar had high ≥ best_sell_micro (SELL zone reached)
+        # At 1-minute bar resolution we cannot determine which extreme filled
+        # first, so we take the pessimistic assumption: force-close the position
+        # immediately at  low − half_spread  and skip normal signal processing
+        # for this bar.
+        _skip_signals = False
+        if _has_whipsaw_cols and open_strategy_qty > _POSITION_DUST_BTC:
+            _high = float(getattr(row, "high", float("nan")))
+            _low = float(getattr(row, "low", float("nan")))
+            _bsm = getattr(row, "best_buy_micro", None)
+            _ssm = getattr(row, "best_sell_micro", None)
+            if (
+                _bsm is not None
+                and pd.notna(_bsm)
+                and _ssm is not None
+                and pd.notna(_ssm)
+                and not np.isnan(_high)
+                and not np.isnan(_low)
+                and _low <= float(_bsm)  # low reached BUY zone
+                and _high >= float(_ssm)  # high also reached SELL zone
+            ):
+                _ws_price = _low - _half_spread_ws  # pessimistic fill
+                _ws_qty = min(open_strategy_qty, btc)
+                if _ws_qty > 0:
+                    _ws_gross = _ws_qty * _ws_price
+                    _ws_fee = abs(_ws_gross) * fee_rate
+                    _ws_proceeds = _ws_gross - _ws_fee
+                    usdt += _ws_proceeds
+                    btc -= _ws_qty
+                    open_strategy_qty = max(0.0, open_strategy_qty - _ws_qty)
+                    n_whipsaw_exits += 1
+                    trade_rows.append(
+                        {
+                            "timestamp": ts,
+                            "side": "SELL_WHIPSAW",
+                            "fill_price": _ws_price,
+                            "quantity": _ws_qty,
+                            "gross": _ws_gross,
+                            "fee": _ws_fee,
+                            "net_cost": None,
+                            "net_proceeds": _ws_proceeds,
+                            "regime": getattr(row, "regime", None),
+                        }
+                    )
+                    log.warning(
+                        "WHIPSAW │ FORCED EXIT │ %s │ qty=%.6f BTC │ "
+                        "exit=%.2f │ bar: low=%.2f(≤buy_micro=%.2f) "
+                        "high=%.2f(≥sell_micro=%.2f)",
+                        ts,
+                        _ws_qty,
+                        _ws_price,
+                        _low,
+                        float(_bsm),
+                        _high,
+                        float(_ssm),
+                    )
+                _skip_signals = True  # do not re-process BUY/SELL for this bar
 
         # BUY
-        if sig == 1:
+        if sig == 1 and not _skip_signals:
             # Position guard: skip if already holding a strategy-opened position.
             # Prevents stacking multiple overlapping BUY legs (grid behaviour)
             # and converts the strategy to proper single-position mean-reversion.
@@ -333,7 +431,7 @@ def simulate_pnl(
                     )
 
         # SELL
-        elif sig == -1:
+        elif sig == -1 and not _skip_signals:
             half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
 
             # Fill at the synthetic bid: close - half_spread.
@@ -443,6 +541,7 @@ def simulate_pnl(
         initial_btc,
         final_equity,
         n_position_guard_skips,
+        n_whipsaw_exits,
     )
 
     log.info(
@@ -515,7 +614,7 @@ def _pair_round_trips(
                 }
             )
 
-        elif row["side"] == "SELL" and not open_buys:
+        elif row["side"].startswith("SELL") and not open_buys:
             # Orphan SELL — no open BUY leg to match against.
             # Most likely cause: initial_btc > 0 and the first signal fired
             # is a SELL.  The cash flow is already correct in the equity curve
@@ -535,7 +634,7 @@ def _pair_round_trips(
                 float(row["fill_price"]),
             )
 
-        elif row["side"] == "SELL" and open_buys:
+        elif row["side"].startswith("SELL") and open_buys:
             exit_price: float = float(row["fill_price"])
             remaining_sell: float = float(row["quantity"])
 
@@ -599,10 +698,20 @@ def _pair_round_trips(
                         "  ║                   = %.4f USDT                             ║\n"
                         "  ║  3) Net Profit    = %.4f - %.4f = %+.4f USDT          ║\n"
                         "  ╚════════════════════════════════════════════════════════════╝",
-                        entry["price"], exit_price, matched_qty,
-                        exit_price, entry["price"], matched_qty, gross_pnl,
-                        entry_fee, exit_fee_, fee_rate, total_fees_,
-                        gross_pnl, total_fees_, pnl_usdt,
+                        entry["price"],
+                        exit_price,
+                        matched_qty,
+                        exit_price,
+                        entry["price"],
+                        matched_qty,
+                        gross_pnl,
+                        entry_fee,
+                        exit_fee_,
+                        fee_rate,
+                        total_fees_,
+                        gross_pnl,
+                        total_fees_,
+                        pnl_usdt,
                     )
                     _first_winner_logged = True
                 # ─────────────────────────────────────────────────────────
@@ -658,6 +767,7 @@ def _compute_stats(
     initial_btc: float,
     final_equity: float,
     n_position_guard_skips: int = 0,
+    n_whipsaw_exits: int = 0,
 ) -> dict[str, Any]:
     """
     Compute Step 5 performance metrics from the equity curve and round trips.
@@ -767,12 +877,11 @@ def _compute_stats(
     # produces a comparable Sharpe regardless of bucket size.
     #
     # Risk-free rate (Rf):
-    # Standard Sharpe = (mean(Rp) − Rf_per_period) / std(Rp) × √(periods_per_year)
     # BACKTEST_RISK_FREE_RATE is annualised (default 0.0 for crypto).
-    # It is converted to a per-period rate via linear scaling:
-    #   Rf_per_period = annual_rf / periods_per_year
-    # (exact compounding would give (1+rf)^(1/n)-1, but the difference is
-    # negligible at the low rates typically used and at high frequencies.)
+    # Exact compounding: Rf_per_period = (1 + annual_rf)^(1/n) − 1
+    # This is mathematically correct for all rate levels and degenerates
+    # to the linear approximation (rate/n) only at very small rates.
+    # At the default of 0.0 both forms give exactly 0 — no behavioural change.
     n_candles = len(equity_df)
     if n_candles >= 2 * 1440:  # ≥ 2 full days
         resample_freq, periods_per_year = "1D", 365
@@ -781,8 +890,8 @@ def _compute_stats(
     else:  # short / debug window
         resample_freq, periods_per_year = "5min", 365 * 24 * 12
 
-    # Per-period risk-free rate (linear approximation — negligible error)
-    rf_per_period = BACKTEST_RISK_FREE_RATE / periods_per_year
+    # Exact per-period risk-free rate via compounding: (1 + r_annual)^(1/n) − 1
+    rf_per_period = (1.0 + BACKTEST_RISK_FREE_RATE) ** (1.0 / periods_per_year) - 1.0
 
     sampled_equity = equity_df["equity"].resample(resample_freq).last().dropna()
     period_ret = sampled_equity.pct_change().dropna()
@@ -915,6 +1024,10 @@ def _compute_stats(
         # Position guard — BUY signals that fired but were suppressed because
         # the strategy already held an open position (single-position MR mode).
         "n_position_guard_skips": n_position_guard_skips,
+        # Whipsaw guard — forced pessimistic exits when same 1-minute bar touched
+        # both BUY zone (low ≤ best_buy_micro) and SELL zone (high ≥ best_sell_micro).
+        # Each event records a SELL_WHIPSAW trade at low − half_spread.
+        "n_whipsaw_exits": n_whipsaw_exits,
         # Filter hit rates — % of raw candidates blocked by each gate (sequentially)
         # confidence_filter: model posterior < HMM_MIN_CONFIDENCE → regime too uncertain to trade
         # regime_filter:     passed confidence but regime direction unfavourable (e.g. trending_down blocks BUY)

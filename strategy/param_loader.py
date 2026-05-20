@@ -113,7 +113,7 @@ If ``__init__`` were written as::
 
 Python evaluates the default expression ``HMM_LOOKBACK`` **once, at the
 ``def`` statement** (still import time).  The frozen default is
-``"2 hours ago UTC"`` and never changes — even if
+``"10 hours ago UTC"`` and never changes — even if
 ``rd_mod.HMM_LOOKBACK`` is later patched.  The ``None`` sentinel forces
 Python to re-read the module-level name **each time** ``__init__`` is called,
 making the patch visible.

@@ -163,11 +163,17 @@ def plot_backtest(
                 break
             _sell_row = _sells.iloc[_sell_idx]
             _qty = min(float(_buy_row["quantity"]), float(_sell_row["quantity"]))
-            _gross = (float(_sell_row["fill_price"]) - float(_buy_row["fill_price"])) * _qty
+            _gross = (
+                float(_sell_row["fill_price"]) - float(_buy_row["fill_price"])
+            ) * _qty
             if _gross > 0:
                 # Prorate the recorded fees to the matched quantity.
-                _entry_fee = float(_buy_row["fee"]) * (_qty / float(_buy_row["quantity"]))
-                _exit_fee = float(_sell_row["fee"]) * (_qty / float(_sell_row["quantity"]))
+                _entry_fee = float(_buy_row["fee"]) * (
+                    _qty / float(_buy_row["quantity"])
+                )
+                _exit_fee = float(_sell_row["fee"]) * (
+                    _qty / float(_sell_row["quantity"])
+                )
                 _total_fees = _entry_fee + _exit_fee
                 _net = _gross - _total_fees
                 log.info(
@@ -184,14 +190,23 @@ def plot_backtest(
                     "  ║  1) Gross Profit  = (%.4f - %.4f) × %.6f             ║\n"
                     "  ║                   = %+.4f USDT                            ║\n"
                     "  ║  2) Total Fees    = entry_fee %.4f + exit_fee %.4f     ║\n"
-                    "  ║     (from trades_df[\"fee\"] column, prorated to matched qty)║\n"
+                    '  ║     (from trades_df["fee"] column, prorated to matched qty)║\n'
                     "  ║                   = %.4f USDT                             ║\n"
                     "  ║  3) Net Profit    = %.4f - %.4f = %+.4f USDT          ║\n"
                     "  ╚════════════════════════════════════════════════════════════╝",
-                    float(_buy_row["fill_price"]), float(_sell_row["fill_price"]), _qty,
-                    float(_sell_row["fill_price"]), float(_buy_row["fill_price"]), _qty, _gross,
-                    _entry_fee, _exit_fee, _total_fees,
-                    _gross, _total_fees, _net,
+                    float(_buy_row["fill_price"]),
+                    float(_sell_row["fill_price"]),
+                    _qty,
+                    float(_sell_row["fill_price"]),
+                    float(_buy_row["fill_price"]),
+                    _qty,
+                    _gross,
+                    _entry_fee,
+                    _exit_fee,
+                    _total_fees,
+                    _gross,
+                    _total_fees,
+                    _net,
                 )
                 break
             _sell_idx += 1
