@@ -114,7 +114,10 @@ def run_backtest(
         If ``True`` (and ``plot=True``), persist the figure as a timestamped
         PNG in ``backtest/results/`` (requires ``kaleido``; falls back to
         HTML if not installed).  Has no effect when ``plot=False``.
-        Default ``False``.
+        When invoked via ``python -m backtest.runner`` this defaults to
+        ``True`` so that every run automatically saves a chart; pass
+        ``--no-plot`` to suppress both display and saving.
+        Default ``False`` for programmatic/library use.
 
     Returns
     -------
@@ -223,11 +226,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Save trades_<ts>.csv and equity_<ts>.csv to backtest/results/.",
     )
-    parser.add_argument(
-        "--save-png",
-        action="store_true",
-        help="Save the Plotly chart as a PNG (requires kaleido; implies --plot).",
-    )
+    # --save-png kept for backwards-compatibility but is now a no-op:
+    # the chart is always saved when plot is active (i.e. unless --no-plot).
     parser.add_argument(
         "--flush-cache",
         action="store_true",
@@ -246,6 +246,6 @@ if __name__ == "__main__":
 
     run_backtest(
         export_csv=args.csv,
-        plot=(not args.no_plot) or args.save_png,
-        save_png=args.save_png,
+        plot=not args.no_plot,
+        save_png=not args.no_plot,  # always save chart to results/ unless headless
     )

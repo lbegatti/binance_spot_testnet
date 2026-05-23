@@ -84,7 +84,7 @@ HMM_N_INIT = 10
 #   train_end = max(2, int(n_rows × 2/3))   (~⅔ train, ~⅓ test)
 # At the default 120-row window this gives train_end = 80 (= HMM_TRAIN_ROWS),
 # but shorter windows now scale proportionally instead of collapsing to 1 test row.
-HMM_TRAIN_ROWS = 80
+# HMM_TRAIN_ROWS is derived from HMM_LOOKBACK_ROWS — see below.
 # Minimum posterior probability for regime gating.
 # predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE → iteration skipped.
 # 0.70 = 70 % probability mass required on the winning state.
@@ -147,16 +147,15 @@ VOLUME_DECAY_FACTOR = 0.80
 # the backtest uses the same rolling-window logic as websocket_main.py.
 HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 10 h at 5 m (120 × 5 min = 600 min)
 VWAP_WINDOW = 5  # rolling VWAP window (rows) — 25 min at 5 m (micro frame)
-REFIT_EVERY = 480  # full BIC re-fit every N macro candles (= 40 h at 5 m)
+REFIT_EVERY = 360  # full BIC re-fit every N macro candles (= 20 h at 5 m)
 # Aligned with SENSITIVITY_REFIT_EVERY so the OOS validation
 # in runner.py uses the same HMM cadence as the IS optimisation
 # in sensitivity.py — makes IS↔OOS Sharpe comparisons
-# apples-to-apples.  → ~54 refits over the 90-day OOS window.
 
 # Sensitivity-sweep override for backtest/sensitivity.py — kept equal to REFIT_EVERY
 # so IS and OOS regime classification use the same cadence.  Defined as a separate
 # constant so sensitivity.py can be overridden independently if needed in future.
-SENSITIVITY_REFIT_EVERY = 480
+SENSITIVITY_REFIT_EVERY = 360
 # How many macro candles to skip between cheap Viterbi passes in sensitivity.py.
 # Between two predict calls the last known regime label is reused (forward-filled
 # onto the 1m micro frame via merge_asof).
@@ -196,7 +195,7 @@ BACKTEST_FEE_RATE = 0.001  # 0.10 %
 # Annualised risk-free rate for Sharpe / Sortino.
 # pnl.py converts this to a per-period rate automatically.
 # Set to 0.04–0.05 for a US T-bill proxy; 0.0 is the standard in crypto research.
-BACKTEST_RISK_FREE_RATE = 0.03  # annualised (0.0 = no risk-free rate adjustment)
+BACKTEST_RISK_FREE_RATE = 0.00  # annualised (0.0 = no risk-free rate adjustment)
 
 # Fill-cost model: simulated bid-ask half-spread in basis points.
 #   half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
