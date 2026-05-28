@@ -1,6 +1,5 @@
 from binance.client import Client
 
-
 # =============================================================================
 # config_parameters.py — central configuration file
 # All tunable constants live here. Edit this file to adjust behaviour across
@@ -217,6 +216,24 @@ BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
 # the balance every round trip.  0.10 → at most 10 % risked per signal.
 # Set to 1.0 to revert to full all-in behaviour.
 BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
+
+# -- Trend-pause filter (macro frame, backtest/signals.py) ----------------
+# Pauses all new BUY/SELL entries when the macro frame shows N consecutive
+# same-direction closes (sustained trend).  Trading resumes after the streak
+# breaks AND TREND_COOLDOWN_BARS additional ranging bars have elapsed.
+TREND_CONSECUTIVE_BARS: int = 4  # N consecutive same-direction 5m closes → pause (= 15 min)
+# Fixed from Optuna study 2026-05-24 — removed from search space.
+TREND_COOLDOWN_BARS: int = 5  # extra macro bars to stay paused after trend ends (= 20 min)
+# Fixed from Optuna study 2026-05-24 — removed from search space.
+
+# -- Adaptive stop-loss (backtest/signals.py + pnl.py) --------------------
+# Forces a SELL when the open position's unrealised loss exceeds a dynamic
+# threshold derived from rolling daily volatility — no fixed percentage needed.
+#   threshold(t) = STOP_LOSS_STD_MULT × rolling_std(daily_abs_return, STOP_LOSS_ROLLING_DAYS)
+# In normal BTC vol (~1–1.5 % daily std) this gives ~3–4.5 % stop distance.
+# DO NOT add these to the Optuna search space — the formula is self-calibrating.
+STOP_LOSS_ROLLING_DAYS: int = 90  # lookback window for rolling std of daily abs returns
+STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
 
 # ---------------------------------------------------------------------------
 # VWAP gate — applies to BOTH live system AND backtest

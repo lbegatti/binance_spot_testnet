@@ -324,6 +324,34 @@ This guard is mirrored exactly in `strategy/analysis.py`
 (`AnalysisEngine._position_open`) for the live system, ensuring the backtest
 and live strategy share the same single-position mean-reversion behaviour.
 
+### Stop-loss vs Buy-and-Hold: asymmetric trade-off
+
+After a stop-loss fires the strategy holds **USDT (cash)** until the next
+qualifying BUY signal.  The **Buy-and-Hold (B&H) benchmark** holds BTC for the
+entire window without ever exitng.  This creates an intentional asymmetry that
+is visible in Panel 1 of the backtest chart (B&H dashed orange line):
+
+| Scenario after SL fires | Strategy | B&H |
+|---|---|---|
+| BTC keeps falling | ✅ Capital preserved (USDT holds value) | ❌ Continues to lose |
+| BTC rebounds immediately | ❌ Misses the recovery (still in cash) | ✅ Recovers fully |
+| BTC consolidates → new signal | Depends on re-entry speed | ✅ Already long |
+
+**What the chart tells you:**
+- **B&H beats strategy** on a sub-window → the SL fired during a dip that
+  recovered and the strategy did not re-enter fast enough (opportunity cost).
+- **Strategy beats B&H** → the SL avoided a sustained drawdown and re-entered
+  at a lower price (protection value exceeded missed-rebound cost).
+
+The goal is *not* to beat B&H on every sub-window but to outperform it on a
+**risk-adjusted** basis (higher Sharpe, lower max drawdown) over the full OOS window.
+
+**Calibration lever:** `STOP_LOSS_STD_MULT` (default 3.0, in `config_parameters.py`)
+- Too tight → fires on normal volatility → many missed rebounds → lags B&H.
+- Too loose → rarely fires → little protection → tracks B&H passively.
+Monitor `n_stop_loss_fires` in the console report after each OOS run and adjust
+`STOP_LOSS_STD_MULT` accordingly (increase to loosen, decrease to tighten).
+
 ### Trade sizing
 - The candidate tuple from the production pipeline contains `bq` (bid quantity)
   and `aq` (ask quantity) — the same values `OrderExecutor.execute()` uses to
@@ -406,6 +434,7 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 | Metric | Key in `stats` dict | Formula / Description |
 |---|---|---|
 | **Total return** | `total_return_pct` | `(final_equity − initial_equity) / initial_equity × 100` |
+| **Buy-and-Hold return** | `bnh_total_return_pct` | Passive benchmark: buy at the first close, hold for the full window.  Computed by `compute_buy_and_hold()` on the same initial portfolio so the two percentages share the same denominator and are directly comparable.  Shown as a dashed orange line in the equity panel and in the figure title |
 | **Win rate** | `win_rate_pct` | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0` |
 | **Average trade PnL** | `avg_trade_pnl_usdt` | `mean(pnl_usdt)` over all round trips |
 | **Max drawdown** | `max_drawdown_pct` | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline |
@@ -418,6 +447,8 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 | **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate) |
 | **Position guard skips** | `n_position_guard_skips` | Count of BUY signals that passed all three gates but were suppressed because the strategy already held an open position (`open_strategy_qty > 0`) — single-position mean-reversion mode |
 | **Whipsaw exits** | `n_whipsaw_exits` | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread` |
+| **Stop-loss fires** | `n_stop_loss_fires` | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance |
+| **Trend-pause skips** | `n_trend_pause_skips` | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars |
 
 ---
 
@@ -1204,5 +1235,5 @@ concrete file in `backtest/`.
 
 ---
 
-*Document last updated: 2026-05-18*
+*Document last updated: 2026-05-28*
 

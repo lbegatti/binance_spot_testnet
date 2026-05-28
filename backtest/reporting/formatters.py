@@ -150,6 +150,9 @@ def print_report(
     n_sell = stats["n_sell_signals"]
     n_hold = int((signals["signal"] == 0).sum())
     n_guard = stats.get("n_position_guard_skips", 0)
+    n_whipsaw = stats.get("n_whipsaw_exits", 0)
+    n_stop_loss = stats.get("n_stop_loss_fires", 0)
+    n_trend_pause = stats.get("n_trend_pause_skips", 0)
     conf_hit = stats.get("confidence_filter_hit_rate_pct", float("nan"))
     regime_hit = stats["regime_filter_hit_rate_pct"]
     vwap_hit = stats["vwap_filter_hit_rate_pct"]
@@ -164,6 +167,15 @@ def print_report(
     print(f"  HOLD (no signal)           :  {n_hold:>8,}")
     print(
         f"  HOLD (position open)       :  {n_guard:>8,}  ← BUY suppressed by position guard"
+    )
+    print(
+        f"  Whipsaw exits              :  {n_whipsaw:>8,}  ← forced SELL (same bar hit BUY+SELL zone)"
+    )
+    print(
+        f"  Trend-pause skips          :  {n_trend_pause:>8,}  ← bars suppressed during sustained trend"
+    )
+    print(
+        f"  Stop-loss fires            :  {n_stop_loss:>8,}  ← positions force-closed by adaptive SL"
     )
     print(f"  Confidence filter blocked  :  {fmt(conf_hit, '.1f')} % of raw candidates")
     print(

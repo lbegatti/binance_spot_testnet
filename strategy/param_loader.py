@@ -342,6 +342,8 @@ def load_best_params_for_backtest() -> dict:
         ("vwap_window", int),
         ("vwap_threshold", float),
         ("fee_rate", float),
+        # trend_consecutive_bars / trend_cooldown_bars removed 2026-05-24:
+        # fixed in config_parameters.py, no longer stored in best_params.json.
     ):
         if key in best:
             result[key] = cast(best[key])

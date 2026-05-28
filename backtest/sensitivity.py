@@ -90,6 +90,7 @@ from backtest.reporting.formatters import (
     print_sensitivity_table,
 )
 from backtest.signals import run_signals
+from backtest.visualization import plot_backtest
 from config_parameters import (
     BACKTEST_INITIAL_BTC,
     BACKTEST_LOOKBACK,
@@ -149,7 +150,6 @@ _PARAM_GRID: dict[str, list[Any]] = {
     ],  # default=20 min; tests short (5,10) and long (40,60)
 }
 
-
 _OPTUNA_SPACE: dict[str, tuple] = {
     "hmm_lookback_rows": ("int", 30, 240, 10),
     "hmm_max_regimes": ("int", 2, 4, 1),
@@ -160,6 +160,10 @@ _OPTUNA_SPACE: dict[str, tuple] = {
         5,
     ),  # 12 values: 5,10,15…60 min; step=5 keeps trials tractable
     "vwap_threshold": ("float", 0.001, 0.005, 0.0005),
+    # trend_consecutive_bars and trend_cooldown_bars removed from Optuna search space
+    # (2026-05-24): fixed at TREND_CONSECUTIVE_BARS=3 / TREND_COOLDOWN_BARS=4 in
+    # config_parameters.py based on the best values found in the first Optuna run.
+    # Iterative optimisation: tune 4 core params first, revisit trend params later.
 }
 
 
@@ -413,11 +417,16 @@ def _save_optuna_plots(study: optuna.Study) -> None:
         return
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
+    # IS window label for chart titles
+    _is_label = f"IS: {BACKTEST_LOOKBACK} → {BACKTEST_OOS_START}  |  run: {run_date}  |  {len(completed)} trials"
 
     # 1. Optimisation history — always available after ≥ 1 trial
     try:
         fig = plot_optimization_history(study)
+        fig.update_layout(title=f"Optuna — Optimisation History  |  {_is_label}")
         path = _REPORTING_DIR / f"optuna_history_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna history chart → %s", path)
@@ -434,6 +443,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 2. Parameter importance
     try:
         fig = plot_param_importances(study)
+        fig.update_layout(title=f"Optuna — Parameter Importance  |  {_is_label}")
         path = _REPORTING_DIR / f"optuna_importance_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna importance chart → %s", path)
@@ -443,6 +453,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 3. Contour — hmm_lookback_rows × vwap_window (the two continuous knobs)
     try:
         fig = plot_contour(study, params=["hmm_lookback_rows", "vwap_window"])
+        fig.update_layout(title=f"Optuna — Contour (hmm_lookback_rows × vwap_window)  |  {_is_label}")
         path = _REPORTING_DIR / f"optuna_contour_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna contour chart → %s", path)
@@ -451,8 +462,8 @@ def _save_optuna_plots(study: optuna.Study) -> None:
 
 
 def _run_sensitivity_optuna_study(
-    n_trials: int = 30,
-    lookback: str | None = None,
+        n_trials: int = 40,
+        lookback: str | None = None,
 ) -> pd.DataFrame:
     """
     Run the Bayesian sensitivity study using Optuna TPE and return results.
@@ -464,9 +475,11 @@ def _run_sensitivity_optuna_study(
     ----------
     n_trials : int
         Number of Optuna trials to run.  Each trial calls ``_run_one()`` once.
-        Default 40 (~5–8 h on a laptop, ~8–12 min per trial).
+        Default 40 (~5–8 h on a laptop).
+        Reduced from 60 to 40 after trend_consecutive_bars / trend_cooldown_bars
+        were removed from the search space (now 4 params, was 6).
         TPE warm-up is 10 random trials; exploitation begins at trial 11.
-        Use 20 for a faster ~2.5–4 h run.
+        Use 60 for a thorough deep search.
     lookback : str | None
         dateutil string overriding ``SENSITIVITY_LOOKBACK`` for this run only.
         Example: ``"180 days ago UTC"`` for a deep-calibration run.
@@ -501,8 +514,8 @@ def _run_sensitivity_optuna_study(
     # trials on top rather than restarting, but it still commits hours of
     # compute and may overwrite best_params.json with a new best.
     if not _check_existing_best_params(
-        mode=f"bayes (adding {n_trials} more Optuna trials)",
-        extra_note="The study resumes — prior trials are kept and result can only improve.",
+            mode=f"bayes (adding {n_trials} more Optuna trials)",
+            extra_note="The study resumes — prior trials are kept and result can only improve.",
     ):
         return pd.DataFrame()
 
@@ -568,7 +581,7 @@ def _run_sensitivity_optuna_study(
         study_name=study_name,
         storage=f"sqlite:///{_optuna_db}",
         load_if_exists=True,  # resume if interrupted ON THE SAME DAY — trials not re-run
-        sampler=optuna.samplers.TPESampler(seed=42),
+        sampler=optuna.samplers.TPESampler(seed=42),  # type: ignore[arg-type]
     )
 
     already_done = len(
@@ -644,23 +657,36 @@ def _run_sensitivity_optuna_study(
         # Re-run the best trial's params on current data BEFORE saving.
         # This ensures best_params.json always reflects today's window, not a
         # stale Sharpe from a previous day that still lives in the Optuna DB.
+        # _run_one_full also returns signals/trades/equity for the IS chart.
         log.info(
-            "Re-running best trial params to compute full stats for B&H comparison…"
+            "Re-running best trial params to compute full stats for B&H comparison and IS chart…"
         )
+        best_signals = best_trades = best_equity = None
         try:
-            best_full = _run_one(study.best_params, df_macro, df_micro)
+            best_full, best_signals, best_trades, best_equity = _run_one_full(
+                study.best_params, df_macro, df_micro
+            )
             best_series = pd.Series({**best_full, **bnh})
             # Save using the CURRENT-data stats so source_value is honest.
             _save_best_params(best_series)
         except Exception:
             log.warning(
                 "Could not re-run best trial — falling back to trial row "
-                "(B&H comparison may be skipped).",
+                "(B&H comparison may be skipped and IS chart not saved).",
                 exc_info=True,
             )
             best_series = valid.iloc[0]
             _save_best_params(best_series)
         print_bnh_comparison(best_series)
+        if best_signals is not None:
+            assert best_trades is not None and best_equity is not None  # set together with best_signals
+            _plot_is_chart(
+                best_params=study.best_params,
+                best_stats=best_series.to_dict(),
+                signals=best_signals,
+                trades=best_trades,
+                equity=best_equity,
+            )
     else:
         log.warning("No valid Optuna trials to save as best_params.json.")
 
@@ -671,9 +697,9 @@ def _run_sensitivity_optuna_study(
 
 
 def _run_one(
-    params: dict[str, Any],
-    prefetched_macro: pd.DataFrame,
-    prefetched_micro: pd.DataFrame,
+        params: dict[str, Any],
+        prefetched_macro: pd.DataFrame,
+        prefetched_micro: pd.DataFrame,
 ) -> dict[str, Any]:
     """
     Execute one full backtest with the given parameter overrides.
@@ -712,6 +738,8 @@ def _run_one(
     # run_signals() uses SENSITIVITY_REFIT_EVERY for a speedup: fewer full BIC
     # refits on the 5-minute macro walk-forward without changing relative rankings.
     # prefetched_macro / prefetched_micro are passed directly — no API calls.
+    # trend_consecutive_bars / trend_cooldown_bars are NOT passed here — they are
+    # fixed in config_parameters.py and run_signals() uses the config defaults.
     signals = run_signals(
         hmm_lookback_rows=params["hmm_lookback_rows"],
         hmm_max_regimes=params["hmm_max_regimes"],
@@ -730,9 +758,91 @@ def _run_one(
     return {**params, "fee_rate": _fee, "vwap_threshold": _threshold, **stats}
 
 
+def _run_one_full(
+        params: dict[str, Any],
+        prefetched_macro: pd.DataFrame,
+        prefetched_micro: pd.DataFrame,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Like ``_run_one`` but also returns ``(signals, trades, equity)`` for
+    visualisation.  Used only for the final best-params re-run at the end of
+    the Bayesian / OAT / full-grid study so that ``plot_backtest()`` can draw
+    the IS sensitivity chart without an extra API call.
+
+    Returns
+    -------
+    result_dict : dict
+        Same as ``_run_one()`` — params merged with stats.
+    signals : pd.DataFrame
+    trades : pd.DataFrame
+    equity : pd.DataFrame
+    """
+    _fee = SENSITIVITY_FEE_RATE
+    _threshold = params.get("vwap_threshold", VWAP_THRESHOLD_MULTIPLIER)
+    log.info(
+        "Re-running best params for IS chart: lookback=%d  max_regimes=%d  "
+        "vwap=%d  threshold=%.4f%%  fee=%.4f%%",
+        params["hmm_lookback_rows"],
+        params["hmm_max_regimes"],
+        params["vwap_window"],
+        _threshold * 100,
+        _fee * 100,
+    )
+    signals = run_signals(
+        hmm_lookback_rows=params["hmm_lookback_rows"],
+        hmm_max_regimes=params["hmm_max_regimes"],
+        vwap_window=params["vwap_window"],
+        vwap_threshold=_threshold,
+        refit_every=SENSITIVITY_REFIT_EVERY,
+        predict_every=SENSITIVITY_PREDICT_EVERY,
+        prefetched_macro=prefetched_macro,
+        prefetched_micro=prefetched_micro,
+    )
+    trades, equity, stats = simulate_pnl(signals, fee_rate=_fee)
+    result_dict = {**params, "fee_rate": _fee, "vwap_threshold": _threshold, **stats}
+    return result_dict, signals, trades, equity
+
+
 # ---------------------------------------------------------------------------
-# Results formatting
+# IS chart helper
 # ---------------------------------------------------------------------------
+
+def _plot_is_chart(
+        best_params: dict[str, Any],
+        best_stats: dict[str, Any],
+        signals: pd.DataFrame,
+        trades: pd.DataFrame,
+        equity: pd.DataFrame,
+) -> None:
+    """
+    Generate and save the IS sensitivity chart using the best-params re-run data.
+    Opens no browser window — the file is saved to
+    ``backtest/results/sensitivity_chart_<ts>.html`` (or ``.png`` if kaleido is
+    installed) for manual inspection.
+
+    Labelled ``"IS (Sensitivity)"`` in the title so it is visually distinct
+    from the OOS chart produced by ``runner.py`` (labelled ``"Backtest"``).
+    The date range in the title comes from the IS window (BACKTEST_LOOKBACK
+    → BACKTEST_OOS_START), so both charts can be compared at a glance.
+    """
+    try:
+        plot_backtest(
+            signals,
+            trades,
+            equity,
+            best_stats,
+            save_png=True,  # triggers _save_figure → HTML fallback (kaleido absent) or PNG
+            show=False,  # headless — save file only; user opens manually
+            title_prefix="IS (Sensitivity)",
+            file_prefix="sensitivity_chart",
+        )
+    except Exception:
+        log.warning(
+            "IS chart generation failed — chart not saved.  "
+            "The best_params.json and sensitivity CSV are unaffected.",
+            exc_info=True,
+        )
+
 
 _DISPLAY_COLS = [
     "hmm_lookback_rows",
@@ -831,7 +941,7 @@ def _save_best_params(best_row: pd.Series) -> None:
 
 
 def run_sensitivity(
-    full_grid: bool = True, lookback: str | None = None
+        full_grid: bool = True, lookback: str | None = None
 ) -> pd.DataFrame:
     """
     Execute the sensitivity sweep and return the results DataFrame.
@@ -951,7 +1061,7 @@ def run_sensitivity(
             (results_df["hmm_lookback_rows"] == defaults["hmm_lookback_rows"])
             & (results_df["hmm_max_regimes"] == defaults["hmm_max_regimes"])
             & (results_df["vwap_window"] == defaults["vwap_window"])
-        ]
+            ]
         if not baseline_rows.empty:
             baseline_sharpe = float(baseline_rows.iloc[0][SENSITIVITY_RANK_METRIC])
             trigger = print_oat_sensitivity_report(
@@ -975,6 +1085,26 @@ def run_sensitivity(
     if not valid.empty:
         _save_best_params(valid.iloc[0])
         print_bnh_comparison(valid.iloc[0])
+        # Re-run best for IS chart — extract only the keys _run_one_full needs.
+        _param_keys = list(_PARAM_GRID.keys()) + ["vwap_threshold"]
+        best_row = valid.iloc[0]
+        best_params_dict = {k: best_row[k] for k in _param_keys if k in best_row.index}
+        try:
+            best_full, best_signals, best_trades, best_equity = _run_one_full(
+                best_params_dict, df_macro, df_micro
+            )
+            best_stats = {**best_row.to_dict(), **best_full}
+            _plot_is_chart(
+                best_params=best_params_dict,
+                best_stats=best_stats,
+                signals=best_signals,
+                trades=best_trades,
+                equity=best_equity,
+            )
+        except Exception:
+            log.warning(
+                "Could not generate IS chart for OAT/grid best run.", exc_info=True
+            )
     else:
         log.warning("No valid results to save as best_params.json.")
 
@@ -1028,8 +1158,11 @@ if __name__ == "__main__":
         default=40,
         help=(
             "Number of Optuna trials for --bayes (default: 40, ~5–8 h). "
+            "Reduced to 40 from 60 after trend_consecutive_bars / trend_cooldown_bars "
+            "were removed from the search space (now 4 params: hmm_lookback_rows, "
+            "hmm_max_regimes, vwap_window, vwap_threshold). "
             "TPE warm-up is 10 random trials; exploitation begins at trial 11. "
-            "Use 20 for a faster ~2.5–4 h run, 30 for a middle ground."
+            "The study is resumable — interrupted runs continue from where they left off."
         ),
     )
     parser.add_argument(

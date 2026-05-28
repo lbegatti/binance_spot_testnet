@@ -24,6 +24,10 @@ from config_parameters import (
     BACKTEST_FILL_SPREAD_BPS,
     HMM_MAX_REGIMES,
     VWAP_THRESHOLD_MULTIPLIER,
+    TREND_CONSECUTIVE_BARS,
+    TREND_COOLDOWN_BARS,
+    STOP_LOSS_ROLLING_DAYS,
+    STOP_LOSS_STD_MULT,
 )
 
 logging.basicConfig(
@@ -63,6 +67,51 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
     return klines_df.dropna()
 
 
+def _add_trend_pause_flag(
+    df_macro: pd.DataFrame,
+    n: int,
+    cooldown: int,
+) -> pd.Series:
+    """
+    Compute a boolean ``trend_pause`` Series on the macro (5 m) frame.
+
+    True  → ``n`` or more consecutive same-direction closes detected;
+             mean-reversion entries should be suppressed.
+    False → market is ranging; normal signal logic applies.
+
+    The streak counter resets automatically when the close direction flips,
+    so no explicit "trend end" detection is required.  The cooldown then keeps
+    ``paused=True`` for ``cooldown`` bars after the last trending bar, preventing
+    whipsaw re-entry the instant the streak breaks.
+
+    NaN rows at the start (HMM warm-up period) have direction filled to 0 so
+    they never artificially trigger a trend pause.  Flat streaks (direction == 0,
+    i.e. consecutive equal closes) are excluded from trend detection.
+    """
+    close = df_macro["close"]
+    # +1 up-close, -1 down-close, 0 flat; NaN at row 0 filled to 0 (no direction)
+    direction = np.sign(close.diff()).fillna(0)
+
+    # Cumulative group ID increments on every direction change.
+    # cumcount()+1 gives the streak length: 1 on the first bar of each run.
+    streak = (
+        direction.groupby(
+            (direction != direction.shift()).cumsum()
+        ).cumcount() + 1
+    )
+
+    # A bar "is in trend" when streak ≥ n AND direction is not flat.
+    in_trend = (streak >= n) & (direction != 0)
+
+    # Cooldown: OR with shifted versions to stay paused for `cooldown` extra bars
+    # after the last in_trend=True bar (counted from the END of the streak).
+    paused = in_trend.copy()
+    for lag in range(1, cooldown + 1):
+        paused = paused | in_trend.shift(lag).fillna(False)
+
+    return paused.astype(bool)
+
+
 def run_signals(
     prefetched_macro: pd.DataFrame | None = None,
     prefetched_micro: pd.DataFrame | None = None,
@@ -74,6 +123,8 @@ def run_signals(
     refit_every: int | None = None,
     predict_every: int | None = None,
     vwap_threshold: float | None = None,
+    trend_consecutive_bars: int | None = None,
+    trend_cooldown_bars: int | None = None,
 ) -> pd.DataFrame:
     """
     Replay the full trading pipeline on historical klines using a
@@ -184,6 +235,14 @@ def run_signals(
     _vwap_threshold = (
         vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
     )
+    _trend_consecutive = (
+        trend_consecutive_bars if trend_consecutive_bars is not None
+        else TREND_CONSECUTIVE_BARS
+    )
+    _trend_cooldown = (
+        trend_cooldown_bars if trend_cooldown_bars is not None
+        else TREND_COOLDOWN_BARS
+    )
 
     # ── 1. Fetch / accept raw OHLCV frames ───────────────────────────────────
     if prefetched_macro is not None:
@@ -226,6 +285,20 @@ def run_signals(
         rd.regime_confidence or 0.0,
     )
 
+    # Compute trend_pause vectorially on the full macro frame BEFORE the loop.
+    # Indexed by position so trend_pause_series.iloc[i] aligns with features_macro[i].
+    trend_pause_series = _add_trend_pause_flag(
+        features_macro, n=_trend_consecutive, cooldown=_trend_cooldown
+    )
+    logging.info(
+        "Trend-pause flag computed (n=%d consecutive bars, cooldown=%d bars): "
+        "%d / %d macro bars flagged as trending.",
+        _trend_consecutive,
+        _trend_cooldown,
+        int(trend_pause_series.sum()),
+        len(trend_pause_series),
+    )
+
     macro_timestamps = features_macro.index
     macro_records: list[dict] = []
     macro_iteration = 0
@@ -255,6 +328,7 @@ def run_signals(
                 "timestamp": macro_timestamps[i],
                 "regime": rd.regime_label,
                 "regime_confidence": rd.regime_confidence,
+                "trend_pause": bool(trend_pause_series.iloc[i]),
             }
         )
 
@@ -284,6 +358,42 @@ def run_signals(
         len(df_micro) - len(df_exec),
     )
 
+    # Fill any NaN trend_pause values left by the stitch with False (no pause).
+    df_exec["trend_pause"] = df_exec["trend_pause"].fillna(False).astype(bool)
+
+    # ── Adaptive stop-loss threshold (daily rolling std of |daily return|) ────
+    # Resamples df_macro_raw to daily bars, computes the rolling std of
+    # daily absolute pct-changes, multiplies by STOP_LOSS_STD_MULT, and
+    # forward-fills onto df_exec via merge_asof.
+
+    # Result: each 1-minute bar
+    # carries the most recent daily-updated stop-loss threshold — no look-ahead.
+    _sl_daily = df_macro_raw[["close"]].resample("1D").last().dropna()
+    _sl_daily["abs_return"] = _sl_daily["close"].pct_change().abs()
+    _sl_daily["stop_loss_pct"] = (
+        _sl_daily["abs_return"]
+        .rolling(STOP_LOSS_ROLLING_DAYS, min_periods=1)
+        .std()
+        * STOP_LOSS_STD_MULT
+    )
+    df_exec = pd.merge_asof(
+        df_exec.sort_index(),
+        _sl_daily[["stop_loss_pct"]].sort_index(),
+        left_index=True,
+        right_index=True,
+        direction="backward",
+    )
+    df_exec["stop_loss_pct"] = df_exec["stop_loss_pct"].fillna(0.0)
+    logging.info(
+        "Stop-loss pct merged onto execution frame "
+        "(daily rolling %d-day std × %.1f); "
+        "median threshold: %.4f (%.2f%%).",
+        STOP_LOSS_ROLLING_DAYS,
+        STOP_LOSS_STD_MULT,
+        df_exec["stop_loss_pct"].median(),
+        df_exec["stop_loss_pct"].median() * 100,
+    )
+
     # ── Phase 3 — Execution loop on 1-minute bars ────────────────────────────
     # Pre-extract columns as numpy arrays to avoid ~390k pandas iloc() calls.
     close_arr = df_exec["close"].to_numpy()
@@ -293,6 +403,8 @@ def run_signals(
     tbv_arr = df_exec["taker_buy_base_vol"].to_numpy()
     regime_arr = df_exec["regime"].to_numpy()
     confidence_arr = df_exec["regime_confidence"].to_numpy(dtype=object)
+    trend_pause_arr = df_exec["trend_pause"].to_numpy(dtype=bool)
+    stop_loss_pct_arr = df_exec["stop_loss_pct"].to_numpy(dtype=float)
     timestamps = df_exec.index
 
     vwap_deque: deque = deque(maxlen=_vwap_window)
@@ -413,6 +525,8 @@ def run_signals(
                 "best_sell_micro": best_sell_micro,
                 "buy_qty": buy_qty,
                 "sell_qty": sell_qty,
+                "trend_pause": trend_pause_arr[i],
+                "stop_loss_pct": stop_loss_pct_arr[i],
             }
         )
 

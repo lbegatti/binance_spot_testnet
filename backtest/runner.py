@@ -168,6 +168,8 @@ def run_backtest(
         hmm_max_regimes=best.get("hmm_max_regimes"),
         vwap_window=best.get("vwap_window"),
         vwap_threshold=best.get("vwap_threshold"),
+        # trend_consecutive_bars / trend_cooldown_bars are fixed in config_parameters.py
+        # and are no longer loaded from best_params.json (removed from Optuna space 2026-05-24).
     )
 
     # Step 4: simulate P&L

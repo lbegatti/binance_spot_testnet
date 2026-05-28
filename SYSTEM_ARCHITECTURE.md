@@ -33,13 +33,14 @@ FILES
     backtest/                           — Offline backtesting framework (see BACKTESTING.md)
     data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
-    signals.py                        — Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m, Phase 2 merge_asof stitch, Phase 3 1m execution loop + regime/VWAP gates
-    pnl.py                            — P&L simulation: balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), intra-candle whipsaw guard (SELL_WHIPSAW at low−half_spread), position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics
+    signals.py                        — Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m + trend_pause flag (_add_trend_pause_flag, TREND_CONSECUTIVE_BARS/TREND_COOLDOWN_BARS) + adaptive stop_loss_pct series (STOP_LOSS_ROLLING_DAYS/STOP_LOSS_STD_MULT); Phase 2 merge_asof stitch; Phase 3 1m execution loop + regime/VWAP gates
+    pnl.py                            — P&L simulation: adaptive stop-loss check (SELL_STOP_LOSS at close−half_spread, n_stop_loss_fires), trend-pause gate (n_trend_pause_skips), balance guard, bps-based half_spread fill (BACKTEST_FILL_SPREAD_BPS), intra-candle whipsaw guard (SELL_WHIPSAW at low−half_spread), position cap (BACKTEST_MAX_POSITION_PCT), FIFO round-trip pairing, equity curve, Step 5 metrics; compute_buy_and_hold() benchmark
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
     regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 70/30 train-test split on 1 year (~525k rows), self-contained BIC search + label assignment (no RegimeDirector), vectorised single Viterbi pass on ~157k test candles, six checks
+    visualization.py                  — 7-panel Plotly chart: equity curve + B&H dashed orange overlay, drawdown, price+BUY/SELL markers, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime; title_prefix/file_prefix params let sensitivity.py save sensitivity_chart_<ts>.html and runner.py save backtest_chart_<ts>.html
     reporting/                        — Console report formatting and CSV export (AI-authored)
       __init__.py                     — Re-exports fmt, print_report, save_csv, print_regime_validation_report
-      formatters.py                   — fmt(), print_report(), save_csv(), print_regime_validation_report(), HEAVY/LIGHT/PREVIEW constants
+      formatters.py                   — fmt(), print_report(), save_csv(), print_regime_validation_report(), print_bnh_comparison(), HEAVY/LIGHT/PREVIEW constants
 
 ## 1. CONFIGURATION  (config_parameters.py)
   All constants are defined in one place and imported by every other module.
@@ -96,12 +97,12 @@ FILES
     VOLUME_DECAY_FACTOR  = 0.80   # exponential decay per synthetic order-book level
     HMM_LOOKBACK_ROWS    = 120    # warm-up window — 10 h at 5 m (120 × 5 min)
     VWAP_WINDOW          = 5      # rolling VWAP window (rows) — 25 min at 5 m (used on micro 1m frame via merge_asof forward-fill)
-    REFIT_EVERY          = 480    # macro-bar iterations between full HMM BIC re-fits (= 40 h at 5 m → ~54 refits over 90-day OOS; ~162 over 270-day IS)
+    REFIT_EVERY          = 360    # macro-bar iterations between full HMM BIC re-fits (= 30 h at 5 m → ~216 refits over 270-day IS; ~72 over 90-day OOS)
                                    # Aligned with SENSITIVITY_REFIT_EVERY so IS optimisation and OOS validation share the same cadence.
     BACKTEST_MAX_ROWS    = None   # max replay candles (None = full run; set to e.g. 500 for fast debug)
     # Backtesting P&L (Step 4)
     BACKTEST_INITIAL_CAPITAL = 5_000.0   # starting USDT balance for the P&L simulation
-    BACKTEST_INITIAL_BTC     = 0.0735    # starting BTC balance (set > 0 to simulate existing position)
+    BACKTEST_INITIAL_BTC     = 0.065     # starting BTC balance (set > 0 to simulate existing position)
     BACKTEST_FEE_RATE        = 0.001     # 0.10 % taker fee per side (Binance Spot standard)
     BACKTEST_RISK_FREE_RATE  = 0.0       # annualised risk-free rate for Sharpe/Sortino
                                          # 0.0 = no adjustment (standard in crypto);
@@ -111,11 +112,21 @@ FILES
                                          # half_spread = close × BPS / 20 000.
                                          # Default 5 bps → ~$20 at $80 k BTC.
     BACKTEST_MAX_POSITION_PCT = 0.10     # max fraction of USDT risked per BUY (10 %).
-    SENSITIVITY_REFIT_EVERY = 480        # HMM refit cadence for sensitivity.py.
-                                         # Now equal to REFIT_EVERY (480) — IS optimisation
-                                         # and OOS validation share the same 40-h cadence
-                                         # (~162 refits over 270-day IS; ~54 over 90-day OOS).
-                                         # config_parameters defaults unchanged.
+    # Trend-pause filter (signals.py Phase 1)
+    TREND_CONSECUTIVE_BARS  = 4          # consecutive same-direction 5m closes to raise trend_pause flag.
+                                         # New BUY/SELL entries are suppressed while paused.
+                                         # Fixed from Optuna study 2026-05-24 — not in search space.
+    TREND_COOLDOWN_BARS     = 5          # extra macro bars to stay paused after last trending bar.
+                                         # Prevents whipsaw re-entry the instant a streak breaks.
+                                         # Fixed from Optuna study 2026-05-24 — not in search space.
+    # Adaptive stop-loss (signals.py + pnl.py)
+    STOP_LOSS_ROLLING_DAYS  = 90         # lookback window (days) for rolling std of daily abs returns.
+                                         # threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT
+    STOP_LOSS_STD_MULT      = 3.0        # multiplier: typical BTC vol (~1–1.5% daily std) → ~3–4.5% stop distance.
+                                         # Increase to loosen; decrease to tighten.
+    SENSITIVITY_REFIT_EVERY = 360        # HMM refit cadence for sensitivity.py.
+                                         # Equal to REFIT_EVERY (360) — IS optimisation
+                                         # and OOS validation share the same 30-h cadence.
     # NOTE: SENSITIVITY_LOOKBACK has been removed.  The IS window is now defined
     # by BACKTEST_LOOKBACK (IS start) and BACKTEST_OOS_START (IS end / OOS start).
     # sensitivity.py passes end_str=BACKTEST_OOS_START to fetch_klines(); runner.py

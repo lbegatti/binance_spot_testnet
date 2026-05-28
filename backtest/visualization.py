@@ -115,6 +115,8 @@ def plot_backtest(
     stats: dict[str, Any],
     save_png: bool = False,
     show: bool = True,
+    title_prefix: str = "Backtest",
+    file_prefix: str = "backtest_chart",
 ) -> None:
     """
     Build the interactive five-panel backtest figure using Plotly.
@@ -141,8 +143,32 @@ def plot_backtest(
     show : bool
         If ``True``, call ``fig.show()`` to open an interactive browser window.
         Default ``True``.  Set to ``False`` for headless / CI environments.
+    title_prefix : str
+        Label shown at the start of the figure title, e.g. ``"Backtest"``
+        (OOS, from runner.py) or ``"IS (Sensitivity)"`` (IS window, from
+        sensitivity.py).  Default ``"Backtest"``.
+    file_prefix : str
+        Stem used when saving the chart file, e.g. ``"backtest_chart"`` or
+        ``"sensitivity_chart"``.  Default ``"backtest_chart"``.
     """
     log.info("Building backtest visualisation (Plotly)…")
+
+    # ── Normalise indexes to Python datetime so kaleido can JSON-serialise them ─
+    # pd.Timestamp is NOT JSON-serialisable by kaleido's orjson backend.
+    # Assigning `.to_pydatetime()` directly still lets pandas re-wrap the array
+    # back into a DatetimeIndex (which contains Timestamps again).  Wrapping in
+    # pd.Index(..., dtype=object) forces an object-dtype index whose elements
+    # are genuine datetime.datetime objects — which orjson handles natively.
+    def _norm_index(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.copy()
+            df.index = pd.Index(df.index.to_pydatetime().tolist(), dtype=object)
+        return df
+
+    signals = _norm_index(signals)
+    equity  = _norm_index(equity)
+    if trades is not None and not trades.empty:
+        trades = _norm_index(trades)
 
     # ── One-time debug: print exact P&L math for first winning round-trip ─────
     # This fires only when plot_backtest() is called (i.e. from runner.py).
@@ -249,8 +275,16 @@ def plot_backtest(
         xaxis5=dict(matches="x"),
     )
 
+    # ── Buy-and-Hold equity curve (Panel 1 overlay) ──────────────────────────
+    # bnh_btc_held is constant (all-in at bar 0); multiply by close series to
+    # get the full mark-to-market B&H equity at every 1-minute bar.
+    _bnh_btc = stats.get("bnh_btc_held")
+    bnh_equity_series: pd.Series | None = None
+    if _bnh_btc is not None and not (isinstance(_bnh_btc, float) and np.isnan(_bnh_btc)):
+        bnh_equity_series = signals["close"] * float(_bnh_btc)
+
     # ── Draw panels ───────────────────────────────────────────────────────────
-    _panel_equity(fig, equity, stats)
+    _panel_equity(fig, equity, stats, bnh_equity_series)
     _panel_price_signals(fig, signals, trades)
     _panel_regime(fig, signals)
     _panel_vwap(fig, signals)
@@ -266,11 +300,17 @@ def plot_backtest(
         """Format a float with a printf-style format string; return 'N/A' for NaN."""
         return (f % v) if not (isinstance(v, float) and np.isnan(v)) else "N/A"
 
+    # Date range from the signals index for the title
+    _date_start = signals.index[0].strftime("%Y-%m-%d") if len(signals) > 0 else "?"
+    _date_end   = signals.index[-1].strftime("%Y-%m-%d") if len(signals) > 0 else "?"
+
     fig.update_layout(
         title=dict(
             text=(
-                f"<b>{SYMBOL} Backtest</b> &nbsp;|&nbsp; "
+                f"<b>{SYMBOL} {title_prefix}</b> &nbsp;|&nbsp; "
+                f"{_date_start} → {_date_end} &nbsp;|&nbsp; "
                 f"Return: {_fmt(stats.get('total_return_pct', float('nan')), '%+.2f%%')} &nbsp; "
+                f"B&H: {_fmt(stats.get('bnh_total_return_pct', float('nan')), '%+.2f%%')} &nbsp; "
                 f"Sharpe: {_fmt(stats.get('sharpe_ratio', float('nan')), '%.3f')} &nbsp; "
                 f"Win-rate: {_fmt(stats.get('win_rate_pct', float('nan')), '%.1f%%')} &nbsp; "
                 f"Max-DD: {_fmt(stats.get('max_drawdown_pct', float('nan')), '%.2f%%')} &nbsp; "
@@ -292,7 +332,7 @@ def plot_backtest(
     )
 
     if save_png:
-        _save_figure(fig)
+        _save_figure(fig, file_prefix=file_prefix)
 
     if show:
         fig.show()
@@ -309,6 +349,7 @@ def _panel_equity(
     fig: go.Figure,
     equity: pd.DataFrame,
     stats: dict[str, Any],
+    bnh_equity_series: "pd.Series | None" = None,
 ) -> None:
     """
     Panel 1 — equity curve (row 1) and drawdown fill (row 2).
@@ -317,6 +358,10 @@ def _panel_equity(
     including HOLD candles (no trade fired).  A dashed horizontal reference
     line marks the starting equity so over- or under-performance is
     immediately visible.
+
+    A dashed orange Buy-and-Hold equity line is overlaid when
+    ``bnh_equity_series`` is provided, giving an immediate visual comparison
+    against the passive benchmark.
 
     The drawdown sub-panel uses a red ``tozeroy`` fill so the worst
     peak-to-trough period is immediately visible without reading numbers.
@@ -334,6 +379,28 @@ def _panel_equity(
         row=1,
         col=1,
     )
+
+    # Buy-and-Hold overlay — dashed orange line for direct visual comparison
+    if bnh_equity_series is not None:
+        _bnh_ret = stats.get("bnh_total_return_pct", float("nan"))
+        _bnh_label = (
+            f"Buy & Hold ({_bnh_ret:+.2f}%)"
+            if not (isinstance(_bnh_ret, float) and np.isnan(_bnh_ret))
+            else "Buy & Hold"
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=bnh_equity_series.index,
+                y=bnh_equity_series.values,
+                mode="lines",
+                name=_bnh_label,
+                line=dict(color="darkorange", width=1.2, dash="dash"),
+                opacity=0.80,
+                legendgroup="bnh",
+            ),
+            row=1,
+            col=1,
+        )
 
     init_eq = stats.get("initial_equity_total_usdt", float(equity["equity"].iloc[0]))
     if isinstance(init_eq, (int, float)) and not np.isnan(float(init_eq)):
@@ -913,7 +980,7 @@ def _compute_filter_counts(signals: pd.DataFrame) -> dict[str, int]:
     }
 
 
-def _save_figure(fig: go.Figure) -> None:
+def _save_figure(fig: go.Figure, file_prefix: str = "backtest_chart") -> None:
     """
     Save the figure as PNG (preferred) or HTML fallback.
 
@@ -931,11 +998,11 @@ def _save_figure(fig: go.Figure) -> None:
     try:
         import kaleido  # noqa: F401  (import only to verify availability)
 
-        path = results_dir / f"backtest_chart_{ts}.png"
+        path = results_dir / f"{file_prefix}_{ts}.png"
         fig.write_image(str(path), width=1800, height=1900, scale=1.5)
         log.info("Chart (PNG) saved → %s", path)
     except ImportError:
-        path = results_dir / f"backtest_chart_{ts}.html"
+        path = results_dir / f"{file_prefix}_{ts}.html"
         fig.write_html(str(path))
         log.warning(
             "kaleido not installed — chart saved as interactive HTML: %s  "

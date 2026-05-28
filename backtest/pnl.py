@@ -274,6 +274,17 @@ def simulate_pnl(
     # guard (same 1-minute bar touched both BUY zone and SELL zone).
     n_whipsaw_exits: int = 0
 
+    # Track the volume-weighted average entry price of the open position.
+    # Updated on every BUY via VWAP formula; reset to 0.0 on every full close.
+    # Used by the adaptive stop-loss to compute the unrealised loss threshold.
+    avg_entry_price: float = 0.0
+
+    # Counter: how many times the adaptive stop-loss forced a position close.
+    n_stop_loss_fires: int = 0
+    # Counter: how many 1m bars were skipped because the macro frame was in a
+    # sustained trend (trend_pause == True from signals.py).
+    n_trend_pause_skips: int = 0
+
     # Whipsaw guard requires the ``high`` and ``low`` columns added to the
     # signals DataFrame by signals.py Step 3.  If absent (legacy frames or
     # unit tests that construct a minimal DataFrame) the guard is silently
@@ -295,6 +306,51 @@ def simulate_pnl(
         _half_spread_ws = (
             float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
         )
+
+        # ── Adaptive stop-loss (unconditional — fires even during trend_pause) ─
+        # Checked FIRST so an open position is always protected regardless of
+        # whether the trend-pause or whipsaw gate would fire on the same bar.
+        _sl_pct = float(getattr(row, "stop_loss_pct", 0.0) or 0.0)
+        if (
+            open_strategy_qty > _POSITION_DUST_BTC
+            and _sl_pct > 0.0
+            and avg_entry_price > 0.0
+            and close < avg_entry_price * (1.0 - _sl_pct)
+        ):
+            _sl_qty = min(open_strategy_qty, btc)
+            if _sl_qty > 0:
+                _sl_fill = close - _half_spread_ws
+                _sl_gross = _sl_qty * _sl_fill
+                _sl_fee = abs(_sl_gross) * fee_rate
+                _sl_proceeds = _sl_gross - _sl_fee
+                usdt += _sl_proceeds
+                btc -= _sl_qty
+                open_strategy_qty = 0.0  # full close — always flat after stop-loss
+                _sl_loss_pct = (close - avg_entry_price) / avg_entry_price * 100
+                avg_entry_price = 0.0  # reset AFTER computing loss for the log
+                n_stop_loss_fires += 1
+                trade_rows.append(
+                    {
+                        "timestamp": ts,
+                        "side": "SELL_STOP_LOSS",
+                        "fill_price": _sl_fill,
+                        "quantity": _sl_qty,
+                        "gross": _sl_gross,
+                        "fee": _sl_fee,
+                        "net_cost": None,
+                        "net_proceeds": _sl_proceeds,
+                        "regime": getattr(row, "regime", None),
+                    }
+                )
+                log.warning(
+                    "STOP-LOSS │ FORCED EXIT │ %s │ qty=%.6f BTC │ "
+                    "exit=%.2f │ threshold=%.2f%% │ actual_loss=%.2f%%",
+                    ts,
+                    _sl_qty,
+                    _sl_fill,
+                    _sl_pct * 100,
+                    _sl_loss_pct,
+                )
 
         # ── Intra-candle whipsaw guard ─────────────────────────────────────────
         # Fires when ALL of these hold:
@@ -330,6 +386,8 @@ def simulate_pnl(
                     usdt += _ws_proceeds
                     btc -= _ws_qty
                     open_strategy_qty = max(0.0, open_strategy_qty - _ws_qty)
+                    if open_strategy_qty <= _POSITION_DUST_BTC:
+                        avg_entry_price = 0.0  # position fully closed
                     n_whipsaw_exits += 1
                     trade_rows.append(
                         {
@@ -357,6 +415,16 @@ def simulate_pnl(
                         float(_ssm),
                     )
                 _skip_signals = True  # do not re-process BUY/SELL for this bar
+
+        # ── Trend-pause gate (blocks new entries; equity mark-to-market runs) ──
+        # Checked AFTER the stop-loss (which fires unconditionally) and whipsaw
+        # guard.  Sets _skip_signals=True to suppress BUY and regular SELL for
+        # this bar, but control falls through to the equity mark-to-market below
+        # so the equity curve remains continuous during the pause.
+        _trend_paused = bool(getattr(row, "trend_pause", False))
+        if _trend_paused and not _skip_signals:
+            n_trend_pause_skips += 1
+            _skip_signals = True
 
         # BUY
         if sig == 1 and not _skip_signals:
@@ -401,6 +469,16 @@ def simulate_pnl(
                     usdt -= net_cost
                     btc += qty
                     open_strategy_qty += qty  # track position opened by this BUY
+                    # Update VWAP average entry price.
+                    # With the single-position guard (open_strategy_qty was 0 before
+                    # this BUY), btc_held_before is 0 and this simplifies to
+                    # avg_entry_price = eff_price.  The VWAP formula is kept for
+                    # correctness if the guard is ever relaxed (multi-chunk entries).
+                    _btc_before = open_strategy_qty - qty
+                    avg_entry_price = (
+                        (avg_entry_price * _btc_before + eff_price * qty)
+                        / open_strategy_qty
+                    )
                     trade_rows.append(
                         {
                             "timestamp": ts,
@@ -460,6 +538,8 @@ def simulate_pnl(
                 usdt += net_proceeds
                 btc -= qty
                 open_strategy_qty = max(0.0, open_strategy_qty - qty)  # reset to flat
+                if open_strategy_qty <= _POSITION_DUST_BTC:
+                    avg_entry_price = 0.0  # position fully closed
                 trade_rows.append(
                     {
                         "timestamp": ts,
@@ -543,6 +623,10 @@ def simulate_pnl(
         n_position_guard_skips,
         n_whipsaw_exits,
     )
+    # Inject guardrail counters (kept outside _compute_stats to avoid changing
+    # its signature — consistent with how n_position_guard_skips is handled).
+    stats["n_stop_loss_fires"] = n_stop_loss_fires
+    stats["n_trend_pause_skips"] = n_trend_pause_skips
 
     log.info(
         "P&L: return=%.2f%%  trades=%d  win_rate=%.1f%%  max_dd=%.2f%%  sharpe=%.3f",

@@ -98,6 +98,7 @@ binance_spot_testnet/
 │   ├── visualization.py               # Step 7 — interactive Plotly chart (6-panel); shown by default from CLI, or run_backtest(plot=True) programmatically
 │   ├── sensitivity.py                 # Step 8 — Bayesian (Optuna TPE, default) / OAT / full-grid sweep; writes best_params.json
 │   ├── regime_validation.py           # Offline long-horizon HMM validation — python -m backtest.regime_validation
+│   ├── visualization.py               # Backtest chart (7-panel Plotly): equity + B&H overlay, drawdown, price+signals, regime, VWAP, signal funnel, signals-by-regime.  Writes backtest_chart_<ts>.html (runner.py) or sensitivity_chart_<ts>.html (sensitivity.py)
 │   └── reporting/                     # Console report formatting and CSV export (AI-authored)
 │       ├── __init__.py
 │       └── formatters.py              # fmt(), print_report(), save_csv(), print_sensitivity_table(), print_oat_sensitivity_report(), print_bnh_comparison() — public helpers
@@ -149,13 +150,17 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of macro (5 m) kline rows used as the HMM warm-up window in the backtest (**10 h at 5 m** — 120 × 5 min; matches `HMM_LOOKBACK` in the live system) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in 1-minute micro bars) for the backtest VWAP computation (**5 min** — 5 × 1 min) |
-| **Backtesting** | `REFIT_EVERY` | `120` | Macro-bar iterations between full HMM BIC re-fits during the signal loop.  At 5 m resolution this means one full re-fit every **10 hours** (~288 refits over the 270-day IS window) |
+| **Backtesting** | `REFIT_EVERY` | `360` | Macro-bar iterations between full HMM BIC re-fits during the signal loop.  At 5 m resolution this means one full re-fit every **30 hours** (~216 refits over the 270-day IS window).  Aligned with `SENSITIVITY_REFIT_EVERY` so IS and OOS validation share the same cadence |
 | **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `5_000.0` | Starting USDT balance for the simulation |
-| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0735` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
+| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.065` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `None` | Max replay candles in debug mode (`None` = full production run; set to e.g. `500` for a quick debug run) |
-| **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `480` | HMM refit cadence used **only** inside `sensitivity.py` (**40 h at 5 m** → ~72 refits over the 270-day IS window, ~4× speedup vs `REFIT_EVERY=120`). `config_parameters.py` defaults and the live system are never affected. |
+| **Trend-pause filter** | `TREND_CONSECUTIVE_BARS` | `4` | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
+| **Trend-pause filter** | `TREND_COOLDOWN_BARS` | `5` | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
+| **Adaptive stop-loss** | `STOP_LOSS_ROLLING_DAYS` | `90` | Lookback window (calendar days) for the rolling standard deviation of daily absolute returns used to compute the dynamic stop-loss threshold.  `threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT` — calibrates automatically to BTC's current volatility regime |
+| **Adaptive stop-loss** | `STOP_LOSS_STD_MULT` | `3.0` | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~3–4.5 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` in the console report to calibrate |
+| **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `360` | HMM refit cadence used **only** inside `sensitivity.py` (**30 h at 5 m** → ~216 refits over the 270-day IS window).  Equal to `REFIT_EVERY` so IS optimisation and OOS validation share the same HMM cadence — Sharpe figures are directly comparable across both windows. |
 | **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise, cutting Viterbi overhead ~5×. `run_backtest.py` always predicts every candle. |
 | **Sensitivity** | `SENSITIVITY_FEE_RATE` | `0.001` | Fee rate applied to **all** sensitivity runs (OAT, full-grid, Bayes). Fixed at the standard Binance Spot taker fee — not a strategy knob, never included in the search grid. |
 | **Sensitivity** | `SENSITIVITY_RANK_METRIC` | `"sharpe_ratio"` | Metric used to rank parameter combinations and select `best_params.json`. Change to `"sortino_ratio"` or `"total_return_pct"` to optimise for a different objective. |
@@ -168,7 +173,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`
-- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`, `BACKTEST_MACRO_INTERVAL`, `BACKTEST_MICRO_INTERVAL`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
 - `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `BACKTEST_MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
