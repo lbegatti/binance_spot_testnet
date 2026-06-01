@@ -476,9 +476,8 @@ def simulate_pnl(
                     # correctness if the guard is ever relaxed (multi-chunk entries).
                     _btc_before = open_strategy_qty - qty
                     avg_entry_price = (
-                        (avg_entry_price * _btc_before + eff_price * qty)
-                        / open_strategy_qty
-                    )
+                        avg_entry_price * _btc_before + eff_price * qty
+                    ) / open_strategy_qty
                     trade_rows.append(
                         {
                             "timestamp": ts,

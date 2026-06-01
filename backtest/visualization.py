@@ -166,7 +166,7 @@ def plot_backtest(
         return df
 
     signals = _norm_index(signals)
-    equity  = _norm_index(equity)
+    equity = _norm_index(equity)
     if trades is not None and not trades.empty:
         trades = _norm_index(trades)
 
@@ -280,7 +280,9 @@ def plot_backtest(
     # get the full mark-to-market B&H equity at every 1-minute bar.
     _bnh_btc = stats.get("bnh_btc_held")
     bnh_equity_series: pd.Series | None = None
-    if _bnh_btc is not None and not (isinstance(_bnh_btc, float) and np.isnan(_bnh_btc)):
+    if _bnh_btc is not None and not (
+        isinstance(_bnh_btc, float) and np.isnan(_bnh_btc)
+    ):
         bnh_equity_series = signals["close"] * float(_bnh_btc)
 
     # ── Draw panels ───────────────────────────────────────────────────────────
@@ -302,7 +304,7 @@ def plot_backtest(
 
     # Date range from the signals index for the title
     _date_start = signals.index[0].strftime("%Y-%m-%d") if len(signals) > 0 else "?"
-    _date_end   = signals.index[-1].strftime("%Y-%m-%d") if len(signals) > 0 else "?"
+    _date_end = signals.index[-1].strftime("%Y-%m-%d") if len(signals) > 0 else "?"
 
     fig.update_layout(
         title=dict(

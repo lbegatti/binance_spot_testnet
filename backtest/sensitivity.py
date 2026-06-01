@@ -453,7 +453,9 @@ def _save_optuna_plots(study: optuna.Study) -> None:
     # 3. Contour — hmm_lookback_rows × vwap_window (the two continuous knobs)
     try:
         fig = plot_contour(study, params=["hmm_lookback_rows", "vwap_window"])
-        fig.update_layout(title=f"Optuna — Contour (hmm_lookback_rows × vwap_window)  |  {_is_label}")
+        fig.update_layout(
+            title=f"Optuna — Contour (hmm_lookback_rows × vwap_window)  |  {_is_label}"
+        )
         path = _REPORTING_DIR / f"optuna_contour_{ts}.html"
         fig.write_html(str(path))
         log.info("Optuna contour chart → %s", path)
@@ -462,8 +464,8 @@ def _save_optuna_plots(study: optuna.Study) -> None:
 
 
 def _run_sensitivity_optuna_study(
-        n_trials: int = 40,
-        lookback: str | None = None,
+    n_trials: int = 40,
+    lookback: str | None = None,
 ) -> pd.DataFrame:
     """
     Run the Bayesian sensitivity study using Optuna TPE and return results.
@@ -514,8 +516,8 @@ def _run_sensitivity_optuna_study(
     # trials on top rather than restarting, but it still commits hours of
     # compute and may overwrite best_params.json with a new best.
     if not _check_existing_best_params(
-            mode=f"bayes (adding {n_trials} more Optuna trials)",
-            extra_note="The study resumes — prior trials are kept and result can only improve.",
+        mode=f"bayes (adding {n_trials} more Optuna trials)",
+        extra_note="The study resumes — prior trials are kept and result can only improve.",
     ):
         return pd.DataFrame()
 
@@ -679,7 +681,9 @@ def _run_sensitivity_optuna_study(
             _save_best_params(best_series)
         print_bnh_comparison(best_series)
         if best_signals is not None:
-            assert best_trades is not None and best_equity is not None  # set together with best_signals
+            assert (
+                best_trades is not None and best_equity is not None
+            )  # set together with best_signals
             _plot_is_chart(
                 best_params=study.best_params,
                 best_stats=best_series.to_dict(),
@@ -697,9 +701,9 @@ def _run_sensitivity_optuna_study(
 
 
 def _run_one(
-        params: dict[str, Any],
-        prefetched_macro: pd.DataFrame,
-        prefetched_micro: pd.DataFrame,
+    params: dict[str, Any],
+    prefetched_macro: pd.DataFrame,
+    prefetched_micro: pd.DataFrame,
 ) -> dict[str, Any]:
     """
     Execute one full backtest with the given parameter overrides.
@@ -759,9 +763,9 @@ def _run_one(
 
 
 def _run_one_full(
-        params: dict[str, Any],
-        prefetched_macro: pd.DataFrame,
-        prefetched_micro: pd.DataFrame,
+    params: dict[str, Any],
+    prefetched_macro: pd.DataFrame,
+    prefetched_micro: pd.DataFrame,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Like ``_run_one`` but also returns ``(signals, trades, equity)`` for
@@ -807,18 +811,19 @@ def _run_one_full(
 # IS chart helper
 # ---------------------------------------------------------------------------
 
+
 def _plot_is_chart(
-        best_params: dict[str, Any],
-        best_stats: dict[str, Any],
-        signals: pd.DataFrame,
-        trades: pd.DataFrame,
-        equity: pd.DataFrame,
+    best_params: dict[str, Any],
+    best_stats: dict[str, Any],
+    signals: pd.DataFrame,
+    trades: pd.DataFrame,
+    equity: pd.DataFrame,
 ) -> None:
     """
-    Generate and save the IS sensitivity chart using the best-params re-run data.
-    Opens no browser window — the file is saved to
-    ``backtest/results/sensitivity_chart_<ts>.html`` (or ``.png`` if kaleido is
-    installed) for manual inspection.
+    Generate, save, and open the IS sensitivity chart using the best-params re-run data.
+    The chart is saved to ``backtest/results/sensitivity_chart_<ts>.html`` (or ``.png``
+    if kaleido is installed) **and** opened in a new browser tab via ``fig.show()``,
+    matching the behaviour of ``runner.py`` so both charts can be compared side-by-side.
 
     Labelled ``"IS (Sensitivity)"`` in the title so it is visually distinct
     from the OOS chart produced by ``runner.py`` (labelled ``"Backtest"``).
@@ -832,7 +837,7 @@ def _plot_is_chart(
             equity,
             best_stats,
             save_png=True,  # triggers _save_figure → HTML fallback (kaleido absent) or PNG
-            show=False,  # headless — save file only; user opens manually
+            show=True,  # open a new browser tab — mirrors runner.py behaviour
             title_prefix="IS (Sensitivity)",
             file_prefix="sensitivity_chart",
         )
@@ -941,7 +946,7 @@ def _save_best_params(best_row: pd.Series) -> None:
 
 
 def run_sensitivity(
-        full_grid: bool = True, lookback: str | None = None
+    full_grid: bool = True, lookback: str | None = None
 ) -> pd.DataFrame:
     """
     Execute the sensitivity sweep and return the results DataFrame.
@@ -1061,7 +1066,7 @@ def run_sensitivity(
             (results_df["hmm_lookback_rows"] == defaults["hmm_lookback_rows"])
             & (results_df["hmm_max_regimes"] == defaults["hmm_max_regimes"])
             & (results_df["vwap_window"] == defaults["vwap_window"])
-            ]
+        ]
         if not baseline_rows.empty:
             baseline_sharpe = float(baseline_rows.iloc[0][SENSITIVITY_RANK_METRIC])
             trigger = print_oat_sensitivity_report(

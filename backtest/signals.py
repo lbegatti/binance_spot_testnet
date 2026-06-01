@@ -94,11 +94,7 @@ def _add_trend_pause_flag(
 
     # Cumulative group ID increments on every direction change.
     # cumcount()+1 gives the streak length: 1 on the first bar of each run.
-    streak = (
-        direction.groupby(
-            (direction != direction.shift()).cumsum()
-        ).cumcount() + 1
-    )
+    streak = direction.groupby((direction != direction.shift()).cumsum()).cumcount() + 1
 
     # A bar "is in trend" when streak ≥ n AND direction is not flat.
     in_trend = (streak >= n) & (direction != 0)
@@ -236,12 +232,12 @@ def run_signals(
         vwap_threshold if vwap_threshold is not None else VWAP_THRESHOLD_MULTIPLIER
     )
     _trend_consecutive = (
-        trend_consecutive_bars if trend_consecutive_bars is not None
+        trend_consecutive_bars
+        if trend_consecutive_bars is not None
         else TREND_CONSECUTIVE_BARS
     )
     _trend_cooldown = (
-        trend_cooldown_bars if trend_cooldown_bars is not None
-        else TREND_COOLDOWN_BARS
+        trend_cooldown_bars if trend_cooldown_bars is not None else TREND_COOLDOWN_BARS
     )
 
     # ── 1. Fetch / accept raw OHLCV frames ───────────────────────────────────
@@ -371,9 +367,7 @@ def run_signals(
     _sl_daily = df_macro_raw[["close"]].resample("1D").last().dropna()
     _sl_daily["abs_return"] = _sl_daily["close"].pct_change().abs()
     _sl_daily["stop_loss_pct"] = (
-        _sl_daily["abs_return"]
-        .rolling(STOP_LOSS_ROLLING_DAYS, min_periods=1)
-        .std()
+        _sl_daily["abs_return"].rolling(STOP_LOSS_ROLLING_DAYS, min_periods=1).std()
         * STOP_LOSS_STD_MULT
     )
     df_exec = pd.merge_asof(

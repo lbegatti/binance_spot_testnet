@@ -221,9 +221,13 @@ BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
 # Pauses all new BUY/SELL entries when the macro frame shows N consecutive
 # same-direction closes (sustained trend).  Trading resumes after the streak
 # breaks AND TREND_COOLDOWN_BARS additional ranging bars have elapsed.
-TREND_CONSECUTIVE_BARS: int = 4  # N consecutive same-direction 5m closes → pause (= 15 min)
+TREND_CONSECUTIVE_BARS: int = (
+    3  # N consecutive same-direction 5m closes → pause (= 15 min)
+)
 # Fixed from Optuna study 2026-05-24 — removed from search space.
-TREND_COOLDOWN_BARS: int = 5  # extra macro bars to stay paused after trend ends (= 20 min)
+TREND_COOLDOWN_BARS: int = (
+    4  # extra macro bars to stay paused after trend ends (= 20 min)
+)
 # Fixed from Optuna study 2026-05-24 — removed from search space.
 
 # -- Adaptive stop-loss (backtest/signals.py + pnl.py) --------------------
