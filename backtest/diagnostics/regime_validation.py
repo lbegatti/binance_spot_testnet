@@ -400,7 +400,11 @@ def _run_checks(
     """
     results: dict = {}
 
-    # forward return: close(t+N) / close(t) - 1
+    # forward return: log(close(t+N) / close(t))
+    # Log-returns are more symmetrically distributed than arithmetic returns
+    # (less positive skew from large price jumps), which makes Check 1's
+    # directional comparison more meaningful and satisfies the Gaussian
+    # assumption underlying Check 2's Welch's t-test more cleanly.
     # N=5 (5-minute horizon) rather than N=1 (1-minute) because:
     #   - At 1 m resolution, BTC returns are near-pure noise (both regimes
     #     overlap entirely) → t-test almost always fails even for a good model.
@@ -411,7 +415,8 @@ def _run_checks(
     _FWD_PERIODS = 5  # candles (= 5 min at 1 m resolution)
     test_labels = test_labels.copy()
     test_labels["fwd_return"] = (
-        test_labels["close"].pct_change(_FWD_PERIODS).shift(-_FWD_PERIODS)
+        np.log(test_labels["close"] / test_labels["close"].shift(_FWD_PERIODS))
+        .shift(-_FWD_PERIODS)
     )
     test_labels.dropna(subset=["fwd_return"], inplace=True)
 

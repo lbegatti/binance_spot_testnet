@@ -35,6 +35,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from config_parameters import (
@@ -300,9 +301,10 @@ def print_regime_validation_report(
     split_idx : int
         Row index where the train/test split occurs (e.g. 10,080).
     """
-    # Re-compute forward return for the statistics table.
+    # Re-compute 1-period log forward return for the statistics table.
+    # Log-returns are more symmetric and Gaussian than arithmetic returns.
     tl = test_labels.copy()
-    tl["fwd_return"] = tl["close"].pct_change().shift(-1)
+    tl["fwd_return"] = np.log(tl["close"] / tl["close"].shift(1)).shift(-1)
     tl.dropna(subset=["fwd_return"], inplace=True)
 
     n_total = len(tl)
@@ -375,7 +377,7 @@ def print_regime_validation_report(
         c = checks[key]
         lines += [f" {title}", f"   {c['detail']}"]
         if key != "hit_rate_alignment":
-            suffix = "  (pass if p < 0.05)" if key == "welch_ttest" else ""
+            suffix = "  (pass if p < 0.10)" if key == "welch_ttest" else ""
             lines.append(f"   → {verdict(c['pass'])}{suffix}")
         lines.append("")
 

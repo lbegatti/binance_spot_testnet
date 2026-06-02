@@ -35,8 +35,9 @@ class RegimeDirector:
 
     The model is fitted on four features derived from OHLCV candles:
 
-    * ``return``        — per-candle percentage price change
-      (``close.pct_change()``).
+    * ``return``        — per-candle log price change
+      (``np.log(close / close.shift(1))``; more Gaussian than arithmetic
+      returns → better GaussianHMM emission fit).
     * ``volatility``    — normalised intra-bar range
       (``(high - low) / close``).
     * ``obi_proxy``     — taker-flow imbalance proxy, rescaled to ``[-1, +1]``
@@ -186,12 +187,13 @@ class RegimeDirector:
         ``HMM_LOOKBACK`` worth of ``HMM_INTERVAL`` candles for ``self.symbol``
         and builds the following columns:
 
-        * ``return``        — ``close.pct_change()``
+        * ``return``        — ``np.log(close / close.shift(1))`` (log-return;
+          more Gaussian than arithmetic returns → better GaussianHMM fit)
         * ``volatility``    — ``(high - low) / close``
         * ``obi_proxy``     — ``(taker_buy_base_vol / volume) × 2 − 1``
         * ``trade_density`` — ``num_trades / volume``
 
-        The first row is dropped (``pct_change`` produces ``NaN``).
+        The first row is dropped (``log-return`` produces ``NaN`` on shift).
         The resulting DataFrame is stored in ``self.klines_df``.
 
         Raises:
@@ -226,7 +228,7 @@ class RegimeDirector:
             pd.to_datetime, unit="ms"
         )
         df.set_index("open_time", inplace=True)
-        df["return"] = df["close"].pct_change()
+        df["return"] = np.log(df["close"] / df["close"].shift(1))
         df["volatility"] = (df["high"] - df["low"]) / df["close"]
         df["obi_proxy"] = (df["taker_buy_base_vol"] / df["volume"]) * 2 - 1
         df["trade_density"] = df["num_trades"] / df["volume"]

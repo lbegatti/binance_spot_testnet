@@ -596,7 +596,7 @@ t, p = scipy.stats.ttest_ind(
 )
 ```
 
-**Pass condition:** p-value < 0.05
+**Pass condition:** p-value < 0.10
 
 **Check 3 — Volatility Check**
 

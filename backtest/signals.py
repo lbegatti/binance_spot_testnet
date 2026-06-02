@@ -41,8 +41,8 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
 
     Mirrors the feature engineering in ``RegimeDirector.get_klines_data()``
     but operates on an already-fetched DataFrame instead of downloading
-    fresh klines.  The first row is dropped because ``pct_change()``
-    produces ``NaN``.
+    fresh klines.  The first row is dropped because ``log-return``
+    produces ``NaN`` on ``shift(1)``.
 
     Args:
         k_df (pd.DataFrame): Raw klines DataFrame returned by
@@ -56,7 +56,7 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
             — and no ``NaN`` rows.
     """
     klines_df = k_df.copy()
-    klines_df["return"] = klines_df["close"].pct_change()
+    klines_df["return"] = np.log(klines_df["close"] / klines_df["close"].shift(1))
     klines_df["volatility"] = (klines_df["high"] - klines_df["low"]) / klines_df[
         "close"
     ]
@@ -266,7 +266,7 @@ def run_signals(
     # ── Phase 1 — HMM walk-forward on 5-minute macro bars ────────────────────
     features_macro = _add_hmm_features(df_macro_raw)
     logging.info(
-        "Macro features ready: %d rows (dropped %d NaN rows from pct_change).",
+        "Macro features ready: %d rows (dropped %d NaN rows from log-return shift).",
         len(features_macro),
         len(df_macro_raw) - len(features_macro),
     )

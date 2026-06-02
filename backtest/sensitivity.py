@@ -466,6 +466,7 @@ def _save_optuna_plots(study: optuna.Study) -> None:
 def _run_sensitivity_optuna_study(
     n_trials: int = 40,
     lookback: str | None = None,
+    force_save: bool = False,
 ) -> pd.DataFrame:
     """
     Run the Bayesian sensitivity study using Optuna TPE and return results.
@@ -517,7 +518,10 @@ def _run_sensitivity_optuna_study(
     # compute and may overwrite best_params.json with a new best.
     if not _check_existing_best_params(
         mode=f"bayes (adding {n_trials} more Optuna trials)",
-        extra_note="The study resumes — prior trials are kept and result can only improve.",
+        extra_note=(
+            "The study resumes — prior trials are kept and result can only improve.  "
+            "Use --force-save if the stored params are stale (negative OOS Sharpe)."
+        ),
     ):
         return pd.DataFrame()
 
@@ -670,7 +674,7 @@ def _run_sensitivity_optuna_study(
             )
             best_series = pd.Series({**best_full, **bnh})
             # Save using the CURRENT-data stats so source_value is honest.
-            _save_best_params(best_series)
+            _save_best_params(best_series, force_save=force_save)
         except Exception:
             log.warning(
                 "Could not re-run best trial — falling back to trial row "
@@ -678,7 +682,7 @@ def _run_sensitivity_optuna_study(
                 exc_info=True,
             )
             best_series = valid.iloc[0]
-            _save_best_params(best_series)
+            _save_best_params(best_series, force_save=force_save)
         print_bnh_comparison(best_series)
         if best_signals is not None:
             assert (
@@ -881,13 +885,18 @@ def _save_results(results_df: pd.DataFrame, mode: str) -> pathlib.Path:
     return csv_path
 
 
-def _save_best_params(best_row: pd.Series) -> None:
+def _save_best_params(best_row: pd.Series, force_save: bool = False) -> None:
     """
     Write the winning parameter set to best_params.json.
 
-    Only overwrites the file if the new Sharpe ratio is strictly better than
-    the value already stored.  This prevents a noisy re-run from destroying
-    a previously healthy result.
+    By default only overwrites the file if the new Sharpe ratio is strictly
+    better than the value already stored.  This prevents a noisy re-run from
+    destroying a previously healthy result.
+
+    Pass ``force_save=True`` (via ``--force-save`` CLI flag) to bypass the
+    guard when the market regime has shifted and the current IS window's best
+    Sharpe is lower than the stored one — in that case the stale params are
+    actively harmful and should be replaced with the current best.
 
     The live system loads this file at startup via _load_best_params()
     in websocket_main.py.  If the file is missing the live system falls
@@ -898,7 +907,7 @@ def _save_best_params(best_row: pd.Series) -> None:
     """
     new_sharpe = float(best_row[SENSITIVITY_RANK_METRIC])
 
-    # ── Guard: never overwrite a better existing result ──────────────────
+    # ── Guard: never overwrite a better existing result (unless forced) ──
     existing_sharpe = float("-inf")
     if _BEST_PARAMS_PATH.exists():
         try:
@@ -909,13 +918,24 @@ def _save_best_params(best_row: pd.Series) -> None:
             pass  # unreadable — treat as no prior
 
     if new_sharpe <= existing_sharpe:
-        log.warning(
-            "New %s (%.4f) ≤ existing (%.4f) — best_params.json NOT overwritten.",
-            SENSITIVITY_RANK_METRIC,
-            new_sharpe,
-            existing_sharpe,
-        )
-        return
+        if force_save:
+            log.warning(
+                "--force-save active: overwriting existing %s (%.4f) with new (%.4f). "
+                "Use this only when the market regime has shifted and stale params are "
+                "actively harmful.",
+                SENSITIVITY_RANK_METRIC,
+                existing_sharpe,
+                new_sharpe,
+            )
+        else:
+            log.warning(
+                "New %s (%.4f) ≤ existing (%.4f) — best_params.json NOT overwritten. "
+                "Use --force-save to override when market conditions have changed.",
+                SENSITIVITY_RANK_METRIC,
+                new_sharpe,
+                existing_sharpe,
+            )
+            return
 
     payload = {
         "hmm_lookback_rows": int(best_row["hmm_lookback_rows"]),
@@ -946,7 +966,7 @@ def _save_best_params(best_row: pd.Series) -> None:
 
 
 def run_sensitivity(
-    full_grid: bool = True, lookback: str | None = None
+    full_grid: bool = True, lookback: str | None = None, force_save: bool = False
 ) -> pd.DataFrame:
     """
     Execute the sensitivity sweep and return the results DataFrame.
@@ -960,7 +980,12 @@ def run_sensitivity(
         dateutil string overriding ``BACKTEST_LOOKBACK`` (IS start) for this
         run only.  ``None`` → use ``BACKTEST_LOOKBACK`` from
         ``config_parameters.py``.  The IS end is always ``BACKTEST_OOS_START``.
-
+    force_save: bool | None
+        If ``True``, bypass the guard in ``_save_best_params()`` that prevents
+        overwriting a better existing result.  Use this when the market regime
+        has shifted and the current IS window's best Sharpe is lower than the
+        stored one — in that case the stale params are actively harmful and
+        should be replaced with the current best.  Default ``False`` (safe mode).
     Returns
     -------
     pd.DataFrame
@@ -1088,7 +1113,7 @@ def run_sensitivity(
     # Save best params (top row after sorting by SENSITIVITY_RANK_METRIC)
     valid = results_df[results_df[SENSITIVITY_RANK_METRIC].notna()]
     if not valid.empty:
-        _save_best_params(valid.iloc[0])
+        _save_best_params(valid.iloc[0], force_save=force_save)
         print_bnh_comparison(valid.iloc[0])
         # Re-run best for IS chart — extract only the keys _run_one_full needs.
         _param_keys = list(_PARAM_GRID.keys()) + ["vwap_threshold"]
@@ -1190,6 +1215,17 @@ if __name__ == "__main__":
             "to force a fresh download on the next run."
         ),
     )
+    parser.add_argument(
+        "--force-save",
+        action="store_true",
+        help=(
+            "Bypass the Sharpe-improvement guard in _save_best_params and always "
+            "overwrite best_params.json with the current run's best result, even if "
+            "its IS Sharpe is lower than the stored value.  Use this when the market "
+            "regime has shifted and the stored params are producing negative OOS "
+            "performance — keeping stale params is worse than accepting a lower IS Sharpe."
+        ),
+    )
     args = parser.parse_args()
 
     # --flush-cache: clear Parquet cache and exit immediately (no backtest run).
@@ -1199,16 +1235,17 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.oat:
-        run_sensitivity(full_grid=False, lookback=args.lookback)
+        run_sensitivity(full_grid=False, lookback=args.lookback, force_save=args.force_save)
     elif args.full_grid:
         log.warning(
             "--full-grid is deprecated. Consider using --bayes for smarter, "
             "faster optimisation with a wider search space."
         )
-        run_sensitivity(full_grid=True, lookback=args.lookback)
+        run_sensitivity(full_grid=True, lookback=args.lookback, force_save=args.force_save)
     else:
         # Default path: --bayes or no flag at all → Bayesian optimisation
         _run_sensitivity_optuna_study(
             n_trials=args.n_trials,
             lookback=args.lookback,
+            force_save=args.force_save,
         )
