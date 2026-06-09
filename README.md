@@ -50,6 +50,13 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
 | 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Welch's t-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~10–20 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
 
+**Detailed notes on `regime_validation.py`:**
+- Uses its own independent **1-year lookback** (`VALIDATION_LOOKBACK = "365 days ago UTC"`) — NOT affected by `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` used by `sensitivity.py` and `runner.py`.
+- Splits the 1-year window into 70% train (~255 days) and 30% test (~109 days).
+- Fits a fresh HMM model on the train set, predicts regime labels on the test set, and runs 6 statistical checks.
+- Runtime: ~10–15 minutes (dominated by Binance API paginated fetches for ~525k rows).
+- To expand to 2 years: modify `VALIDATION_LOOKBACK` to `"730 days ago UTC"` (runtime ~20–30 min, moderate statistical benefit).
+
 > **Recommended order for a new setup:**
 > `regime_validation` → `sensitivity` → `runner` → `websocket_main`
 
@@ -287,17 +294,16 @@ Binance REST API                   Binance WebSocket (production)
 
 **Component responsibilities:**
 
-| Class / Module | File | Role |
-|---|---|---|
-| *(constants)* | `config_parameters.py` | Single source of truth for all tunable constants (`SYMBOL`, `CCY`, `CRYPTOCCY`, intervals, depths, timeouts, HMM parameters) — imported by every package |
-| `OrderBookState` | `core/order_book_state.py` | Single source of truth — owns `local_book`, `history_order_book`, `balance_status`, `thread_lock`, and `thread_balance_lock` |
-| `MessageHandler` | `core/message_handler.py` | One active WebSocket callback: `handle_depth_message` (merges diff-depth ticks into `local_book`, appends snapshots, calls `calculate_best_quote` every 10th tick).  `handle_balance_message` is preserved but superseded — see `OrderExecutor` |
-| `RegimeDirector` | `strategy/regime_director.py` | Detects the current market regime via a `GaussianHMM` fitted on recent 5-minute klines.  Features are z-score scaled (`StandardScaler`, fitted on the first `train_end = max(2, int(n_rows × 2/3))` rows — adaptive per-window 2/3 split).  Fitted once at pre-session startup; then updated every `HIST_INTERVAL` (60 s) via a **two-speed** scheme: cheap Viterbi prediction on most iterations, full model re-fit every `HMM_REFIT_INTERVAL` (300 s).  Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability from `predict_proba()`), both protected by `_regime_lock` |
-| `AnalysisEngine` | `strategy/analysis.py` | Runs two background loops (`low_latency_analysis` and `historical_analysis`) that read from `OrderBookState` via the shared locks; applies VWAP, regime-confidence, and regime-direction filters before delegating order placement to `OrderExecutor`.  Enforces a **single-open-position guard** (`_position_open` flag): BUY fires only when flat; SELL resets the guard.  Prevents order stacking in both the WS-mode race window and REST-fallback mode. Counts suppressed BUYs in `_position_guard_skips` (logged at session end) |
-| `OrderExecutor` | `execution/order_executor.py` | Places LIMIT GTC orders **and** maintains real-time balance updates via a single Binance WebSocket API connection.  On connect: `session.logon` (HMAC-signed) → `userDataStream.subscribe` → receives `outboundAccountPosition` push events on the **same** socket.  Falls back to REST for orders if WS is unavailable; balances fall back to startup REST snapshot |
-| `websocket_main` | `websocket_main.py` | Session driver — instantiates all classes, seeds initial balances into `state`, runs pre-session regime detection, opens WebSocket streams, starts all threads, manages session lifetime and shutdown |
+| Class / Module | Role |
+|---|---|
+| `OrderBookState` | Shared order book (`local_book`, `history_order_book`) and balance data (`balance_status`); serialised via `thread_lock` and `thread_balance_lock` |
+| `MessageHandler` | Merges diff-depth WebSocket ticks into `local_book`; appends snapshots to history; triggers throttled quote calculation every 10 ticks |
+| `RegimeDirector` | Detects market regime via HMM on 5-minute bars (2/3-1/3 train/test split, adaptive per window). Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability) protected by `_regime_lock` |
+| `AnalysisEngine` | Runs `low_latency_analysis` (1 s cadence, scores order-book candidates) and `historical_analysis` (60 s cadence, updates HMM + VWAPs). Enforces single-open-position guard (`_position_open` flag) |
+| `OrderExecutor` | Places LIMIT GTC orders and maintains real-time balance via Binance WebSocket API. Falls back to REST for orders and startup snapshot if unavailable |
+| `websocket_main` | Session orchestrator — creates state, injects into handlers, runs pre-session regime fit, opens WebSocket streams, starts threads |
 
-**How the components interact:**
+**How they interact (essentials):**
 
 1. `websocket_main.py` creates a single `OrderBookState` instance and injects it into both `MessageHandler` and `AnalysisEngine`.  After construction it immediately seeds `state.balance_status` with the REST-fetched balances before any thread starts.
 2. Order-book data (`local_book`, `history_order_book`) is serialised through `state.thread_lock`.  `MessageHandler.handle_depth_message` acquires it to write; `AnalysisEngine.low_latency_analysis` acquires it to take a read-only copy and releases it before any heavy computation.
@@ -376,7 +382,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 5. Snapshot `btc_start_price` via `ticker_price(symbol)` and compute `start_total_usdt = usdt_balance + btc_balance × btc_start_price` — stored for the end-of-session P&L decomposition.
 6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (10 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
-7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of 1-minute klines (last 2 hours), fits `GaussianHMM` models for 2–4 states, selects the best by BIC, and assigns `regime_label` before any thread starts.
+7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of **5-minute klines** (last 10 hours) via `HMM_INTERVAL` / `HMM_LOOKBACK`, fits `GaussianHMM` models for 2–3 states (from `HMM_MAX_REGIMES`), selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.
 9. Open one `SpotWebsocketStreamClient` (`ws_client`) on the production stream endpoint; subscribe to `diff_book_depth` at 100 ms intervals; callback: `handle_depth_message`.
 10. Wait 1 second for the first diff-depth messages to arrive and populate `local_book["bids"]`.

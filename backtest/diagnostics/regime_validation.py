@@ -261,11 +261,6 @@ def _train_and_predict(
     before ``split_idx``.  Test rows are only passed to ``transform()``
     and ``predict()`` — neither changes learned parameters.
 
-    With the real dataset (~91,000 train rows, ~39,000 test rows) the
-    model sees **63 days** of market history during training — far more
-    representative than the live system's 80-minute window.  Phase 2
-    completes in **seconds** (one vectorised Viterbi pass).
-
     Args:
         features_df: Full feature DataFrame.
         split_idx:   First row of the test set.

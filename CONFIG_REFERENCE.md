@@ -1,0 +1,93 @@
+# Configuration Reference (`config_parameters.py`)
+
+Complete reference for all tunable constants. Default values are as of 2026-06-04.
+
+## Live System Parameters
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `SYMBOL` | `"BTCUSDT"` | Trading pair |
+| `HFT_INTERVAL` | 1 s | Low-latency analysis cadence |
+| `HIST_INTERVAL` | 60 s | Historical analysis + VWAP update cadence |
+| `N_LEVELS` | 50 | Order book depth (50 bids + 50 asks) |
+| `MAX_ORDERS_PER_ITER` | 1 | Max orders placed per low-latency iteration |
+| `MIN_VWAP_HISTORY_SIZE` | 5 | Minimum snapshots for VWAP calculation |
+| `DEFAULT_SESSION_MINUTES` | 10 | Session duration (live trading) |
+
+## HMM Regime Detection
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `HMM_INTERVAL` | 5-minute klines | Regime detection granularity |
+| `HMM_LOOKBACK` | "10 hours ago UTC" | Rolling window (~120 bars at 5 m); stable EM convergence |
+| `HMM_MAX_REGIMES` | 3 | Upper bound on hidden states (BIC search 2–3) |
+| `HMM_MIN_CONFIDENCE` | 0.70 | Gate: block orders if regime confidence < 70% posterior |
+| `HMM_N_ITERATIONS` | 1000 | Max EM iterations per model fit |
+| `HMM_RANDOM_STATE` | 46 | Random seed for reproducible state numbering |
+| `HMM_MIN_COVAR` | 1e-1 | Regularisation floor for covariance matrices |
+| `HMM_N_INIT` | 10 | Random restarts per candidate `n_components` |
+| `HMM_REFIT_INTERVAL` | 300 s | Full re-fit cadence (every 5 min at 5 m bars) |
+| `HMM_TRAIN_ROWS` | 80 | Legacy (no longer used); see code for adaptive split |
+| `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to GaussianHMM |
+
+## Strategy Filters
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `VWAP_THRESHOLD_MULTIPLIER` | 0.003 (0.30 %) | Dead-zone threshold for VWAP mean-reversion |
+| `VWAP_WINDOW` | 5 | 1-minute rolling window for VWAP (5 min total) |
+| `TREND_CONSECUTIVE_BARS` | 4 | Consecutive same-direction bars to trigger trend-pause |
+| `TREND_COOLDOWN_BARS` | 5 | Bars to maintain paused state after trend ends |
+| `STOP_LOSS_ROLLING_DAYS` | 90 | Rolling window for stop-loss volatility calculation |
+| `STOP_LOSS_STD_MULT` | 3.0 | Volatility multiplier for stop-loss distance |
+
+## Backtesting Parameters
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `BACKTEST_MACRO_INTERVAL` | "5m" | HMM regime frame (5-minute) |
+| `BACKTEST_MICRO_INTERVAL` | "1m" | Execution frame (1-minute) |
+| `BACKTEST_LOOKBACK` | "360 days ago UTC" | In-sample window start for sensitivity tuning |
+| `BACKTEST_OOS_START` | "90 days ago UTC" | Out-of-sample boundary (IS/OOS cutoff) |
+| `BACKTEST_INITIAL_BTC` | 0.065 | Starting BTC holdings |
+| `BACKTEST_INITIAL_CAPITAL` | 5,000 USDT | Starting USDT balance |
+| `BACKTEST_FEE_RATE` | 0.001 | Taker fee per side (0.10 %) |
+| `BACKTEST_FILL_SPREAD_BPS` | 5 | Synthetic fill cost (basis points) |
+| `BACKTEST_MAX_ROWS` | None | Max kline rows (unlimited; use for testing) |
+| `CACHE_TTL_HOURS` | 24 | Parquet cache time-to-live |
+
+## Output Paths
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `BEST_PARAMS_FILE` | `"backtest/results/best_params.json"` | Sensitivity sweep output (centralized) |
+| `BACKTEST_RESULTS_DIR` | `"backtest/results"` | Machine artefacts (JSON, Optuna SQLite) |
+| `BACKTEST_REPORTING_DIR` | `"backtest/reporting"` | Human reports (CSVs, Plotly charts) |
+
+## Sensitivity Analysis Parameters
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `SENSITIVITY_LOOKBACK` | *(removed)* | Use `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START` instead |
+| `SENSITIVITY_REFIT_EVERY` | 480 | Full HMM re-fit cadence during IS sweep (40 h at 5 m) |
+| `SENSITIVITY_PREDICT_EVERY` | 5 | Viterbi prediction cadence during IS sweep (every 5 candles) |
+| `SENSITIVITY_FEE_RATE` | 0.001 | Fee rate fixed during Optuna search (standard Binance Spot taker) |
+| `SENSITIVITY_RANK_METRIC` | "sharpe_ratio" | Metric used to rank trials (Sharpe ratio) |
+
+## Example best_params.json Output
+
+```json
+{
+  "schema_version": 1,
+  "hmm_lookback_rows": 120,
+  "hmm_max_regimes": 3,
+  "vwap_window": 5,
+  "vwap_threshold": 0.003,
+  "fee_rate": 0.001,
+  "generated_at": "2026-06-04T18:00:00+00:00",
+  "source_metric": "sharpe_ratio",
+  "source_value": 1.42
+}
+```
+
+**Note:** `schema_version` enables forward-compatible migrations if JSON structure changes in future updates.

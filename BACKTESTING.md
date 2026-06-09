@@ -150,32 +150,9 @@ weighted opportunity score — rather than simplified proxies.
 
 ## Step 2c — Synthetic Order Book Reconstruction
 
-The live strategy consumes **50 levels of bids and asks** per evaluation cycle.
-Kline data provides only a single OHLCV bar per candle.  To feed the existing
-scoring pipeline (`metrics.py` → `indicators.py` → `scores.py`) during a
-backtest, a synthetic depth ladder is constructed for each candle in three
-steps (full derivation in [`SYSTEM_ARCHITECTURE.md §
-Synthetic Order Book`](SYSTEM_ARCHITECTURE.md)):
-
-1. **Spread reconstruction** — `synthetic_best_bid = close − (high − low) / 2`,
-   `synthetic_best_ask = close + (high − low) / 2`.  `close` is used as mid
-   (not `(high + low) / 2`) because it is the last traded price and best
-   single-point estimate of end-of-candle position.
-
-2. **Level generation** — 50 bid and 50 ask levels are stepped away from the
-   best bid/ask at `tick_size = high − low` intervals.  Volume at level `i`
-   is `(volume / N_LEVELS) × 0.80^i` (exponential decay, standard assumption).
-
-3. **OBI asymmetry injection** — a symmetric book yields OBI = 0, defeating
-   the 70/30 score.  Each level's bid quantity is scaled by `2 × buy_ratio`
-   and ask quantity by `2 × sell_ratio`, where
-   `buy_ratio = taker_buy_base_vol / volume`.  This makes `micro_price` and
-   OBI reflect real taker flow while running the **exact production code**.
-
-> **Fill-cost model (not the same as the synthetic spread):** P&L simulation
-> uses a bps-based half-spread `close × BACKTEST_FILL_SPREAD_BPS / 20 000`
-> (default 5 bps ≈ $20 at $80 k BTC) — not the candle range, which would be
-> 10–100× larger and cause 100 % drawdown on a $10,000 portfolio.
+For each candle, 50 synthetic bid/ask levels are built from OHLCV data with OBI asymmetry injected from taker-buy flow.  
+Fill prices use `close × BACKTEST_FILL_SPREAD_BPS / 20 000` (default 5 bps).  
+See `backtest/synthetic_book.py` docstring for implementation details.
 
 ---
 
@@ -219,10 +196,10 @@ For each 1 m candle:
 
 ### Per-candle dataset sizes
 
-| Phase | Frame | Candles (IS 270 days) |
-|---|---|---|
-| 1 — HMM walk-forward | 5 m | ~77,760 |
-| 3 — Execution loop | 1 m | ~388,800 |
+| Phase                | Frame | Candles (IS 270 days) |
+|----------------------|-------|-----------------------|
+| 1 — HMM walk-forward | 5 m   | ~77,760               |
+| 3 — Execution loop   | 1 m   | ~388,800              |
 
 > **Memory:** `df_macro` ~6 MB, `df_micro` ~30 MB, one synthetic order book at a time
 > (100 rows, discarded after each candle) — total well under 50 MB.
@@ -292,83 +269,15 @@ if open_strategy_qty > _POSITION_DUST_BTC
 
 ### Position model — single open position at a time
 
-`simulate_pnl()` enforces a **one-position-at-a-time** rule to prevent
-grid-trading accumulation (stacking BUY legs on every dip signal):
+`simulate_pnl()` enforces a **one-position-at-a-time** rule via `open_strategy_qty` (BTC held exclusively by strategy signals, excluding `initial_btc`). BUY fires only when `open_strategy_qty ≤ 1e-6` (threshold below which position is treated as flat). SELL always closes the full position in one shot, guaranteeing the strategy returns to flat. The position guard counts suppressed BUY signals in `n_position_guard_skips` (returned in the `stats` dict).
 
-| Variable | Role |
-|---|---|
-| `open_strategy_qty` | BTC held exclusively by strategy BUY signals (excludes `initial_btc`) |
-| `_POSITION_DUST_BTC = 1e-6` | Threshold below which the position is treated as flat (prevents floating-point dust from permanently blocking the guard) |
-| `n_position_guard_skips` | Count of BUY signals suppressed because `open_strategy_qty > 0` |
+### Trade sizing and costs
 
-**BUY** fires only when `open_strategy_qty ≤ _POSITION_DUST_BTC` (flat).
-If already long, the signal is skipped and logged at INFO level:
-`HOLD │ position open │ <ts> │ held=X.XXXXXX BTC │ BUY opportunity suppressed`
-
-**SELL** always closes the **full** `open_strategy_qty` in one shot (not the
-synthetic book-depth qty), guaranteeing the strategy returns to flat so the
-BUY gate reopens on the very next qualifying signal.
-
-The initial BTC balance (`initial_btc`) is excluded from position tracking.
-Any SELL that fires before the first strategy BUY is treated as an
-*"orphan SELL"* — a visible WARNING box is printed; equity and cash flows
-remain correct.
-
-`n_position_guard_skips` is returned in the `stats` dict and printed in the
-`SIGNALS` section of the console report:
-```
-  HOLD (position open)       :       142  ← BUY suppressed by position guard
-```
-
-This guard is mirrored exactly in `strategy/analysis.py`
-(`AnalysisEngine._position_open`) for the live system, ensuring the backtest
-and live strategy share the same single-position mean-reversion behaviour.
-
-### Stop-loss vs Buy-and-Hold: asymmetric trade-off
-
-After a stop-loss fires the strategy holds **USDT (cash)** until the next
-qualifying BUY signal.  The **Buy-and-Hold (B&H) benchmark** holds BTC for the
-entire window without ever exitng.  This creates an intentional asymmetry that
-is visible in Panel 1 of the backtest chart (B&H dashed orange line):
-
-| Scenario after SL fires | Strategy | B&H |
-|---|---|---|
-| BTC keeps falling | ✅ Capital preserved (USDT holds value) | ❌ Continues to lose |
-| BTC rebounds immediately | ❌ Misses the recovery (still in cash) | ✅ Recovers fully |
-| BTC consolidates → new signal | Depends on re-entry speed | ✅ Already long |
-
-**What the chart tells you:**
-- **B&H beats strategy** on a sub-window → the SL fired during a dip that
-  recovered and the strategy did not re-enter fast enough (opportunity cost).
-- **Strategy beats B&H** → the SL avoided a sustained drawdown and re-entered
-  at a lower price (protection value exceeded missed-rebound cost).
-
-The goal is *not* to beat B&H on every sub-window but to outperform it on a
-**risk-adjusted** basis (higher Sharpe, lower max drawdown) over the full OOS window.
-
-**Calibration lever:** `STOP_LOSS_STD_MULT` (default 3.0, in `config_parameters.py`)
-- Too tight → fires on normal volatility → many missed rebounds → lags B&H.
-- Too loose → rarely fires → little protection → tracks B&H passively.
-Monitor `n_stop_loss_fires` in the console report after each OOS run and adjust
-`STOP_LOSS_STD_MULT` accordingly (increase to loosen, decrease to tighten).
-
-### Trade sizing
-- The candidate tuple from the production pipeline contains `bq` (bid quantity)
-  and `aq` (ask quantity) — the same values `OrderExecutor.execute()` uses to
-  size LIMIT orders in the live system.
-- BUY quantity = `aq` from the best-buy candidate; SELL quantity = `bq` from
-  the best-sell candidate.
-- A balance guard caps quantity at
-  `min(quantity, usdt_budget / (eff_price × (1 + fee_rate)))` for BUY and
-  `min(quantity, btc_balance)` for SELL.
-- `usdt_budget = usdt × BACKTEST_MAX_POSITION_PCT` (default 10 %) so each BUY
-  risks at most 10 % of available USDT, preventing all-in fee compounding.
-
-### Costs
-- Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`; Binance Spot standard).
-- Slippage estimate: add half the high-low spread as a conservative proxy.
-
-### P&L per trade and round-trip pairing
+- BUY quantity = `aq` from best-buy candidate, capped at `min(aq, usdt / (price × (1 + fee_rate)))` for BUY to reserve taker fee.
+- SELL quantity = `bq` from best-sell candidate, capped at `min(bq, btc_balance)`.
+- `usdt_budget = usdt × BACKTEST_MAX_POSITION_PCT` (10 %) limits each BUY to ~10 % of available USDT.
+- Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`).
+- Fill prices: `close ± half_spread` where `half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000` (default 5 bps, ~$20 at $80k BTC).
 
 A **round trip** is one complete BUY → SELL cycle and is the unit used to
 compute win rate, profit factor, and average holding time.  Round-trip pairing
@@ -431,24 +340,24 @@ When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
 
 ### Metric table
 
-| Metric | Key in `stats` dict | Formula / Description |
-|---|---|---|
-| **Total return** | `total_return_pct` | `(final_equity − initial_equity) / initial_equity × 100` |
-| **Buy-and-Hold return** | `bnh_total_return_pct` | Passive benchmark: buy at the first close, hold for the full window.  Computed by `compute_buy_and_hold()` on the same initial portfolio so the two percentages share the same denominator and are directly comparable.  Shown as a dashed orange line in the equity panel and in the figure title |
-| **Win rate** | `win_rate_pct` | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0` |
-| **Average trade PnL** | `avg_trade_pnl_usdt` | `mean(pnl_usdt)` over all round trips |
-| **Max drawdown** | `max_drawdown_pct` | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline |
-| **Sharpe ratio** | `sharpe_ratio` | `mean(Rp − Rf) / std(Rp − Rf) × √N` where `Rp` = period portfolio return, `Rf = (1 + BACKTEST_RISK_FREE_RATE)^(1/N) − 1` (exact per-period compounding; default 0.0), and `N` = periods per year.  Bucket size is chosen **adaptively**: ≥ 2 days → daily (N = 365), ≥ 2 h → hourly (N = 8 760), otherwise 5-min (N = 105 120).  Crypto trades 24/7 so √365 (not √252) is the correct annualiser for daily buckets |
-| **Sortino ratio** | `sortino_ratio` | Same as Sharpe but `std` is computed on **downside excess returns only** (`excess_ret[excess_ret < 0]`).  Penalises only negative volatility |
-| **Profit factor** | `profit_factor` | `Σ(pnl > 0) / |Σ(pnl < 0)|`  — ratio of gross winning P&L to gross losing P&L.  `∞` when there are no losing round trips |
-| **Avg holding period** | `avg_holding_minutes` | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period) |
-| **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain) |
-| **Regime filter hit rate** | `regime_filter_hit_rate_pct` | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate |
-| **VWAP filter hit rate** | `vwap_filter_hit_rate_pct` | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate) |
-| **Position guard skips** | `n_position_guard_skips` | Count of BUY signals that passed all three gates but were suppressed because the strategy already held an open position (`open_strategy_qty > 0`) — single-position mean-reversion mode |
-| **Whipsaw exits** | `n_whipsaw_exits` | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread` |
-| **Stop-loss fires** | `n_stop_loss_fires` | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance |
-| **Trend-pause skips** | `n_trend_pause_skips` | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars |
+| Metric                         | Key in `stats` dict              | Formula / Description                                                                                                                                                                                                                                                                                                                                                                                              |
+|--------------------------------|----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Total return**               | `total_return_pct`               | `(final_equity − initial_equity) / initial_equity × 100`                                                                                                                                                                                                                                                                                                                                                           |
+| **Buy-and-Hold return**        | `bnh_total_return_pct`           | Passive benchmark: buy at the first close, hold for the full window.  Computed by `compute_buy_and_hold()` on the same initial portfolio so the two percentages share the same denominator and are directly comparable.  Shown as a dashed orange line in the equity panel and in the figure title                                                                                                                 |
+| **Win rate**                   | `win_rate_pct`                   | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0`                                                                                                                                                                                                                                                                                                                                   |
+| **Average trade PnL**          | `avg_trade_pnl_usdt`             | `mean(pnl_usdt)` over all round trips                                                                                                                                                                                                                                                                                                                                                                              |
+| **Max drawdown**               | `max_drawdown_pct`               | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline                                                                                                                                                                                                        |
+| **Sharpe ratio**               | `sharpe_ratio`                   | `mean(Rp − Rf) / std(Rp − Rf) × √N` where `Rp` = period portfolio return, `Rf = (1 + BACKTEST_RISK_FREE_RATE)^(1/N) − 1` (exact per-period compounding; default 0.0), and `N` = periods per year.  Bucket size is chosen **adaptively**: ≥ 2 days → daily (N = 365), ≥ 2 h → hourly (N = 8 760), otherwise 5-min (N = 105 120).  Crypto trades 24/7 so √365 (not √252) is the correct annualiser for daily buckets |
+| **Sortino ratio**              | `sortino_ratio`                  | Same as Sharpe but `std` is computed on **downside excess returns only** (`excess_ret[excess_ret < 0]`).  Penalises only negative volatility                                                                                                                                                                                                                                                                       |
+| **Profit factor**              | `profit_factor`                  | Σ(pnl > 0) / Σ(pnl < 0) ratio of gross winning P&L to gross losing P&L.  INF when there are no losing round trips                                                                                                                                                                                                                                                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Avg holding period**         | `avg_holding_minutes`            | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period)                                                                                                                                                                                                                                                                                                      |
+| **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain)                                                                                                                                                                                                                             |
+| **Regime filter hit rate**     | `regime_filter_hit_rate_pct`     | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate                                                                                                                                                                                                                                             |
+| **VWAP filter hit rate**       | `vwap_filter_hit_rate_pct`       | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate)                                                                                                                                                                                                                                         |
+| **Position guard skips**       | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the strategy already held an open position (`open_strategy_qty > 0`) — single-position mean-reversion mode                                                                                                                                                                                                                            |
+| **Whipsaw exits**              | `n_whipsaw_exits`                | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread`                                                                                                                                                                                      |
+| **Stop-loss fires**            | `n_stop_loss_fires`              | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance                                                                                                                                                                                                   |
+| **Trend-pause skips**          | `n_trend_pause_skips`            | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars                                                                                                                                                            |
 
 ---
 
@@ -763,150 +672,13 @@ range is the **default** used by the baseline run.
 
 ### Execution Modes
 
-#### Default — Bayesian Optimisation via Optuna TPE *(recommended)*
+Three modes optimize the strategy over the 270-day in-sample window:
 
-Uses the **Tree-structured Parzen Estimator (TPE)** sampler to intelligently
-navigate the parameter space rather than exhaustively enumerating it.
+- **Bayesian (Optuna)** — Default: Uses Optuna's TPE for intelligent hyperparameter search. ~40 trials (~3–6 h on laptop). `python -m backtest.sensitivity --bayes`
+- **One-At-a-Time (OAT)** — Quick sanity check: baseline + 7 variations (~1–2 h). `python -m backtest.sensitivity --oat`
+- **Full-grid** — Exhaustive 30-run sweep (deprecated). `python -m backtest.sensitivity --full-grid`
 
-- **40 trials** by default (~3–6 h on a laptop, ~5–8 min/trial on the 270-day IS window at 5 m).
-- Data pre-fetched **once** before the study begins and shared across all trials
-  via a `_make_objective(prefetched_macro, prefetched_micro)` factory closure — no redundant API calls.
-- The study is persisted to `backtest/results/optuna.db` (SQLite) with
-  `load_if_exists=True`, so an interrupted run **resumes automatically** from
-  the last completed trial.
-- Plotly diagnostic HTML charts — automatically saved to **`backtest/reporting/`** after every Bayesian study:
-  - `optuna_history_<ts>.html` — objective value vs trial number (convergence check).
-  - `optuna_importance_<ts>.html` — fANOVA parameter importance.
-  - `optuna_contour_<ts>.html` — 2-D Sharpe surface for `hmm_lookback_rows × vwap_window` (the two highest-importance parameters per fANOVA).
-
-```bash
-python -m backtest.sensitivity                         # 40 trials (default, IS window)
-python -m backtest.sensitivity --bayes --n-trials 50  # custom trial count
-python -m backtest.sensitivity --lookback "720 days ago UTC"  # longer IS start
-```
-
-**Bayesian search space (`_OPTUNA_SPACE`):**
-
-| Parameter | Type | Low | High | Step |
-|---|---|---|---|---|
-| `hmm_lookback_rows` | int | 30 | 240 | 10 |
-| `hmm_max_regimes` | int | 2 | 4 | 1 |
-| `vwap_window` | int | 5 | 60 | 5 |
-| `vwap_threshold` | float | 0.001 | 0.005 | 0.0005 |
-
-`fee_rate` is fixed at `0.001` (Binance standard taker rate) — not a strategy
-knob and excluded from the search space.
-
-#### Phase 1 — One-At-a-Time (OAT) sweep *(quick sanity check)*
-
-Hold all parameters at defaults; vary one at a time.
-- 1 baseline + 7 non-default values = **8 runs**.
-- Shows which parameter individually drives the most sensitivity.
-- Does **not** capture interaction effects.
-- Trigger rule: if any single OAT parameter causes `|ΔSharpe| > 0.5`, the
-  console report suggests running `--bayes` for a wider search.
-
-```bash
-python -m backtest.sensitivity --oat
-```
-
-#### Phase 2 — Full factorial grid *(DEPRECATED)*
-
-All combinations exhaustively.  Superseded by `--bayes` which covers a wider
-continuous space in fewer runs.
-
-```bash
-python -m backtest.sensitivity --full-grid   # ⚠️ deprecated — use --bayes
-```
-
-#### `--lookback` override
-
-Any execution mode accepts `--lookback` to override the IS start (`BACKTEST_LOOKBACK`)
-for a single run without editing `config_parameters.py`.  The IS end is always
-`BACKTEST_OOS_START` — it cannot be overridden via CLI to preserve the OOS boundary:
-
-```bash
-python -m backtest.sensitivity --lookback "720 days ago UTC"   # longer IS window
-python -m backtest.sensitivity --oat --lookback "180 days ago UTC"  # shorter IS smoke-test
-```
-
-#### Guard — existing `best_params.json`
-
-Before every run (all three modes), `_check_existing_best_params()` inspects
-any existing `best_params.json` and prints a bordered table showing its age,
-Sharpe, and parameter values.  The user is prompted `[y/N]` and must explicitly
-confirm before the run proceeds.  Non-interactive environments abort
-automatically (`EOFError` guard).  For `--bayes` specifically, the guard notes
-that the study **resumes** (existing trials are not lost) rather than restarting.
-
----
-
-### Implementation (Approach A — keyword overrides)
-
-`run_signals()` accepts six optional keyword arguments that default to `None`
-(falling back to `config_parameters.py` constants when `None`).  Existing
-callers (`runner.py`) require zero changes.
-
-```python
-# Inside _run_one() — shared by OAT, full-grid, and every Bayesian trial
-signals = run_signals(
-    hmm_lookback_rows=params["hmm_lookback_rows"],   # overrides HMM_LOOKBACK_ROWS
-    hmm_max_regimes=params["hmm_max_regimes"],        # overrides HMM_MAX_REGIMES
-    vwap_window=params["vwap_window"],                # overrides VWAP_WINDOW
-    refit_every=SENSITIVITY_REFIT_EVERY,              # 480 — same cadence as runner.py (REFIT_EVERY=480)
-    predict_every=SENSITIVITY_PREDICT_EVERY,          # 5 — 5× fewer Viterbi passes
-    prefetched_macro=prefetched_macro,                # pre-fetched 5m klines (no extra API call)
-    prefetched_micro=prefetched_micro,                # pre-fetched 1m klines (no extra API call)
-)
-_, _, stats = simulate_pnl(signals, fee_rate=params["fee_rate"])
-```
-
-> **`fee_rate` in `_run_one()`:** `fee_rate=0.001` is always injected into
-> `params` before every `_run_one()` call (both Bayes and grid modes).
-> `runner.py` uses its own `BACKTEST_FEE_RATE = 0.001` — the sensitivity
-> result is informational only since Binance charges its fixed taker fee regardless.
-> The sensitivity optimizer's choice of fee rate is diagnostic, not prescriptive.
-
-**Combined speedup per OAT run (270-day IS window at 5 m vs naïve full-fetch run):**
-
-| Optimisation | Constant | Factor |
-|---|---|---|
-| IS/OOS split | `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START` (270-day IS, 5 m) | defines the window |
-| Less frequent HMM refit | `SENSITIVITY_REFIT_EVERY = REFIT_EVERY = 480` | IS and OOS share the same 40-h cadence |
-| Less frequent Viterbi | `SENSITIVITY_PREDICT_EVERY = 5` | ~5× fewer predict calls |
-| `itertuples()` in P&L loop | — (code change in `pnl.py`) | ~5× faster P&L walk |
-| Numpy-vectorised book build | — (code change in `synthetic_book.py`) | ~5–10× faster per candle |
-
-Total wall time: **~1–2 h** for the full OAT (8 runs) on a laptop.
-
----
-
-### Output
-
-**Console** — sorted summary table (one row per combination):
-
-```
-════════════════════════════════════════════════════════════════════════════════════════
-  SENSITIVITY ANALYSIS — BTCUSDT  (bayes, 30 combinations)
-════════════════════════════════════════════════════════════════════════════════════════
- hmm_lookback_rows  hmm_max_regimes  vwap_window  fee_rate  sharpe_ratio
-           180               3              7       0.001       1.47
-           120               3              5       0.001       1.42   ← baseline
-           ...
-════════════════════════════════════════════════════════════════════════════════════════
-```
-
-For OAT mode the table also includes all `_DISPLAY_COLS` metrics (total return,
-drawdown, Sortino, win rate, profit factor, round trips, avg holding period),
-followed by a per-parameter delta-Sharpe report.
-
-**Files written:**
-- `backtest/reporting/sensitivity_<mode>_<timestamp>.csv` — all metrics, all runs (human-readable).
-- `backtest/results/best_params.json` — winning parameter set (ranked by Sharpe; machine-readable).
-- `backtest/results/optuna.db` — SQLite study persistence (Bayes mode only; machine-readable).
-- `backtest/reporting/optuna_history_<ts>.html` — (Bayes mode only — always saved automatically).
-- `backtest/reporting/optuna_importance_<ts>.html` — (Bayes mode only — always saved automatically).
-- `backtest/reporting/optuna_contour_<ts>.html` — (Bayes mode only — always saved automatically).
+For full CLI options: `python -m backtest.sensitivity --help`
 
 ---
 

@@ -245,6 +245,31 @@ historical_analysis()                       low_latency_analysis()
 
 ---
 
+## A.5a Confidence Gating — `HMM_MIN_CONFIDENCE`
+
+Even with a valid regime label, the HMM's posterior probability for the current state may be ambiguous (e.g., 55% trending_up vs 45% neutral).
+The `predict_proba()` method returns this posterior probability for the assigned regime state.
+
+**Confidence gate**: If `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.70 = 70% posterior probability threshold),
+both BUY and SELL orders are skipped on that iteration.
+This prevents trading on weak signals when the model is uncertain.
+
+```python
+# In low_latency_analysis():
+regime_confidence = self.regime_director.regime_confidence  # posterior prob ∈ [0.0, 1.0]
+
+if regime_confidence is not None and regime_confidence < HMM_MIN_CONFIDENCE:
+    # Skip both sides — signal is ambiguous (coin-flip probability)
+    logging.info("Regime '%s' confidence %.2f < %.2f — skipped",
+                 current_regime, regime_confidence, HMM_MIN_CONFIDENCE)
+    continue
+```
+
+`HMM_MIN_CONFIDENCE` is configured in `config_parameters.py` and can be tuned independently of the `sensitivity.py` Bayesian search
+(it is not in the Optuna search space — fixed based on risk tolerance for ambiguous signals).
+
+---
+
 ## A.6 Threading Safety Summary
 
 | Operation | Lock held | Duration |

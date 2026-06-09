@@ -101,6 +101,9 @@ from config_parameters import (
     SENSITIVITY_RANK_METRIC,
     SENSITIVITY_OAT_THRESHOLD,
     VWAP_THRESHOLD_MULTIPLIER,
+    BEST_PARAMS_FILE,
+    BACKTEST_RESULTS_DIR,
+    BACKTEST_REPORTING_DIR,
 )
 
 logging.basicConfig(
@@ -111,17 +114,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Directories
 # ---------------------------------------------------------------------------
-# _RESULTS_DIR  — machine-readable artefacts consumed by the live system and
-#                 Optuna (best_params.json, optuna.db).  NOT for human reports.
-# _REPORTING_DIR — human-readable summaries: sensitivity CSVs and Optuna HTML
-#                  charts.  Lives under backtest/reporting/ alongside formatters.py.
-_RESULTS_DIR = pathlib.Path(__file__).parent / "results"
-_RESULTS_DIR.mkdir(exist_ok=True)
+# Use centralized path definitions from config_parameters.py (prevents
+# divergence between sensitivity.py producer and param_loader.py consumers).
+_RESULTS_DIR = pathlib.Path(__file__).parent.parent / BACKTEST_RESULTS_DIR
+_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-_REPORTING_DIR = pathlib.Path(__file__).parent / "reporting"
-_REPORTING_DIR.mkdir(exist_ok=True)
+_REPORTING_DIR = pathlib.Path(__file__).parent.parent / BACKTEST_REPORTING_DIR
+_REPORTING_DIR.mkdir(parents=True, exist_ok=True)
 
-_BEST_PARAMS_PATH = _RESULTS_DIR / "best_params.json"
+_BEST_PARAMS_PATH = _RESULTS_DIR / BEST_PARAMS_FILE
 
 # ---------------------------------------------------------------------------
 # Parameter grid definition
@@ -938,6 +939,7 @@ def _save_best_params(best_row: pd.Series, force_save: bool = False) -> None:
             return
 
     payload = {
+        "schema_version": 1,  # Increment on breaking changes to JSON structure
         "hmm_lookback_rows": int(best_row["hmm_lookback_rows"]),
         "hmm_max_regimes": int(best_row["hmm_max_regimes"]),
         "vwap_window": int(best_row["vwap_window"]),
@@ -1235,13 +1237,17 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.oat:
-        run_sensitivity(full_grid=False, lookback=args.lookback, force_save=args.force_save)
+        run_sensitivity(
+            full_grid=False, lookback=args.lookback, force_save=args.force_save
+        )
     elif args.full_grid:
         log.warning(
             "--full-grid is deprecated. Consider using --bayes for smarter, "
             "faster optimisation with a wider search space."
         )
-        run_sensitivity(full_grid=True, lookback=args.lookback, force_save=args.force_save)
+        run_sensitivity(
+            full_grid=True, lookback=args.lookback, force_save=args.force_save
+        )
     else:
         # Default path: --bayes or no flag at all → Bayesian optimisation
         _run_sensitivity_optuna_study(

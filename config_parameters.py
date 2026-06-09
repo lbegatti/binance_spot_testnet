@@ -194,7 +194,7 @@ BACKTEST_FEE_RATE = 0.001  # 0.10 %
 
 # Annualised risk-free rate for Sharpe / Sortino.
 # pnl.py converts this to a per-period rate automatically.
-# Set to 0.04–0.05 for a US T-bill proxy; 0.0 is the standard in crypto research.
+# Set to 0.04–0.05 for a US T-bill proxy;
 BACKTEST_RISK_FREE_RATE = 0.00  # annualised (0.0 = no risk-free rate adjustment)
 
 # Fill-cost model: simulated bid-ask half-spread in basis points.
@@ -261,3 +261,48 @@ STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
 #              backtest/signals.py  (backtest path),
 #              backtest/sensitivity.py (fixed baseline — not tuned in grid).
 VWAP_THRESHOLD_MULTIPLIER: float = 0.002  # 0.20 % dead zone — exact round-trip break-even
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Backtesting — Output Paths and best_params.json Orchestration
+# ---------------------------------------------------------------------------
+# Filename of the best-parameter JSON file produced by sensitivity.py and
+# consumed by websocket_main.py (live system) and runner.py (backtest).
+# Centralized here to prevent divergence between producer and consumers.
+# NOTE: This is the FILENAME ONLY (best_params.json); directory paths defined below.
+BEST_PARAMS_FILE = "best_params.json"
+
+# Output directories for sensitivity sweep artifacts.
+BACKTEST_RESULTS_DIR = "backtest/results"  # Machine: best_params.json, optuna.db
+BACKTEST_REPORTING_DIR = "backtest/reporting"  # Human: CSVs, Optuna HTML charts
+
+# Sensitivity sweep — --force-save override flag.
+# By default, sensitivity.py only overwrites best_params.json if the new
+# Sharpe ratio is strictly better than the value already stored (guard logic
+# in backtest/sensitivity.py line ~920). Pass --force-save to override when
+# the market regime has shifted and cached params are stale/harmful.
+#
+# Usage: python -m backtest.sensitivity --force-save
+#
+# Fields derived from best_params.json:
+#
+# LIVE SYSTEM (websocket_main.py):
+#   - hmm_lookback_rows  → patched to HMM_LOOKBACK (string, via rows_to_lookback)
+#   - hmm_max_regimes    → patched to HMM_MAX_REGIMES (int)
+#   - vwap_threshold     → patched to VWAP_THRESHOLD_MULTIPLIER (float)
+#   - fee_rate          → NOT USED (stored for reference only; Binance charges
+#                         its own fees regardless of our simulation parameter)
+#
+# BACKTESTING (runner.py):
+#   - hmm_lookback_rows  → passed as kwarg to run_signals()
+#   - hmm_max_regimes    → passed as kwarg to run_signals()
+#   - vwap_window        → passed as kwarg to run_signals()
+#   - vwap_threshold     → passed as kwarg to run_signals()
+#   - fee_rate          → passed as kwarg to simulate_pnl(); ensures OOS Sharpe
+#                         is computed with same fee assumption as IS tuning.
+#
+# Note: HMM_LOOKBACK conversion between storage formats:
+#   - Storage (best_params.json): hmm_lookback_rows as int (candle count)
+#   - Live system (HMM_LOOKBACK): dateutil string ("10 hours ago UTC")
+#   - Conversion (param_loader.py): rows_to_lookback() multiplies rows × 5 min
+#   - Example: 120 rows × 5 min/row = 600 min = 10 hours → "10 hours ago UTC"
