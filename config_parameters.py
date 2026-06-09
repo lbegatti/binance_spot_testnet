@@ -86,8 +86,9 @@ HMM_N_INIT = 10
 # HMM_TRAIN_ROWS is derived from HMM_LOOKBACK_ROWS — see below.
 # Minimum posterior probability for regime gating.
 # predict_proba()[-1][current_regime] < HMM_MIN_CONFIDENCE → iteration skipped.
-# 0.70 = 70 % probability mass required on the winning state.
-HMM_MIN_CONFIDENCE = 0.70
+# 0.60 = 1.8× random for 3 states (33 % baseline). Still requires clear model
+# conviction while opening the 50–69 % confidence band that 0.70 fully rejected.
+HMM_MIN_CONFIDENCE = 0.60
 # Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
 # inside historical_analysis().  Between re-fits only a cheap Viterbi pass
 # (predict_current_regime()) runs.  Must be a multiple of HIST_INTERVAL.
@@ -249,8 +250,8 @@ STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
 #
 # Rule of thumb: threshold must cover at least the round-trip fee.
 #   Standard Binance Spot taker fee: 0.10 % per side → 0.20 % round trip.
-#   0.002 (0.20 %) = exact round-trip break-even (2 × one-way fee).
-#   0.003 (0.30 %) = break-even + 0.10 % profit margin per side (default).
+#   0.002 (0.20 %) = exact round-trip break-even (2 × one-way fee). [default]
+#   0.003 (0.30 %) = break-even + 0.10 % profit margin per side.
 #   Higher values filter out more marginal signals, reducing trade count.
 #
 # Increase to 0.005–0.010 in choppy / low-volatility markets.
@@ -259,4 +260,4 @@ STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
 # Imported by: strategy/analysis.py (live WebSocket path),
 #              backtest/signals.py  (backtest path),
 #              backtest/sensitivity.py (fixed baseline — not tuned in grid).
-VWAP_THRESHOLD_MULTIPLIER: float = 0.003  # 0.30 % dead zone — break-even + margin
+VWAP_THRESHOLD_MULTIPLIER: float = 0.002  # 0.20 % dead zone — exact round-trip break-even

@@ -48,7 +48,7 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 | 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 10 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
 | 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
-| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 365 days of data and runs six statistical tests (direction test, Welch's t-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~15–30 min on a laptop (365-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
+| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Welch's t-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~10–20 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
 
 > **Recommended order for a new setup:**
 > `regime_validation` → `sensitivity` → `runner` → `websocket_main`
@@ -140,7 +140,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices — prevents positive-definite errors.  1e-1 is the recommended safe default for z-scored financial features |
 | **HMM** | `HMM_N_INIT` | `10` | Number of independent random-seed restarts per candidate `n_components` value inside `select_hmm_model()`.  Higher values reduce the chance of degenerate EM solutions (e.g. transmat row summing to 0) on flat / low-variance windows |
 | **HMM** | `HMM_TRAIN_ROWS` | `80` | Legacy constant kept in `config_parameters.py` for reference.  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set |
-| **HMM** | `HMM_MIN_CONFIDENCE` | `0.70` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
+| **HMM** | `HMM_MIN_CONFIDENCE` | `0.60` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
 | **Backtesting** | `BACKTEST_MACRO_INTERVAL` | `"5m"` | Kline resolution for the HMM regime frame.  5-minute bars reduce noise vs 1-minute without losing intraday regime granularity.  At 5 m: 270 IS days → ~77,760 rows; 90 OOS days → ~25,920 rows. |
@@ -304,13 +304,13 @@ Binance REST API                   Binance WebSocket (production)
 3. Balance data (`balance_status`) is serialised through the dedicated `state.thread_balance_lock`, completely independent of `thread_lock`.  This prevents the high-frequency WebSocket order-book path (every 100 ms) from blocking on the lower-frequency balance path.
 4. `MessageHandler` is the **only writer** to order-book data in `OrderBookState`.  `OrderExecutor._handle_balance_update` is the **only writer** to `balance_status`.  `AnalysisEngine` is **read-only** — it copies data under the appropriate lock and immediately releases it.
 5. `AnalysisEngine` delegates order placement to `OrderExecutor`.  When `_select_best_opportunity()` returns a non-`None` 8-element tuple `(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)`, the engine calls `executor.execute("BUY", best_buy)` or `executor.execute("SELL", best_sell)`.  `OrderExecutor` validates the strategy, checks balances under `thread_balance_lock`, computes quantity (`aq` for BUY, `bq` for SELL), and sends a LIMIT GTC order via its own `SpotWebsocketAPIClient`.  BUY orders are capped at `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))`: dividing by price × (1 + fee) reserves the taker fee so the total debit never exceeds the available USDT balance (Binance charges the fee on top of the notional and rejects with `insufficient balance` if the full balance is committed).  The response arrives asynchronously in `handle_order_response`.
-6. **VWAP dip/strength confirmation filter** — `AnalysisEngine` owns a private `_vwap_lock` plus two attributes `_bid_vwap` and `_ask_vwap` (initially `None`).  `historical_analysis` computes both VWAPs from `history_order_book` every 1 min and publishes them under `_vwap_lock`.  `low_latency_analysis` reads both under the same lock and gates order execution using a **mean-reversion** strategy with a **dead-zone threshold** (`VWAP_THRESHOLD_MULTIPLIER` δ, default 0.003 = 0.30 %):
+6. **VWAP dip/strength confirmation filter** — `AnalysisEngine` owns a private `_vwap_lock` plus two attributes `_bid_vwap` and `_ask_vwap` (initially `None`).  `historical_analysis` computes both VWAPs from `history_order_book` every 1 min and publishes them under `_vwap_lock`.  `low_latency_analysis` reads both under the same lock and gates order execution using a **mean-reversion** strategy with a **dead-zone threshold** (`VWAP_THRESHOLD_MULTIPLIER` δ, default 0.002 = 0.20 %):
    - **BUY**: execute only if `_bid_vwap is None` (first ~1 min) **or** `micro_price < bid_vwap × (1 − δ)`.  BUY is anchored to `bid_vwap` (volume-weighted bid pressure).
    - **SELL**: execute only if `_ask_vwap is None` (first ~1 min) **or** `micro_price ≥ ask_vwap × (1 + δ)`.  SELL is anchored to `ask_vwap` (volume-weighted ask pressure).
    - Each side uses its own VWAP anchor; using a shared `bid_vwap` for both would introduce a cross-side anchoring bias.
    - This logic may be reverted to a momentum strategy (BUY if `micro_price > ask_vwap`, SELL if `micro_price < bid_vwap`) if backtesting favours trend-following over mean-reversion.
 7. **Real-time balance tracking (no listenKey)** — `OrderExecutor` owns the single `SpotWebsocketAPIClient` connection (`wss://testnet.binance.vision/ws-api/v3`).  On socket open (`on_open` callback) it sends a signed `session.logon` frame.  On success it immediately sends `userDataStream.subscribe`.  Once confirmed, Binance pushes `outboundAccountPosition` events on the **same** connection whenever a balance changes (e.g. after an order fill).  `handle_order_response` routes these push events (frames with no `"id"` field) to `_handle_balance_update`, which writes to `state.balance_status` under `thread_balance_lock`.  If the testnet doesn't support `session.logon` or `userDataStream.subscribe`, the executor falls back silently to the REST snapshot taken at session startup.
-8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` and `regime_confidence` are never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration applies a **two-speed** update: cheap Viterbi prediction (`predict_current_regime()`) on most iterations, full model re-fit (`select_hmm_model()`) every `HMM_REFIT_INTERVAL` (300 s, i.e. every 5th iteration).  Features are **z-score scaled** via `StandardScaler` before every `fit()` / `predict()` / `predict_proba()` call — the scaler is fitted on the first `train_end` rows only (in-sample), where `train_end = max(2, int(n_rows × 2/3))`, and applied to the full window (out-of-sample) to avoid data leakage.  At the default 120-row window `train_end = 80` (~⅔ in-sample, ~⅓ out-of-sample); shorter windows scale proportionally.  `assign_regime_labels()` runs inside `_regime_lock` on every iteration.  `low_latency_analysis` reads both `regime_label` and `regime_confidence` under `_regime_lock` and applies **two sequential gates** before any order: (a) **confidence gate** — if `regime_confidence < HMM_MIN_CONFIDENCE` (0.70), both BUY and SELL are skipped regardless of label (the model is uncertain); (b) **direction gate** — BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
+8. **HMM regime filter** — `websocket_main.py` instantiates `RegimeDirector` and calls `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()` **before** the analysis threads start, so `regime_label` and `regime_confidence` are never `None` on the first `low_latency_analysis` iteration.  Every `historical_analysis` iteration applies a **two-speed** update: cheap Viterbi prediction (`predict_current_regime()`) on most iterations, full model re-fit (`select_hmm_model()`) every `HMM_REFIT_INTERVAL` (300 s, i.e. every 5th iteration).  Features are **z-score scaled** via `StandardScaler` before every `fit()` / `predict()` / `predict_proba()` call — the scaler is fitted on the first `train_end` rows only (in-sample), where `train_end = max(2, int(n_rows × 2/3))`, and applied to the full window (out-of-sample) to avoid data leakage.  At the default 120-row window `train_end = 80` (~⅔ in-sample, ~⅓ out-of-sample); shorter windows scale proportionally.  `assign_regime_labels()` runs inside `_regime_lock` on every iteration.  `low_latency_analysis` reads both `regime_label` and `regime_confidence` under `_regime_lock` and applies **two sequential gates** before any order: (a) **confidence gate** — if `regime_confidence < HMM_MIN_CONFIDENCE` (0.60), both BUY and SELL are skipped regardless of label (the model is uncertain); (b) **direction gate** — BUY orders are suppressed in `"trending_down"` or `"high_volatility"` regimes; SELL orders are suppressed in `"trending_up"` or `"high_volatility"` regimes.
 
 ---
 
@@ -524,7 +524,7 @@ Both VWAPs are published under `_vwap_lock` so the low-latency thread can read t
 
 ### Dip/Strength Confirmation Filter (Mean-Reversion)
 
-After the first `historical_analysis` iteration (≈ 1 min into the session), `_bid_vwap` and `_ask_vwap` are populated.  `low_latency_analysis` reads both on every iteration and applies a **dip/strength confirmation gate** with a symmetric dead zone (`VWAP_THRESHOLD_MULTIPLIER` δ, default 0.003) before sending an order:
+After the first `historical_analysis` iteration (≈ 1 min into the session), `_bid_vwap` and `_ask_vwap` are populated.  `low_latency_analysis` reads both on every iteration and applies a **dip/strength confirmation gate** with a symmetric dead zone (`VWAP_THRESHOLD_MULTIPLIER` δ, default 0.002) before sending an order:
 
 | Side | Anchor | Condition to execute | Interpretation |
 |------|--------|---------------------|----------------|
@@ -534,7 +534,7 @@ After the first `historical_analysis` iteration (≈ 1 min into the session), `_
 $$\text{VWAP gate (BUY):} \quad P_{\mu} < \text{VWAP}_{\text{bid}} \times (1 - \delta)$$
 $$\text{VWAP gate (SELL):} \quad P_{\mu} \geq \text{VWAP}_{\text{ask}} \times (1 + \delta)$$
 
-where $\delta$ = `VWAP_THRESHOLD_MULTIPLIER` (default 0.003 = 0.30 %).  Signals within ±δ of the respective VWAP are rejected as micro-noise that cannot cover the round-trip fee.
+where $\delta$ = `VWAP_THRESHOLD_MULTIPLIER` (default 0.002 = 0.20 %).  Signals within ±δ of the respective VWAP are rejected as micro-noise that cannot cover the round-trip fee.
 
 Each side is anchored to its own reference price: `bid_vwap` tracks volume-weighted bid pressure (the BUY benchmark); `ask_vwap` tracks volume-weighted ask pressure (the SELL benchmark).  Using a shared `bid_vwap` for both sides would introduce a cross-side anchoring bias.
 
@@ -652,7 +652,7 @@ $$\text{regime\_confidence} = P(\text{state} = \text{current\_regime} \mid \text
 
 | `regime_confidence` | Interpretation |
 |---|---|
-| ≥ `HMM_MIN_CONFIDENCE` (0.70) | Model is confident — gates apply normally |
+| ≥ `HMM_MIN_CONFIDENCE` (0.60) | Model is confident — gates apply normally |
 | < `HMM_MIN_CONFIDENCE` | Model is uncertain (e.g. 55 % vs 45 %) — **both BUY and SELL are skipped** |
 | `None` (warm-up) | No model fitted yet — gate is transparent |
 
@@ -696,7 +696,7 @@ Two gates are applied **sequentially**:
 | `regime_confidence` | Result |
 |---|---|
 | `None` (before first historical run) | ✅ transparent — all orders allowed |
-| ≥ `HMM_MIN_CONFIDENCE` (0.70) | ✅ proceed to direction gate |
+| ≥ `HMM_MIN_CONFIDENCE` (0.60) | ✅ proceed to direction gate |
 | < `HMM_MIN_CONFIDENCE` | ❌ **both** BUY and SELL skipped |
 
 **Gate 2 — Direction** (evaluated only if confidence gate passed):
@@ -727,12 +727,16 @@ websocket_main.py startup
 │
 └── historical_analysis — every 60 s
     ├── compute bid_vwap / ask_vwap                           ← existing VWAP logic
-    ├── get_klines_data()                                     ← refresh features from Binance
-    ├── if iteration % 5 == 0:
-    │     select_hmm_model()                                  ← full re-fit + new scaler (every 5 min)
-    │   else:
-    │     predict_current_regime()                            ← cheap Viterbi + predict_proba
-    └── assign_regime_labels() under _regime_lock             ← label + confidence write (every iteration)
+    ├── check UTC clock boundary:
+    │     now = int(time.time())
+    │     current_5m_boundary = now - (now % 300)
+    │     if current_5m_boundary > _last_hmm_boundary:
+    │       get_klines_data()                                 ← refresh features from Binance
+    │       if hmm_iteration % hmm_refit_every == 0:
+    │         select_hmm_model()                              ← full BIC re-fit + new scaler
+    │       else:
+    │         predict_current_regime()                        ← cheap Viterbi + predict_proba
+    └── assign_regime_labels() under _regime_lock             ← label + confidence write (every boundary)
 ```
 
 ---
@@ -771,7 +775,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/pnl.py` | ✅ done | Simulated P&L — **intra-candle whipsaw guard** (`SELL_WHIPSAW` at `low−half_spread` when same 1m bar hits BUY+SELL zones; `n_whipsaw_exits` in stats); **single-position mean-reversion guard** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY fires only when flat, SELL closes the full open position in one shot; balance guard; bps-based `half_spread` fill (`BACKTEST_FILL_SPREAD_BPS`); per-trade position cap (`BACKTEST_MAX_POSITION_PCT`); equity curve; FIFO round-trip pairing; explicit taker-fee deduction in `_pair_round_trips`; Step 5 metrics |
 | `backtest/runner.py` | ✅ done | Top-level orchestration — fetches **OOS window** (`BACKTEST_OOS_START → today`, ~25,920 rows at 5 m / ~129,600 rows at 1 m) via `fetch_macro_klines` + `fetch_micro_klines` (cached); chains all modules, delegates report/CSV to `reporting/`; **plot is ON by default** (use `--no-plot` to suppress in headless/CI mode), `--save-png`, and `--flush-cache` flags.  Loads `fee_rate` from `best_params.json` and passes to `simulate_pnl()` |
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored |
-| `backtest/diagnostics/regime_validation.py` | ✅ done | Offline long-horizon regime validation — **70/30 train-test split** on 1 year (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~157,500 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation` |
+| `backtest/diagnostics/regime_validation.py` | ✅ done | Offline long-horizon regime validation — **70/30 train-test split** on 2 years (~210,000 rows, `VALIDATION_LOOKBACK = "730 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~63,000 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation` |
 | `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands, VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
 | `backtest/sensitivity.py` | ✅ done | **Bayesian optimisation via Optuna TPE (default, 40 trials)**, OAT sweep (`--oat`, 8 runs), and deprecated full-grid (`--full-grid`) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER` on the **IS window** (270 days, ~77,760 5m / ~388,800 1m rows).  `fee_rate` fixed at `SENSITIVITY_FEE_RATE` (0.001).  `--lookback` flag overrides IS start.  `--flush-cache` clears the Parquet cache.  Writes `best_params.json` — loaded by `websocket_main.py` (live) and `runner.py` (backtest). Use Case B deferred. |
 

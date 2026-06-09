@@ -503,8 +503,8 @@ Specifically it answers four questions:
 
 #### Dataset
 
-`VALIDATION_LOOKBACK = "365 days ago UTC"` fetches **~525,000 rows** at 1 m
-(365 × 24 × 60 = 525,600 candles).  One year of BTC data captures multiple full
+`VALIDATION_LOOKBACK = "730 days ago UTC"` fetches **~210,000 rows** at 5m
+(730 × 24 × 12 = 210,240 candles).  Two years of BTC data capture multiple full
 market cycle turns (trending, ranging, volatile), giving the HMM the broadest
 possible basis for regime learning.  Crypto trades 24/7 so all days are fully
 populated with no weekend gaps.
@@ -514,9 +514,9 @@ from `int(len(features_df) * 0.70)` so the ratio stays exact regardless of
 the actual number of rows Binance returns:
 
 ```
-full dataset:  ~525,000 rows   (365 days × 1,440 candles/day at 1 m)
-  ├── train set:  first 70 %  →  ~367,500 rows   (~255 days, ~8.5 months)
-  └── test  set:  last  30 %  →  ~157,500 rows   (~109 days, ~3.6 months)
+full dataset:  ~210,000 rows   (730 days × 288 candles/day at 5m)
+  ├── train set:  first 70 %  →  ~147,000 rows   (~511 days, ~17 months)
+  └── test  set:  last  30 %  →   ~63,000 rows   (~219 days, ~7.3 months)
 
 split_idx = int(len(features_df) * 0.70)
 train_df  = features_df.iloc[:split_idx]
@@ -527,13 +527,13 @@ test_df   = features_df.iloc[split_idx:]
 > calls `fetch_klines()` and `_add_hmm_features()` directly.
 > Use `VALIDATION_LOOKBACK = "90 days ago UTC"` for a faster smoke-test run.
 
-#### Phase 1 — Training Fit on Full Train Set (~367,500 rows)
+#### Phase 1 — Training Fit on Full Train Set (~147,000 rows)
 
 This module is **self-contained** — it does **not** use `RegimeDirector`.
 It replicates the BIC search and label-assignment logic directly using raw
 `GaussianHMM` + `StandardScaler` so that the training window is not
 capped by the live adaptive split (`train_end = max(2, int(n_rows × 2/3))`);
-instead it fits on the full 70 % train set (~367,500 rows) to give the HMM
+instead it fits on the full 70 % train set (~147,000 rows) to give the HMM
 the broadest possible regime-coverage check:
 
 1. `StandardScaler.fit_transform(train_features)` — learn mean/std from
@@ -547,7 +547,7 @@ the broadest possible regime-coverage check:
 
 The entire test set is scored in **four bulk operations** (no per-candle loop):
 
-1. `scaler.transform(test_features)` — scale all ~157,500 test rows at once.
+1. `scaler.transform(test_features)` — scale all ~63,000 test rows at once.
 2. `model.predict(test_scaled)` — single Viterbi pass (hmmlearn C extension).
 3. `model.predict_proba(test_scaled)` — Forward–Backward pass;
    `proba[np.arange(n), states]` extracts per-candle confidence via NumPy
@@ -557,21 +557,23 @@ The entire test set is scored in **four bulk operations** (no per-candle loop):
 
 | Approach | Viterbi calls | Estimated Phase 2 time |
 |---|---|---|
-| Per-candle loop | ~157,500 | hours |
+| Per-candle loop | ~63,000 | hours |
 | Vectorised (current) | **1** | **seconds** |
 
-Total runtime is dominated by the **Binance paginated fetch** (~8–10 min for
-1 year at 1 m resolution).
+Total runtime is dominated by the **Binance paginated fetch** (~3–5 min for
+2 years at 5m resolution).
 
 #### Phase 3 — Validation Checks
 
-For every labelled candle `t`, the 1-candle forward return is computed:
+For every labelled candle `t`, the 1-hour cumulative forward log-return is computed
+as the rolling sum of 12 single-period log-returns shifted forward by 12 candles
+(12 × 5 min = 1 hour):
 
 ```
-forward_return(t) = close(t+1) / close(t) − 1
+fwd_return(t) = log(close(t+12) / close(t))   [1-hour cumulative log-return]
 ```
 
-Six checks are then run on the ~4,200 labelled test candles:
+Six checks are then run on the ~63,000 labelled test candles (~219 days):
 
 **Check 1 — Direction Test** *(primary)*
 
@@ -613,12 +615,12 @@ training window.
 **Check 4 — Confidence Distribution**
 
 **Pass condition:** No label has a median `regime_confidence` below
-`HMM_MIN_CONFIDENCE` (0.70).  A label that is consistently uncertain suggests
+`HMM_MIN_CONFIDENCE` (0.60).  A label that is consistently uncertain suggests
 the model cannot distinguish that regime reliably on new data.
 
 **Check 5 — Label Frequency**
 
-**Pass condition:** No regime has < 1 % frequency over the ~4,200 test
+**Pass condition:** No regime has < 1 % frequency over the ~63,000 test
 candles.  Near-zero frequency means the model is effectively collapsing to
 fewer states than `n_components` — a sign of over-parameterisation.
 
@@ -669,7 +671,7 @@ Results are printed by
 
  Label frequency (all regimes > 1 %):  →  [PASS / FAIL]
 
- Confidence floor (all median conf ≥ 0.70): → [PASS / FAIL]
+ Confidence floor (all median conf ≥ 0.60): → [PASS / FAIL]
 
  Hit-rate alignment (compare with runner.py regime_filter_hit_rate_pct):
    BUY  blocked (trending_down|high_vol): xx.x %  (x,xxx/x,xxx)
@@ -1095,13 +1097,13 @@ concrete file in `backtest/`.
   *(Implemented.)*
 - ✅ **Step 6b — Offline long-horizon regime validation** (`backtest/diagnostics/regime_validation.py`) —
   Standalone diagnostic script (run with `python -m backtest.diagnostics.regime_validation`).
-  Fetches **1 year** of 1-minute klines (~525,000 rows, `VALIDATION_LOOKBACK = "365 days ago UTC"`),
+  Fetches **2 years** of 5-minute klines (~210,000 rows, `VALIDATION_LOOKBACK = "730 days ago UTC"`),
   applies a **70/30 train-test split** at runtime (`split_idx = int(len(df) * 0.70)`).
   **Self-contained** — does not use `RegimeDirector`; replicates BIC search and label
   assignment directly with raw `GaussianHMM` + `StandardScaler` so the training window
   is not capped by the live adaptive split.  Unlike the live per-window split which
   uses ~⅔ of a 120-row rolling window, this diagnostic fits on the full 70 % train set
-  (~367,500 rows) to give the HMM the broadest possible regime-coverage check.  Phase 2 scores all ~157,500 test candles in a
+  (~147,000 rows) to give the HMM the broadest possible regime-coverage check.  Phase 2 scores all ~63,000 test candles in a
   **single vectorised Viterbi pass** with NumPy advanced indexing for confidence
   extraction (`proba[np.arange(n), states]`) and a lookup-array for label mapping
   (`label_array[states]`).  `BACKTEST_MAX_ROWS` is intentionally bypassed.
@@ -1193,6 +1195,26 @@ concrete file in `backtest/`.
   *(Use Case A on the 270-day IS window implemented; Use Case B deferred.)*
 
 - ✅ **Step 9 — Multi-timeframe resolution decoupling + documentation** (2026-05-18)
+
+  **Why two resolutions?**
+  The HMM uses 5-minute klines because microstructure noise in 1-minute bars
+  degrades EM convergence and destabilises BIC selection. Regime shifts are
+  structural (hours, not seconds), so 5m granularity is sufficient and produces
+  richer per-bar signals with 5× fewer rows.
+
+  **How `merge_asof` prevents look-ahead bias:**
+  A naïve timestamp join would align a 5m regime label with 1m bars that formed
+  *during* that candle's build. `merge_asof(direction='backward')` propagates
+  only the last *completed* 5m label forward — each 1m bar sees only information
+  that was available when it opened.
+
+  **Why multiple 1m bars share one 5m label:**
+  Each 5m candle close produces one regime update; the five 1m bars within that
+  window intentionally carry the same label. This mirrors how the live system
+  operates (HMM fires at candle close, order logic runs every second).
+
+  **Live alignment:** `HMM_INTERVAL = "5m"` in the live system now matches the
+  backtest macro frame, making IS↔OOS Sharpe comparisons reliable.
 
   **Phase 0 — `config_parameters.py`:**  `BACKTEST_MACRO_INTERVAL = "5m"`,
   `BACKTEST_MICRO_INTERVAL = "1m"` added.  `HMM_INTERVAL = "5m"`,
