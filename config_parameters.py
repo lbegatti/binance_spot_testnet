@@ -152,10 +152,13 @@ REFIT_EVERY = 360  # full BIC re-fit every N macro candles (= 20 h at 5 m)
 # in runner.py uses the same HMM cadence as the IS optimisation
 # in sensitivity.py — makes IS↔OOS Sharpe comparisons
 
-# Sensitivity-sweep override for backtest/sensitivity.py — kept equal to REFIT_EVERY
-# so IS and OOS regime classification use the same cadence.  Defined as a separate
-# constant so sensitivity.py can be overridden independently if needed in future.
-SENSITIVITY_REFIT_EVERY = 360
+# Sensitivity-sweep override for backtest/sensitivity.py — intentionally HIGHER than
+# REFIT_EVERY to speed up the 40-trial Optuna loop.  480 rows = 40 h at 5 m gives
+# ~162 BIC refits per trial (270-day IS window / 480).  Using REFIT_EVERY=360 would
+# push this to 216 refits/trial (+33 %), adding ~4 h across 40 trials with no
+# meaningful change in the relative ranking of parameter combinations.
+# runner.py uses REFIT_EVERY=360 for accuracy; here accuracy is traded for speed.
+SENSITIVITY_REFIT_EVERY = 480
 # How many macro candles to skip between cheap Viterbi passes in sensitivity.py.
 # Between two predict calls the last known regime label is reused (forward-filled
 # onto the 1m micro frame via merge_asof).
@@ -260,7 +263,9 @@ STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
 # Imported by: strategy/analysis.py (live WebSocket path),
 #              backtest/signals.py  (backtest path),
 #              backtest/sensitivity.py (fixed baseline — not tuned in grid).
-VWAP_THRESHOLD_MULTIPLIER: float = 0.002  # 0.20 % dead zone — exact round-trip break-even
+VWAP_THRESHOLD_MULTIPLIER: float = (
+    0.002  # 0.20 % dead zone — exact round-trip break-even
+)
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------

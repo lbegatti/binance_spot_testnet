@@ -1001,13 +1001,21 @@ def _save_figure(fig: go.Figure, file_prefix: str = "backtest_chart") -> None:
         import kaleido  # noqa: F401  (import only to verify availability)
 
         path = results_dir / f"{file_prefix}_{ts}.png"
-        fig.write_image(str(path), width=1800, height=1900, scale=1.5)
+        # scale=1.0 keeps the export at the declared pixel dimensions (1600×1800).
+        # The previous scale=1.5 produced a 2700×2850 image that reliably timed
+        # out kaleido's async renderer on large figures.
+        fig.write_image(str(path), width=1600, height=1800, scale=1.0)
         log.info("Chart (PNG) saved → %s", path)
+        return
     except ImportError:
-        path = results_dir / f"{file_prefix}_{ts}.html"
-        fig.write_html(str(path))
         log.warning(
-            "kaleido not installed — chart saved as interactive HTML: %s  "
-            "(install with: pip install kaleido)",
-            path,
+            "kaleido not installed — falling back to HTML  "
+            "(install with: pip install kaleido)"
         )
+    except Exception as exc:
+        # TimeoutError from kaleido's async renderer or any other render failure.
+        log.warning("kaleido render failed (%s) — falling back to HTML.", exc)
+
+    path = results_dir / f"{file_prefix}_{ts}.html"
+    fig.write_html(str(path))
+    log.info("Chart (HTML) saved → %s", path)

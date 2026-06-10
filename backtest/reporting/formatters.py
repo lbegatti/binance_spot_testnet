@@ -355,7 +355,7 @@ def print_regime_validation_report(
             "direction_test",
             "Check 1 — Direction test (trending_up > neutral > trending_down):",
         ),
-        ("welch_ttest", "Check 2 — Welch's t-test (trending_up vs trending_down):"),
+        ("welch_ttest", "Check 2 — Kruskal-Wallis H-test (all regime states):"),
         (
             "volatility_check",
             "Check 3 — Volatility check (high_vol mean vol > neutral mean vol):",

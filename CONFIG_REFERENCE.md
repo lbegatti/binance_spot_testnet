@@ -21,7 +21,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `HMM_INTERVAL` | 5-minute klines | Regime detection granularity |
 | `HMM_LOOKBACK` | "10 hours ago UTC" | Rolling window (~120 bars at 5 m); stable EM convergence |
 | `HMM_MAX_REGIMES` | 3 | Upper bound on hidden states (BIC search 2–3) |
-| `HMM_MIN_CONFIDENCE` | 0.70 | Gate: block orders if regime confidence < 70% posterior |
+| `HMM_MIN_CONFIDENCE` | 0.60 | Gate: block orders if regime confidence < 60% posterior |
 | `HMM_N_ITERATIONS` | 1000 | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | 46 | Random seed for reproducible state numbering |
 | `HMM_MIN_COVAR` | 1e-1 | Regularisation floor for covariance matrices |
@@ -34,10 +34,10 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `VWAP_THRESHOLD_MULTIPLIER` | 0.003 (0.30 %) | Dead-zone threshold for VWAP mean-reversion |
+| `VWAP_THRESHOLD_MULTIPLIER` | 0.002 (0.20 %) | Dead-zone threshold for VWAP mean-reversion |
 | `VWAP_WINDOW` | 5 | 1-minute rolling window for VWAP (5 min total) |
-| `TREND_CONSECUTIVE_BARS` | 4 | Consecutive same-direction bars to trigger trend-pause |
-| `TREND_COOLDOWN_BARS` | 5 | Bars to maintain paused state after trend ends |
+| `TREND_CONSECUTIVE_BARS` | 3 | Consecutive same-direction bars to trigger trend-pause |
+| `TREND_COOLDOWN_BARS` | 4 | Bars to maintain paused state after trend ends |
 | `STOP_LOSS_ROLLING_DAYS` | 90 | Rolling window for stop-loss volatility calculation |
 | `STOP_LOSS_STD_MULT` | 3.0 | Volatility multiplier for stop-loss distance |
 
@@ -91,3 +91,22 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 ```
 
 **Note:** `schema_version` enables forward-compatible migrations if JSON structure changes in future updates.
+
+## Imported By
+
+Which modules import each constant from `config_parameters.py`:
+
+- `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
+- `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
+- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`
+- `strategy/book_utils.py` — `N_LEVELS`
+- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
+- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
+- `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`, `BACKTEST_MACRO_INTERVAL`, `BACKTEST_MICRO_INTERVAL`
+- `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
+- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `BACKTEST_MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
+- `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
+- `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
+- `backtest/sensitivity.py` — `SENSITIVITY_REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
+- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants

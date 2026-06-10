@@ -235,13 +235,13 @@ historical_analysis()                       low_latency_analysis()
 
 ## A.5 Regime Label Reference
 
-| `regime_label` | BUY | SELL | Typical market condition |
-|---|---|---|---|
-| `"trending_up"` | ✅ | ❌ | Highest combined return + OBI rank (most bullish state) |
-| `"trending_down"` | ❌ | ✅ | Lowest combined return + OBI rank (most bearish state) |
-| `"high_volatility"` | ❌ | ❌ | Large intra-bar swings OR heavy trade fragmentation — unreliable market |
-| `"neutral"` | ✅ | ✅ | No dominant signal in any feature |
-| `None` *(impossible after step 4b)* | ✅ | ✅ | Transparent — all orders pass through |
+| `regime_label`                      | BUY | SELL | Typical market condition                                                |
+|-------------------------------------|-----|------|-------------------------------------------------------------------------|
+| `"trending_up"`                     | ✅   | ❌    | Highest combined return + OBI rank (most bullish state)                 |
+| `"trending_down"`                   | ❌   | ✅    | Lowest combined return + OBI rank (most bearish state)                  |
+| `"high_volatility"`                 | ❌   | ❌    | Large intra-bar swings OR heavy trade fragmentation — unreliable market |
+| `"neutral"`                         | ✅   | ✅    | No dominant signal in any feature                                       |
+| `None` *(impossible after step 4b)* | ✅   | ✅    | Transparent — all orders pass through                                   |
 
 ---
 
@@ -250,7 +250,7 @@ historical_analysis()                       low_latency_analysis()
 Even with a valid regime label, the HMM's posterior probability for the current state may be ambiguous (e.g., 55% trending_up vs 45% neutral).
 The `predict_proba()` method returns this posterior probability for the assigned regime state.
 
-**Confidence gate**: If `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.70 = 70% posterior probability threshold),
+**Confidence gate**: If `regime_confidence < HMM_MIN_CONFIDENCE` (default 0.60 = 60% posterior probability threshold),
 both BUY and SELL orders are skipped on that iteration.
 This prevents trading on weak signals when the model is uncertain.
 

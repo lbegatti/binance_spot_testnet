@@ -496,16 +496,20 @@ mean(forward_return | trending_up)  >  mean(forward_return | neutral)
 
 **Check 2 — Statistical Significance**
 
-Two-sample Welch's t-test (does not assume equal variance) between the
-`trending_up` and `trending_down` forward return distributions:
+Kruskal-Wallis H-test across **all** BIC-selected regime states (k ≥ 2).
+H₀: all state forward-return distributions are identical (rank-based).
 
 ```
-t, p = scipy.stats.ttest_ind(
-    forward_returns[regime == "trending_up"],
-    forward_returns[regime == "trending_down"],
-    equal_var=False,
-)
+H, p = scipy.stats.kruskal(*[
+    forward_returns[regime == lbl]
+    for lbl in sorted(unique_labels)
+])
 ```
+
+Preferred over Welch's t-test because (a) BTC returns are fat-tailed,
+violating the Gaussian assumption; (b) HMM states have unequal emission
+variances by construction; (c) it handles k > 2 states without multiple
+comparison inflation.  For k = 2 it reduces to Mann-Whitney U.
 
 **Pass condition:** p-value < 0.10
 
@@ -572,8 +576,8 @@ Results are printed by
    neutral mean:        ±x.xxxxx %
    trending_down mean:  −x.xxxxx %   →  [PASS / FAIL]
 
- Welch's t-test (trending_up vs trending_down):
-   t = x.xx,  p = x.xxxxxx             →  [PASS / FAIL]
+ Kruskal-Wallis H-test (all k states):
+   H = x.xx,  p = x.xxxxxx  k=x groups →  [PASS / FAIL]
 
  Volatility check (high_vol mean vol > neutral mean vol):
    x.xxxxxx > x.xxxxxx                 →  [PASS / FAIL]
@@ -597,7 +601,7 @@ Results are printed by
 | Single 7/3 split, not rolling | Rolling refits on the test set would re-use test candles for fitting; a single split is the cleanest long-horizon OOS test |
 | Only `predict_current_regime()` on test set | No refit → model never touches test candles during training |
 | `BACKTEST_MAX_ROWS` must be bypassed | 500 rows collapses the split to a few hours of train data — statistically worthless |
-| Welch's t-test (not Student's) | Regime return distributions are unlikely to have equal variance |
+| Kruskal-Wallis H-test (not Welch's t-test) | BTC returns are fat-tailed (leptokurtic); HMM states have unequal emission variances by construction; K-W handles any k ≥ 2 states without multiple-comparison inflation |
 | Forward return = 1 candle | Consistent with the 1 m resolution; matches the minimum observable effect of a regime signal |
 | Standalone script, not in `runner.py` | This is a one-off diagnostic, not part of the core P&L pipeline |
 
@@ -634,7 +638,7 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | IS window | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m) |
 | OOS window | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py` |
 | Rationale | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`. |
-| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (40 h at 5 m) — now equal to `REFIT_EVERY` so IS optimisation and OOS validation share the same cadence (~162 refits over 270-day IS window, ~54 over 90-day OOS). IS↔OOS Sharpe comparisons are apples-to-apples. |
+| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (40 h at 5 m, ~162 refits over 270-day IS window) — intentionally higher than `REFIT_EVERY = 360` (30 h) used by `runner.py`. The sweep runs 40× so fewer refits per trial cuts ~4 h of total runtime without changing the relative ranking of parameter combinations. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `runner.py` always predicts every candle. |
 | Runtime (Bayes, 40 trials) | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials) |
 | Runtime (OAT, 8 runs) | ~1–2 h on a laptop |
@@ -882,8 +886,8 @@ concrete file in `backtest/`.
   Six checks (Phase 3) are computed on the labelled test candles:
   1. **Direction test** — `trending_up` mean > `neutral` mean > `trending_down`
      mean forward 1-candle return.
-  2. **Welch's t-test** — p < 0.05 between `trending_up` and `trending_down`
-     forward return distributions (does not assume equal variance).
+  2. **Kruskal-Wallis H-test** — p < 0.10 across all k BIC-selected regime
+     states (non-parametric; no normality or equal-variance assumption).
   3. **Volatility check** — mean volatility feature higher for `high_volatility`
      than `neutral`.
   4. **Confidence floor** — median `regime_confidence` ≥ `HMM_MIN_CONFIDENCE`
@@ -926,45 +930,7 @@ concrete file in `backtest/`.
   PNG export requires ``pip install kaleido``; without it an interactive HTML
   file is saved instead.  *(Implemented.)*
 
-- ✅ **Step 8 — `backtest/sensitivity.py`** — Sensitivity analysis with three
-  execution modes: **Bayesian optimisation via Optuna TPE (default)**, OAT sweep
-  (`--oat`), and deprecated full-grid (`--full-grid`).  Tunes
-  `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER`
-  over the **IS window** (`BACKTEST_LOOKBACK → BACKTEST_OOS_START`, 270 days, ~77,760
-  rows at 5 m / ~388,800 rows at 1 m).  `SENSITIVITY_LOOKBACK` **removed** — IS window is now defined by
-  `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START`.  `end_str=BACKTEST_OOS_START` is passed
-  to `fetch_klines()` to enforce the IS boundary.  `fee_rate` is fixed at `0.001`
-  (not a strategy knob).
-
-  **Bayesian mode** (`python -m backtest.sensitivity`):
-  - Optuna TPE sampler, 40 trials by default (`--n-trials N` to change).
-  - Data pre-fetched once (`_make_objective` factory closure over `prefetched_macro` + `prefetched_micro`).
-  - Study persisted to `backtest/results/optuna.db`; resumes automatically if
-    interrupted (`load_if_exists=True`).
-  - Three HTML charts saved automatically to **`backtest/reporting/`**:
-  - Three HTML charts saved automatically to **`backtest/reporting/`**: optimisation history, parameter importance (fANOVA), contour (`hmm_lookback_rows × vwap_window`).
-
-  - **OAT mode** (`python -m backtest.sensitivity --oat`):
-  - 8 runs (1 baseline + 7 non-default), ~1–2 h.
-  - Per-parameter delta-Sharpe report; flags `|ΔSharpe| > 0.5` with a
-    suggestion to run `--bayes`.
-
-  **Common features (all modes):**
-  - `--lookback` flag overrides `BACKTEST_LOOKBACK` (IS start) for one run without
-    editing `config_parameters.py`.  IS end always = `BACKTEST_OOS_START`.
-  - `_check_existing_best_params()` guard: shows age, Sharpe and params of any
-    existing `best_params.json`; requires `[y/N]` confirmation before proceeding.
-  - Sensitivity CSVs (`sensitivity_<mode>_<ts>.csv`) written to **`backtest/reporting/`**;
-    `best_params.json` (machine-readable, loaded by live system) written to `backtest/results/`.
-  - Console report formatting (`print_sensitivity_table`, `print_oat_sensitivity_report`,
-    `print_bnh_comparison`) delegated to `backtest/reporting/formatters.py`.
-  - Writes `best_params.json` — loaded via `strategy.param_loader`
-    (`load_best_params()` by `websocket_main.py` at startup;
-    `load_best_params_for_backtest()` by `runner.py` before `run_signals()`).
-
-  **Use Case B (OOS robustness validation) deferred** — running sensitivity on the OOS window
-  (~4–12 h for OAT alone on a laptop) is impractical without dedicated compute.
-  *(Use Case A on the 270-day IS window implemented; Use Case B deferred.)*
+- ✅ **Step 8 — `backtest/sensitivity.py`** — Three modes: Bayesian (Optuna TPE, 40 trials default), OAT (`--oat`, 1 baseline + 7 variants), and deprecated full-grid.  Tunes `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `VWAP_THRESHOLD_MULTIPLIER` on the 270-day IS window; `fee_rate` fixed at `0.001` (not a strategy knob).  Data pre-fetched once via `_make_objective` factory closure (`prefetched_macro` + `prefetched_micro`); Optuna study persisted to `backtest/results/optuna.db` (`load_if_exists=True`).  Three HTML charts (optimisation history, fANOVA parameter importance, `hmm_lookback_rows × vwap_window` contour) auto-saved to `backtest/reporting/`.  `_check_existing_best_params()` guard prompts `[y/N]` before overwriting.  Sensitivity CSVs → `backtest/reporting/`; `best_params.json` → `backtest/results/` (loaded by `strategy.param_loader`).  Console formatting via `print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison` in `backtest/reporting/formatters.py`.  Use Case B (OOS robustness) deferred — see **Step 8** above for full details.  *(Implemented.)*
 
 - ✅ **Step 9 — Multi-timeframe resolution decoupling + documentation** (2026-05-18)
 

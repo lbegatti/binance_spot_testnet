@@ -106,7 +106,9 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 VALIDATION_LOOKBACK = "730 days ago UTC"  # fetch window (2 years, ~210,000 rows)
 _TRAIN_RATIO = 0.70  # first 70 % = train, last 30 % = test (evaluated)
-_CANDLES_PER_DAY = 288  # 24 h × 12 bars/h at 5m resolution — used for human-readable logging only
+_CANDLES_PER_DAY = (
+    288  # 24 h × 12 bars/h at 5m resolution — used for human-readable logging only
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 1 — Data Fetch
@@ -345,7 +347,7 @@ def _run_checks(
     ``BACKTESTING.md``.
 
     Because labels are now produced by a walk-forward loop that mirrors
-    the live system, all six checks — including Welch's t-test — are
+    the live system, all six checks — including the Kruskal-Wallis H-test — are
     statistically meaningful.
 
     **Check 1 — Direction test:**
@@ -357,14 +359,12 @@ def _run_checks(
         NaN for a regime means that regime was absent from the test labels
         (expected when BIC selects n=2 states — no neutral state exists).
 
-    **Check 2 — Welch's t-test:**
-        Two-sample t-test (unequal variance) on **5-minute** forward returns
-        between ``trending_up`` and ``trending_down`` candles.
-        Pass if p < 0.10.  A 5-minute horizon is used instead of 1-minute
-        because 1-min BTC returns are near-pure noise at microstructure scale —
-        regime effects manifest over several minutes, not individual candles.
-        p < 0.10 (rather than 0.05) is the standard threshold for
-        high-frequency financial data where within-group variance is large.
+    **Check 2 — Kruskal-Wallis H-test (all regime states):**
+        Non-parametric rank-based test of H₀: all state forward-return
+        distributions are identical.  Tests ALL k BIC-selected states
+        simultaneously (k=2 or k=3).  No normality or equal-variance
+        assumption — both of which HMM states violate.
+        Pass if p < 0.10.
 
     **Check 3 — Volatility check:**
         ``mean(volatility | high_volatility) > mean(volatility | neutral)``.
@@ -474,34 +474,47 @@ def _run_checks(
         ),
     }
 
-    # ── Check 2 — Welch's t-test (5-min forward returns) ─────────────────
-    # Uses 5-minute forward returns (not 1-minute) because regime effects
-    # manifest over several minutes, not individual candles.  At 1-min
-    # resolution, BTC returns are near-pure noise and the t-test almost
-    # always fails regardless of model quality.
-    # Threshold: p < 0.10 (standard for high-frequency financial data).
-    _TTEST_P_THRESHOLD = 0.10
-    fwd_tu = test_labels.loc[test_labels["regime_label"] == "trending_up", "fwd_return"]
-    fwd_td = test_labels.loc[
-        test_labels["regime_label"] == "trending_down", "fwd_return"
+    # ── Check 2 — Kruskal-Wallis H-test (all regime states) ─────────────
+    # Non-parametric rank-based test of H₀: all state forward-return
+    # distributions are identical (location shift).
+    #
+    # Why Kruskal-Wallis over Welch's t-test:
+    #   1. Works for any k ≥ 2 states — no separate code path for n=2 vs n=3.
+    #   2. No normality assumption — BTC returns are fat-tailed (leptokurtic),
+    #      violating the Gaussian premise of Welch's t-test.
+    #   3. No equal-variance assumption — HMM states have different emission
+    #      variances by construction (each state models its own σ²).
+    #   4. For k=2 it reduces to the Mann-Whitney U / Wilcoxon rank-sum test,
+    #      which is strictly more robust than Welch's t-test for fat-tailed data.
+    #
+    # Threshold: p < 0.10 (standard for high-frequency financial data where
+    # within-group variance is large relative to between-group mean differences).
+    _KW_P_THRESHOLD = 0.10
+    all_labels: list[str] = sorted(str(v) for v in test_labels["regime_label"].unique())
+    kw_groups = [
+        test_labels.loc[test_labels["regime_label"] == lbl, "fwd_return"].values
+        for lbl in all_labels
     ]
+    kw_groups_valid = [(lbl, g) for lbl, g in zip(all_labels, kw_groups) if len(g) > 1]
 
-    if len(fwd_tu) > 1 and len(fwd_td) > 1:
-        t_stat, p_val = stats.ttest_ind(fwd_tu, fwd_td, equal_var=False)
-        ttest_pass = p_val < _TTEST_P_THRESHOLD
+    if len(kw_groups_valid) >= 2:
+        h_stat, p_val = stats.kruskal(*[g for _, g in kw_groups_valid])
+        kw_pass = p_val < _KW_P_THRESHOLD
+        valid_label_str = ", ".join(lbl for lbl, _ in kw_groups_valid)
         results["welch_ttest"] = {
-            "pass": ttest_pass,
+            "pass": kw_pass,
             "detail": (
-                f"t={t_stat:.3f}  p={p_val:.6f}  "
-                f"(pass if p < {_TTEST_P_THRESHOLD}; using 5-min fwd return)"
+                f"H={h_stat:.3f}  p={p_val:.6f}  k={len(kw_groups_valid)} groups "
+                f"({valid_label_str})  "
+                f"(pass if p < {_KW_P_THRESHOLD}; Kruskal-Wallis, 1-h fwd return)"
             ),
         }
     else:
         results["welch_ttest"] = {
             "pass": False,
             "detail": (
-                f"Insufficient samples: trending_up={len(fwd_tu)}, "
-                f"trending_down={len(fwd_td)}"
+                "Insufficient groups with >1 sample: "
+                + ", ".join(f"{lbl}={len(g)}" for lbl, g in zip(all_labels, kw_groups))
             ),
         }
 

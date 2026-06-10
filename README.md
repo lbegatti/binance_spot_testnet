@@ -48,14 +48,13 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 | 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 10 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
 | 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
-| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Welch's t-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~10–20 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
+| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
 
 **Detailed notes on `regime_validation.py`:**
-- Uses its own independent **1-year lookback** (`VALIDATION_LOOKBACK = "365 days ago UTC"`) — NOT affected by `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` used by `sensitivity.py` and `runner.py`.
-- Splits the 1-year window into 70% train (~255 days) and 30% test (~109 days).
+- Uses its own independent **2-year lookback** (`VALIDATION_LOOKBACK = "730 days ago UTC"`) — NOT affected by `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` used by `sensitivity.py` and `runner.py`.
+- Splits the 2-year window into 70% train (~511 days) and 30% test (~219 days).
 - Fits a fresh HMM model on the train set, predicts regime labels on the test set, and runs 6 statistical checks.
-- Runtime: ~10–15 minutes (dominated by Binance API paginated fetches for ~525k rows).
-- To expand to 2 years: modify `VALIDATION_LOOKBACK` to `"730 days ago UTC"` (runtime ~20–30 min, moderate statistical benefit).
+- Runtime: ~20–30 minutes (dominated by Binance API paginated fetches for ~1,050k rows).
 
 > **Recommended order for a new setup:**
 > `regime_validation` → `sensitivity` → `runner` → `websocket_main`
@@ -142,8 +141,8 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
 | **HMM** | `HMM_MAX_REGIMES` | `3` | Upper bound on hidden states evaluated during BIC search (2 … 3, = `len(HMM_FEATURE_COLS) − 1`).  Capped at 3 to avoid under-populated states when training on 4 features |
 | **HMM** | `HMM_RANDOM_STATE` | `46` | Random seed for reproducible HMM initialisation |
-| **HMM** | `HMM_INTERVAL` | `Client.KLINE_INTERVAL_1MINUTE` | Kline granularity for regime detection (1 m — intra-session resolution) |
-| **HMM** | `HMM_LOOKBACK` | `"2 hours ago UTC"` | Kline history window (~120 rows at 1 m — captures recent intra-day regime without being stale) |
+| **HMM** | `HMM_INTERVAL` | `Client.KLINE_INTERVAL_5MINUTE` | Kline granularity for regime detection (5 m — reduces noise vs 1 m without losing intraday granularity) |
+| **HMM** | `HMM_LOOKBACK` | `"10 hours ago UTC"` | Kline history window (~120 rows at 5 m — provides stable EM convergence without being stale) |
 | **HMM** | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices — prevents positive-definite errors.  1e-1 is the recommended safe default for z-scored financial features |
 | **HMM** | `HMM_N_INIT` | `10` | Number of independent random-seed restarts per candidate `n_components` value inside `select_hmm_model()`.  Higher values reduce the chance of degenerate EM solutions (e.g. transmat row summing to 0) on flat / low-variance windows |
 | **HMM** | `HMM_TRAIN_ROWS` | `80` | Legacy constant kept in `config_parameters.py` for reference.  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set |
@@ -157,37 +156,23 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
 | **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of macro (5 m) kline rows used as the HMM warm-up window in the backtest (**10 h at 5 m** — 120 × 5 min; matches `HMM_LOOKBACK` in the live system) |
 | **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in 1-minute micro bars) for the backtest VWAP computation (**5 min** — 5 × 1 min) |
-| **Backtesting** | `REFIT_EVERY` | `360` | Macro-bar iterations between full HMM BIC re-fits during the signal loop.  At 5 m resolution this means one full re-fit every **30 hours** (~216 refits over the 270-day IS window).  Aligned with `SENSITIVITY_REFIT_EVERY` so IS and OOS validation share the same cadence |
+| **Backtesting** | `REFIT_EVERY` | `360` | Macro-bar iterations between full HMM BIC re-fits during the signal loop.  At 5 m resolution this means one full re-fit every **30 hours** (~216 refits over the 270-day IS window).  Intentionally lower than `SENSITIVITY_REFIT_EVERY` (480) — the OOS runner refits more frequently than the IS sweep. |
 | **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `5_000.0` | Starting USDT balance for the simulation |
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.065` | Starting BTC balance for the simulation (set > 0 to simulate an existing position) |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
 | **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `None` | Max replay candles in debug mode (`None` = full production run; set to e.g. `500` for a quick debug run) |
-| **Trend-pause filter** | `TREND_CONSECUTIVE_BARS` | `4` | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
-| **Trend-pause filter** | `TREND_COOLDOWN_BARS` | `5` | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
+| **Trend-pause filter** | `TREND_CONSECUTIVE_BARS` | `3` | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
+| **Trend-pause filter** | `TREND_COOLDOWN_BARS` | `4` | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
 | **Adaptive stop-loss** | `STOP_LOSS_ROLLING_DAYS` | `90` | Lookback window (calendar days) for the rolling standard deviation of daily absolute returns used to compute the dynamic stop-loss threshold.  `threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT` — calibrates automatically to BTC's current volatility regime |
 | **Adaptive stop-loss** | `STOP_LOSS_STD_MULT` | `3.0` | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~3–4.5 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` in the console report to calibrate |
-| **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `360` | HMM refit cadence used **only** inside `sensitivity.py` (**30 h at 5 m** → ~216 refits over the 270-day IS window).  Equal to `REFIT_EVERY` so IS optimisation and OOS validation share the same HMM cadence — Sharpe figures are directly comparable across both windows. |
+| **Sensitivity** | `SENSITIVITY_REFIT_EVERY` | `480` | HMM refit cadence used **only** inside `sensitivity.py` (**40 h at 5 m** → ~162 refits over the 270-day IS window).  Intentionally higher than `REFIT_EVERY` (360) — the IS sweep refits less frequently to reduce trial runtime. |
 | **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise, cutting Viterbi overhead ~5×. `run_backtest.py` always predicts every candle. |
 | **Sensitivity** | `SENSITIVITY_FEE_RATE` | `0.001` | Fee rate applied to **all** sensitivity runs (OAT, full-grid, Bayes). Fixed at the standard Binance Spot taker fee — not a strategy knob, never included in the search grid. |
 | **Sensitivity** | `SENSITIVITY_RANK_METRIC` | `"sharpe_ratio"` | Metric used to rank parameter combinations and select `best_params.json`. Change to `"sortino_ratio"` or `"total_return_pct"` to optimise for a different objective. |
-| **Sensitivity** | `SENSITIVITY_OAT_THRESHOLD` | `0.5` | \|ΔSharpe\| threshold in the OAT sensitivity report. If any parameter change moves the rank metric by more than this, the report recommends running `--bayes` for a wider search. |
+| **Sensitivity** | `SENSITIVITY_OAT_THRESHOLD` | `0.5` | $|\Delta \text{Sharpe}|$ threshold in the OAT sensitivity report. If any parameter change moves the rank metric by more than this, the report recommends running `--bayes` for a wider search. |
 
-**Imported by:**
-- `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
-- `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
-- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`
-- `strategy/book_utils.py` — `N_LEVELS`
-- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
-- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`
-- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
-- `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`, `BACKTEST_MACRO_INTERVAL`, `BACKTEST_MICRO_INTERVAL`
-- `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
-- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `BACKTEST_MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
-- `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
-- `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
-- `backtest/sensitivity.py` — `SENSITIVITY_REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
-- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
+For a compact per-category summary and the full per-module import list, see **[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)**.
 
 ---
 
@@ -887,7 +872,7 @@ python -c "from backtest.runner import run_backtest; run_backtest(export_csv=Tru
 > label-assignment rules, confidence threshold, etc.) the validation tool **must**
 > be re-run to confirm that the frozen model still produces statistically meaningful
 > labels on out-of-sample data.  A failing check (especially Check 1 — direction
-> test, or Check 2 — Welch's t-test) is a strong signal that the change broke the
+> test, or Check 2 — Kruskal-Wallis H-test) is a strong signal that the change broke the
 > regime filter's discriminative power and should be reviewed before deploying live.
 >
 > ```bash

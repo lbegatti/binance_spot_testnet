@@ -61,10 +61,9 @@ Notes
 -----
 - config_parameters.py and the live system are NEVER modified by this script.
   All overrides are passed as keyword arguments to run_signals() / simulate_pnl().
-- SENSITIVITY_REFIT_EVERY (480 iterations = 40 h at 5 m) equals REFIT_EVERY so the IS
-  optimisation and OOS validation (runner.py) share the same HMM refit cadence — ~162
-  refits over the 270-day IS window, ~54 over the 90-day OOS window.  IS↔OOS Sharpe
-  figures are therefore directly comparable.
+- SENSITIVITY_REFIT_EVERY (480 iterations = 40 h at 5 m) is intentionally HIGHER than
+  REFIT_EVERY (360 = 20 h) to speed up the 40-trial sweep: ~162 BIC refits per trial
+  instead of 216 (+33 % slower).  runner.py uses REFIT_EVERY=360 for OOS accuracy.
 - Do NOT commit best_params.json to git — it is sample-specific.
 """
 
@@ -604,11 +603,19 @@ def _run_sensitivity_optuna_study(
     else:
         log.info("Fresh study '%s' — no prior trials for this window.", study_name)
 
-    study.optimize(
-        _make_objective(prefetched_macro=df_macro, prefetched_micro=df_micro),
-        n_trials=n_trials,
-        show_progress_bar=True,
-    )
+    # Suppress INFO logs during the sweep so the tqdm progress bar stays visible.
+    # Per-trial INFO messages from signals.py / pnl.py flood the console and
+    # overwrite the tqdm \r line, making the bar appear frozen or absent.
+    _prev_level = logging.root.level
+    logging.root.setLevel(logging.WARNING)
+    try:
+        study.optimize(
+            _make_objective(prefetched_macro=df_macro, prefetched_micro=df_micro),
+            n_trials=n_trials,
+            show_progress_bar=True,
+        )
+    finally:
+        logging.root.setLevel(_prev_level)
 
     # ── Step 7: diagnostic charts (always saved) ─────────────────────────
     _save_optuna_plots(study)

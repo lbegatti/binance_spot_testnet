@@ -140,7 +140,9 @@ from config_parameters import BEST_PARAMS_FILE, BACKTEST_RESULTS_DIR
 # ---------------------------------------------------------------------------
 # Fixed — always resolves relative to this file's location (strategy/)
 # Imported from config_parameters.py to prevent divergence with sensitivity.py
-BEST_PARAMS_PATH = pathlib.Path(__file__).parent.parent / BACKTEST_RESULTS_DIR / BEST_PARAMS_FILE
+BEST_PARAMS_PATH = (
+    pathlib.Path(__file__).parent.parent / BACKTEST_RESULTS_DIR / BEST_PARAMS_FILE
+)
 
 
 # Converts hmm_lookback_rows (int, 5-minute candles) → HMM_LOOKBACK dateutil
