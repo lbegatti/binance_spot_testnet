@@ -237,7 +237,11 @@ class AnalysisEngine:
         8. **Regime direction filter** (HMM gate) — reads
            ``regime_director.regime_label`` under ``_regime_lock``:
            - BUY:  skip if regime is ``"trending_down"`` or ``"high_volatility"``.
-           - SELL: skip if regime is ``"trending_up"``  or ``"high_volatility"``.
+           - SELL: skip if regime is ``"trending_up"`` or ``"high_volatility"``
+             **and** ``_position_open`` is ``False`` (i.e. no existing long to
+             close).  When a position is open the SELL is always an exit, not a
+             new short — the regime gate must never block it or the position
+             becomes permanently stranded in a trending market.
            ``None`` label (before first ``historical_analysis`` run) is treated
            as transparent — all orders are allowed through.
         9. **Order execution** — delegates to
@@ -356,13 +360,27 @@ class AnalysisEngine:
                     # (grid behaviour) in both REST-fallback mode (balance never
                     # updated) and the WS race window (balance update arrives late).
                     # Mirrors the identical guard in backtest/pnl.py.
-                    self._position_guard_skips += 1
-                    logging.info(
-                        "HFT #%d [buy] — skipped: position already open "
-                        "(guard skips so far this session: %d)",
-                        iteration,
-                        self._position_guard_skips,
-                    )
+                    #
+                    # Ghost-position check: if the guard is armed but BTC balance
+                    # is ~0, the limit BUY likely never filled (price moved away
+                    # before the order matched).  Reset so the strategy can
+                    # re-enter on the next signal (audit Finding 7).
+                    if btc_balance < 0.0001:
+                        self._position_open = False
+                        logging.info(
+                            "HFT #%d [buy] — position guard reset: armed but BTC "
+                            "balance %.8f ≈ 0 (limit order likely unfilled).",
+                            iteration,
+                            btc_balance,
+                        )
+                    else:
+                        self._position_guard_skips += 1
+                        logging.info(
+                            "HFT #%d [buy] — skipped: position already open "
+                            "(guard skips so far this session: %d)",
+                            iteration,
+                            self._position_guard_skips,
+                        )
                 else:
                     self._position_open = True
                     self.order_executor.execute("BUY", best_buy)
@@ -373,12 +391,16 @@ class AnalysisEngine:
                     if ask_vwap is not None
                     else None
                 )
-                if (
+                # Regime gate applies only when flat (no open position).
+                # When _position_open is True the SELL closes an existing long,
+                # not a new short entry — blocking it would strand the position
+                # for the rest of the session (audit Finding 1).
+                if not self._position_open and (
                     current_regime == "trending_up"
                     or current_regime == "high_volatility"
                 ):
                     logging.info(
-                        "HFT #%d [sell] — skipped: regime is '%s'",
+                        "HFT #%d [sell] — skipped: regime is '%s' (flat, no position to close)",
                         iteration,
                         current_regime,
                     )

@@ -404,7 +404,16 @@ def run_signals(
     vwap_deque: deque = deque(maxlen=_vwap_window)
     records: list[dict] = []
 
+    # Tracks whether a strategy BUY has been dispatched without a matching SELL.
+    # Mirrors _position_open in analysis.py — used to bypass the SELL regime gate
+    # for exits (audit Finding 1 fix).
+    _sim_position_open: bool = False
+
     for i in range(len(df_exec)):
+        # Snapshot position state before the signal gate evaluates.
+        # Used in records so pnl._compute_stats() can distinguish a regime-blocked
+        # SELL (flat → gate applied) from a regime-bypassed exit (position open).
+        _bar_position_open = _sim_position_open
         regime = regime_arr[i]
         # regime_confidence may be a float/NaN for the very first stitched bar;
         # treat that the same as None (transparent gate).
@@ -493,15 +502,23 @@ def run_signals(
                 vwap_ok = vwap_floor is None or best_buy_micro < vwap_floor
                 if regime_ok and vwap_ok:
                     signal = 1
+                    _sim_position_open = True  # track simulated open position
 
             if best_sell and best_sell_micro is not None and signal == 0:
-                regime_ok = regime not in ("trending_up", "high_volatility")
+                # Regime gate applies only when flat — mirrors analysis.py fix (audit Finding 1).
+                # When _sim_position_open is True this SELL is an exit close, not a new
+                # short entry — blocking it would strand the position in trending markets.
+                regime_ok = _sim_position_open or regime not in (
+                    "trending_up",
+                    "high_volatility",
+                )
                 vwap_ceil = (
                     ask_vwap * (1.0 + _vwap_threshold) if ask_vwap is not None else None
                 )
                 vwap_ok = vwap_ceil is None or best_sell_micro >= vwap_ceil
                 if regime_ok and vwap_ok:
                     signal = -1
+                    _sim_position_open = False  # position closed
 
         records.append(
             {
@@ -521,6 +538,7 @@ def run_signals(
                 "sell_qty": sell_qty,
                 "trend_pause": trend_pause_arr[i],
                 "stop_loss_pct": stop_loss_pct_arr[i],
+                "sim_position_open": _bar_position_open,
             }
         )
 

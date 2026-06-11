@@ -1030,6 +1030,10 @@ def _compute_stats(
         _conf_passed = pd.Series(True, index=signals.index)
 
     # Regime-blocked: passed confidence gate but regime was unfavourable.
+    # For SELL, exclude bars where a position was already open — in that case
+    # the regime gate is bypassed (exit close, not a new short entry), so the
+    # signal is not truly "blocked" by regime.  Falls back to the old count if
+    # sim_position_open is absent (legacy signal DataFrames / unit tests).
     regime_blocked_buy = int(
         (
             signals["best_buy_micro"].notna()
@@ -1037,13 +1041,23 @@ def _compute_stats(
             & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
         ).sum()
     )
-    regime_blocked_sell = int(
-        (
-            signals["best_sell_micro"].notna()
-            & _conf_passed
-            & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
-        ).sum()
-    )
+    if "sim_position_open" in signals.columns:
+        regime_blocked_sell = int(
+            (
+                signals["best_sell_micro"].notna()
+                & _conf_passed
+                & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+                & ~signals["sim_position_open"]
+            ).sum()
+        )
+    else:
+        regime_blocked_sell = int(
+            (
+                signals["best_sell_micro"].notna()
+                & _conf_passed
+                & signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+            ).sum()
+        )
 
     # VWAP-blocked: residual after confidence and regime.
     # max(0, …) guards against floating-point rounding edge cases.
