@@ -61,9 +61,8 @@ Notes
 -----
 - config_parameters.py and the live system are NEVER modified by this script.
   All overrides are passed as keyword arguments to run_signals() / simulate_pnl().
-- SENSITIVITY_REFIT_EVERY (480 iterations = 40 h at 5 m) is intentionally HIGHER than
-  REFIT_EVERY (360 = 20 h) to speed up the 40-trial sweep: ~162 BIC refits per trial
-  instead of 216 (+33 % slower).  runner.py uses REFIT_EVERY=360 for OOS accuracy.
+- REFIT_EVERY (480 iterations = 40 h at 5 m) is shared by both sensitivity.py and
+  runner.py so IS and OOS use the same HMM refit cadence (~162 IS refits, ~54 OOS).
 - Do NOT commit best_params.json to git — it is sample-specific.
 """
 
@@ -94,7 +93,7 @@ from config_parameters import (
     BACKTEST_INITIAL_BTC,
     BACKTEST_LOOKBACK,
     BACKTEST_OOS_START,
-    SENSITIVITY_REFIT_EVERY,
+    REFIT_EVERY,
     SENSITIVITY_PREDICT_EVERY,
     SENSITIVITY_FEE_RATE,
     SENSITIVITY_RANK_METRIC,
@@ -751,8 +750,8 @@ def _run_one(
         _fee * 100,
     )
 
-    # run_signals() uses SENSITIVITY_REFIT_EVERY for a speedup: fewer full BIC
-    # refits on the 5-minute macro walk-forward without changing relative rankings.
+    # run_signals() uses the shared REFIT_EVERY so the IS sweep and OOS backtest
+    # use the same HMM refit cadence — makes IS↔OOS Sharpe figures comparable.
     # prefetched_macro / prefetched_micro are passed directly — no API calls.
     # trend_consecutive_bars / trend_cooldown_bars are NOT passed here — they are
     # fixed in config_parameters.py and run_signals() uses the config defaults.
@@ -761,7 +760,7 @@ def _run_one(
         hmm_max_regimes=params["hmm_max_regimes"],
         vwap_window=params["vwap_window"],
         vwap_threshold=_threshold,
-        refit_every=SENSITIVITY_REFIT_EVERY,
+        refit_every=REFIT_EVERY,
         predict_every=SENSITIVITY_PREDICT_EVERY,
         prefetched_macro=prefetched_macro,
         prefetched_micro=prefetched_micro,
@@ -809,7 +808,7 @@ def _run_one_full(
         hmm_max_regimes=params["hmm_max_regimes"],
         vwap_window=params["vwap_window"],
         vwap_threshold=_threshold,
-        refit_every=SENSITIVITY_REFIT_EVERY,
+        refit_every=REFIT_EVERY,
         predict_every=SENSITIVITY_PREDICT_EVERY,
         prefetched_macro=prefetched_macro,
         prefetched_micro=prefetched_micro,

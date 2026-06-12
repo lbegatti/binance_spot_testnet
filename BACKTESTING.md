@@ -638,7 +638,7 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | IS window | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m) |
 | OOS window | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py` |
 | Rationale | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`. |
-| Refit cadence | `SENSITIVITY_REFIT_EVERY = 480` (40 h at 5 m, ~162 refits over 270-day IS window) — intentionally higher than `REFIT_EVERY = 360` (30 h) used by `runner.py`. The sweep runs 40× so fewer refits per trial cuts ~4 h of total runtime without changing the relative ranking of parameter combinations. |
+| Refit cadence | `REFIT_EVERY = 480` (40 h at 5 m) — shared by `sensitivity.py` (~162 refits over 270-day IS window) and `runner.py` (~54 refits over 90-day OOS window) so IS↔OOS Sharpe figures use the same HMM cadence and are directly comparable. |
 | Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `runner.py` always predicts every candle. |
 | Runtime (Bayes, 40 trials) | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials) |
 | Runtime (OAT, 8 runs) | ~1–2 h on a laptop |
@@ -957,7 +957,7 @@ concrete file in `backtest/`.
   **Phase 0 — `config_parameters.py`:**  `BACKTEST_MACRO_INTERVAL = "5m"`,
   `BACKTEST_MICRO_INTERVAL = "1m"` added.  `HMM_INTERVAL = "5m"`,
   `HMM_LOOKBACK = "10 hours ago UTC"` (live system aligned).
-  `SENSITIVITY_PREDICT_EVERY = 5`, `SENSITIVITY_REFIT_EVERY = 480` retained.
+  `SENSITIVITY_PREDICT_EVERY = 5` retained.  `SENSITIVITY_REFIT_EVERY` removed — refit cadence unified under `REFIT_EVERY = 480` shared by both pipelines.  `HMM_N_INIT` reduced 10 → 5.
 
   **Phase 1 — `backtest/data.py`:** `fetch_macro_klines()` and `fetch_micro_klines()`
   typed wrappers added.  Parquet cache (`_cached_fetch`, `_cache_path`,

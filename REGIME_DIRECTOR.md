@@ -20,7 +20,7 @@ No magic numbers appear anywhere else in the strategy code.
 | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | `46` | Seed for reproducible state numbering across fits |
 | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices (1e-1 recommended safe default for z-scored financial features) |
-| `HMM_N_INIT` | `10` | Random-seed restarts per candidate `n_components`; reduces degenerate EM solutions on flat windows |
+| `HMM_N_INIT` | `5` | Random-seed restarts per candidate `n_components`; loop breaks on the first valid fit so well-conditioned windows cost 1 seed — only pathological windows retry up to 5 |
 | `HMM_REFIT_INTERVAL` | `300` | Full re-fit cadence (s).  Between re-fits only Viterbi prediction runs |
 | `HMM_TRAIN_ROWS` | `80` | Legacy constant — **no longer used** to cap the train/test split inside `regime_director.py`.  The split is now computed adaptively as `train_end = max(2, int(n_rows × 2/3))` per window.  Retained in `config_parameters.py` for reference and diagnostic use |
 

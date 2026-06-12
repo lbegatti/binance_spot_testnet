@@ -76,7 +76,10 @@ HMM_MIN_COVAR = 1e-1
 # Number of independent random-seed restarts per candidate n_components value
 # inside select_hmm_model().  Higher values reduce the chance of degenerate
 # EM solutions (e.g. transmat row summing to 0) on flat/low-variance windows.
-HMM_N_INIT = 10
+# 5 seeds balances robustness against degenerate initialisation with speed:
+# the retry loop breaks on the first valid fit, so well-conditioned windows
+# still cost 1 seed; only pathological IS windows retry up to 5.
+HMM_N_INIT = 5
 # Legacy train/predict split constant — RETAINED FOR REFERENCE AND DIAGNOSTICS ONLY.
 # regime_director.py no longer uses this value to cap the split.
 # The split is now computed adaptively per window:
@@ -147,18 +150,10 @@ VOLUME_DECAY_FACTOR = 0.80
 # the backtest uses the same rolling-window logic as websocket_main.py.
 HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 10 h at 5 m (120 × 5 min = 600 min)
 VWAP_WINDOW = 5  # rolling VWAP window (rows) — 25 min at 5 m (micro frame)
-REFIT_EVERY = 360  # full BIC re-fit every N macro candles (= 20 h at 5 m)
-# Aligned with SENSITIVITY_REFIT_EVERY so the OOS validation
-# in runner.py uses the same HMM cadence as the IS optimisation
-# in sensitivity.py — makes IS↔OOS Sharpe comparisons
-
-# Sensitivity-sweep override for backtest/sensitivity.py — intentionally HIGHER than
-# REFIT_EVERY to speed up the 40-trial Optuna loop.  480 rows = 40 h at 5 m gives
-# ~162 BIC refits per trial (270-day IS window / 480).  Using REFIT_EVERY=360 would
-# push this to 216 refits/trial (+33 %), adding ~4 h across 40 trials with no
-# meaningful change in the relative ranking of parameter combinations.
-# runner.py uses REFIT_EVERY=360 for accuracy; here accuracy is traded for speed.
-SENSITIVITY_REFIT_EVERY = 480
+REFIT_EVERY = 480  # full BIC re-fit every N macro candles (= 40 h at 5 m)
+# Shared by sensitivity.py (IS sweep, ~162 refits over 270 days) and runner.py
+# (OOS backtest, ~54 refits over 90 days) so both pipelines use the same HMM
+# refit cadence — IS↔OOS Sharpe figures are directly comparable.
 # How many macro candles to skip between cheap Viterbi passes in sensitivity.py.
 # Between two predict calls the last known regime label is reused (forward-filled
 # onto the 1m micro frame via merge_asof).

@@ -25,7 +25,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `HMM_N_ITERATIONS` | 1000 | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | 46 | Random seed for reproducible state numbering |
 | `HMM_MIN_COVAR` | 1e-1 | Regularisation floor for covariance matrices |
-| `HMM_N_INIT` | 10 | Random restarts per candidate `n_components` |
+| `HMM_N_INIT` | 5 | Random restarts per candidate `n_components` |
 | `HMM_REFIT_INTERVAL` | 300 s | Full re-fit cadence (every 5 min at 5 m bars) |
 | `HMM_TRAIN_ROWS` | 80 | Legacy (no longer used); see code for adaptive split |
 | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to GaussianHMM |
@@ -69,7 +69,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | Constant | Default | Purpose |
 |---|---|---|
 | `SENSITIVITY_LOOKBACK` | *(removed)* | Use `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START` instead |
-| `SENSITIVITY_REFIT_EVERY` | 480 | Full HMM re-fit cadence during IS sweep (40 h at 5 m) |
+| `REFIT_EVERY` | 480 | Full HMM re-fit cadence shared by IS sweep and OOS backtest (40 h at 5 m, ~162 IS refits / ~54 OOS refits) |
 | `SENSITIVITY_PREDICT_EVERY` | 5 | Viterbi prediction cadence during IS sweep (every 5 candles) |
 | `SENSITIVITY_FEE_RATE` | 0.001 | Fee rate fixed during Optuna search (standard Binance Spot taker) |
 | `SENSITIVITY_RANK_METRIC` | "sharpe_ratio" | Metric used to rank trials (Sharpe ratio) |
@@ -108,5 +108,5 @@ Which modules import each constant from `config_parameters.py`:
 - `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `BACKTEST_MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
-- `backtest/sensitivity.py` — `SENSITIVITY_REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
+- `backtest/sensitivity.py` — `REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
 - `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
