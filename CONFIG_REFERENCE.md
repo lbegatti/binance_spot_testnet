@@ -49,8 +49,8 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `BACKTEST_MICRO_INTERVAL` | "1m" | Execution frame (1-minute) |
 | `BACKTEST_LOOKBACK` | "360 days ago UTC" | In-sample window start for sensitivity tuning |
 | `BACKTEST_OOS_START` | "90 days ago UTC" | Out-of-sample boundary (IS/OOS cutoff) |
-| `BACKTEST_INITIAL_BTC` | 0.065 | Starting BTC holdings |
-| `BACKTEST_INITIAL_CAPITAL` | 5,000 USDT | Starting USDT balance |
+| `BACKTEST_INITIAL_BTC` | 0.0 | Starting BTC balance. Set to `0.0` to avoid orphan SELL signals consuming a pre-existing balance before the first strategy BUY. The equivalent BTC value is folded into `BACKTEST_INITIAL_CAPITAL`. |
+| `BACKTEST_INITIAL_CAPITAL` | 315,000 USDT | Starting USDT balance (~250k USDT + 1 BTC @ ~65k), mirroring the live paper-trading account. |
 | `BACKTEST_FEE_RATE` | 0.001 | Taker fee per side (0.10 %) |
 | `BACKTEST_FILL_SPREAD_BPS` | 5 | Synthetic fill cost (basis points) |
 | `BACKTEST_MAX_ROWS` | None | Max kline rows (unlimited; use for testing) |
@@ -78,7 +78,6 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 
 ```json
 {
-  "schema_version": 1,
   "hmm_lookback_rows": 120,
   "hmm_max_regimes": 3,
   "vwap_window": 5,
@@ -98,7 +97,7 @@ Which modules import each constant from `config_parameters.py`:
 
 - `core/order_book_state.py` — `HISTORY_MAXLEN`, `CRYPTOCCY`, `CCY`
 - `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
-- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`
+- `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS` (stop-loss constants read indirectly via the refresher closure injected by `websocket_main.py`)
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`
@@ -109,4 +108,4 @@ Which modules import each constant from `config_parameters.py`:
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `backtest/sensitivity.py` — `REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
-- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, and all session / connection constants
+- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`, and all session / connection constants

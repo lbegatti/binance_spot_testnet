@@ -304,10 +304,10 @@ Two sub-cases are handled within each SELL iteration:
   as the remaining SELL qty allows, generating one round-trip record per
   consumed leg.
 
-**Orphan SELL** (SELL with no open BUY leg — only possible when
-`initial_btc > 0`): the trade is correctly reflected in the equity curve and
-balance, but is excluded from round-trip stats.  A clearly visible WARNING box
-is printed to the console.
+**Orphan SELL** (SELL with no open BUY leg): the trade is correctly reflected
+in the equity curve and balance, but is excluded from round-trip stats.  A
+clearly visible WARNING box is printed to the console.  This scenario is
+avoided entirely by setting `BACKTEST_INITIAL_BTC = 0.0`.
 
 ```
 BUY  P&L entry  = fill_price = close + half_spread    (half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000)
@@ -328,15 +328,18 @@ returned by the function.
 
 ### Initial equity
 
-The total return denominator accounts for **both** the USDT cash balance and
-any pre-existing BTC position, valued at the first candle's close:
+With `BACKTEST_INITIAL_BTC = 0.0` (always), initial equity equals the USDT
+balance directly.  The formula in `_compute_stats()` is general — it supports
+a non-zero BTC start — but the project always uses the simplified form:
 
 ```
-initial_btc_as_usdt     = initial_btc × close[0]
-initial_equity          = initial_usdt + initial_btc_as_usdt
+initial_btc_as_usdt     = initial_btc × close[0]   # = 0 when BACKTEST_INITIAL_BTC = 0
+initial_equity          = initial_usdt + initial_btc_as_usdt  # = initial_usdt
 ```
 
-When `initial_btc = 0` this reduces to `initial_equity = initial_usdt`.
+`BACKTEST_INITIAL_CAPITAL = 315_000.0` already incorporates the value of the
+live account's 1 BTC holding (~65k at ~65k/BTC) so total starting equity
+matches the live paper-trading account (~250k USDT + 1 BTC ≈ 315k).
 
 ### Metric table
 
@@ -638,8 +641,9 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 | IS window | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m) |
 | OOS window | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py` |
 | Rationale | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`. |
-| Refit cadence | `REFIT_EVERY = 480` (40 h at 5 m) — shared by `sensitivity.py` (~162 refits over 270-day IS window) and `runner.py` (~54 refits over 90-day OOS window) so IS↔OOS Sharpe figures use the same HMM cadence and are directly comparable. |
-| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — Viterbi prediction called every 5 candles; last known regime reused otherwise (~5× fewer calls). `runner.py` always predicts every candle. |
+| Refit cadence | `REFIT_EVERY = 480` (40 h at 5 m) — shared by `sensitivity.py` (~162 refits over 270-day IS window) and `runner.py` (~54 refits over 90-day OOS window).  Full-BIC refits use identical cadence in IS and OOS. |
+| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — IS sweep re-predicts the regime every 25 min (5 macro candles, last known label reused between calls); `runner.py` re-predicts every 5 min (every macro candle).  **IS / OOS Sharpe are NOT pure equivalents because of this gap** — see caveat below. |
+| ⚠ IS↔OOS Sharpe comparability | The full-BIC refit cadence matches in IS and OOS, but the Viterbi cadence does not (`SENSITIVITY_PREDICT_EVERY = 5` vs `runner.py`'s implicit `1`).  This means the IS sweep responds to intra-refit regime transitions 20 minutes later than the OOS run, producing a slightly different signal mix on identical data.  A non-zero IS-vs-OOS Sharpe gap is therefore NOT a pure overfitting signal — part of it is the cadence gap.  Treat the IS Sharpe as a **parameter ranking score**, not as an absolute predictor of OOS performance.  Lowering `SENSITIVITY_PREDICT_EVERY` to 1 would close the gap but slow the IS sweep ~5× without any guarantee the cadence component is the dominant one. |
 | Runtime (Bayes, 40 trials) | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials) |
 | Runtime (OAT, 8 runs) | ~1–2 h on a laptop |
 | Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `runner.py`) |

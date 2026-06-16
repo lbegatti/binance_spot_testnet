@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 from binance.lib.utils import websocket_api_signature, get_uuid
 from core.order_book_state import OrderBookState
@@ -83,6 +84,11 @@ class OrderExecutor:
         self.rest_client = rest_client
         self.ws_api_client = None
         self.placed_orders: list[dict] = []
+        # Pending GTC BUY tracking — for the 10-second stale-order cancel.
+        # _pending_buy_placed_at: wall-clock time the BUY was dispatched.
+        # _pending_buy_id: Binance orderId (REST: set synchronously; WS: async via handle_order_response).
+        self._pending_buy_placed_at: float | None = None
+        self._pending_buy_id: int | None = None
 
         # Tracks the in-flight session.logon and userDataStream.subscribe requests
         # so handle_order_response can route their responses correctly.
@@ -217,6 +223,102 @@ class OrderExecutor:
             )
 
     # ------------------------------------------------------------------
+    # Internal helpers — balance refresh and stale-order cancel
+    # ------------------------------------------------------------------
+
+    def _refresh_balance_rest(self) -> None:
+        """
+        Fetch free balances from Binance REST and update ``state.balance_status``.
+
+        Called after every successful order placement and after a stale BUY
+        cancel so that the next order sees the correct free/locked split.
+        No-ops silently when ``rest_client`` is ``None``.
+        """
+        if self.rest_client is None:
+            return
+        try:
+            acc = self.rest_client.account(recvWindow=RECV_WINDOW)
+            with self.state.thread_balance_lock:
+                for item in acc.get("balances", []):
+                    asset = item.get("asset")
+                    if asset in self.state.balance_status:
+                        self.state.balance_status[asset] = float(item["free"])
+            logging.info(
+                "Balance refreshed — %s: %.8f | %s: %.2f",
+                CRYPTOCCY,
+                self.state.balance_status.get(CRYPTOCCY, 0.0),
+                CCY,
+                self.state.balance_status.get(CCY, 0.0),
+            )
+        except Exception as e:
+            logging.warning(
+                "Balance refresh failed (%s). Next order may use stale balance.", e
+            )
+
+    def cancel_stale_buy(self, timeout_sec: float = 10.0) -> bool:
+        """
+        Cancel the outstanding GTC BUY order if it has been open longer than
+        ``timeout_sec`` seconds, then refresh the balance so freed USDT becomes
+        available for the next BUY signal.
+
+        Returns:
+            True  — caller should reset ``_position_open`` to False.
+            False — keep ``_position_open`` True (order likely filled; wait for SELL).
+        """
+        if self._pending_buy_placed_at is None:
+            return False
+        elapsed = time.time() - self._pending_buy_placed_at
+        if elapsed < timeout_sec:
+            return False
+
+        if self._pending_buy_id is None:
+            # Order dispatched but no orderId yet (WS response still in flight).
+            # Cannot cancel without an ID; clear stale state and allow re-entry.
+            logging.warning(
+                "BUY order timed out (%.1fs) with no orderId — clearing stale state.",
+                elapsed,
+            )
+            self._pending_buy_placed_at = None
+            return True
+
+        if self.rest_client is None:
+            logging.warning(
+                "Cannot cancel stale BUY order %s: no REST client available.",
+                self._pending_buy_id,
+            )
+            self._pending_buy_placed_at = None
+            self._pending_buy_id = None
+            return True
+
+        try:
+            self.rest_client.cancel_order(
+                symbol=SYMBOL,
+                orderId=self._pending_buy_id,
+                recvWindow=RECV_WINDOW,
+            )
+            logging.info(
+                "Stale BUY order %s cancelled after %.1fs.",
+                self._pending_buy_id,
+                elapsed,
+            )
+            self._refresh_balance_rest()
+            self._pending_buy_id = None
+            self._pending_buy_placed_at = None
+            return True
+        except Exception as e:
+            # Most likely: order already filled (Binance -2011 "Unknown order").
+            # Keep _position_open True so the strategy waits for a SELL signal
+            # to close the position.
+            logging.warning(
+                "Cancel of BUY order %s failed (%s) — order may have filled; "
+                "keeping position open.",
+                self._pending_buy_id,
+                e,
+            )
+            self._pending_buy_placed_at = None  # don't retry on every tick
+            return False
+
+    # ------------------------------------------------------------------
     # Callback — invoked by the WebSocket API client on every message
     # ------------------------------------------------------------------
 
@@ -309,6 +411,11 @@ class OrderExecutor:
             return
 
         self.last_order = result
+        # Capture BUY orderId for the 10-second stale-cancel mechanism.
+        # The WS path sets _pending_buy_placed_at synchronously in execute();
+        # the orderId only arrives here asynchronously.
+        if result.get("side") == "BUY":
+            self._pending_buy_id = result.get("orderId")
         self.placed_orders.append(
             {
                 "orderId": result.get("orderId"),
@@ -328,31 +435,29 @@ class OrderExecutor:
 
     def execute(self, strategy: str, opportunity: tuple) -> None:
         """
-        Send a LIMIT GTC order request over the WebSocket API (preferred) or
-        the REST API (fallback).
+        Send a LIMIT GTC (BUY) or LIMIT IOC (SELL) order via the WebSocket API
+        (preferred) or the REST API (fallback).
 
-        The method validates the strategy, dynamically caps the requested
-        quantity to the available balance, and dispatches the order frame.
-        The actual Binance response is handled asynchronously in
-        ``handle_order_response``.
+        **Order type per side:**
 
-        **Dynamic quantity cap** — rather than skipping an order when the
-        order-book level quantity exceeds the available balance, the quantity
-        is capped to the affordable amount:
+        * BUY:  LIMIT GTC — dip-buy placed on the book; lives until filled or
+          cancelled via ``cancel_stale_buy`` (10-second timeout).
+          ``_pending_buy_placed_at`` is set on dispatch; ``_pending_buy_id`` is
+          set synchronously (REST) or asynchronously via ``handle_order_response``
+          (WS) so the cancel mechanism can target the correct order.
+        * SELL: LIMIT IOC — fills at the best available bid immediately or
+          cancels; never locks BTC beyond a single matching cycle, eliminating
+          the -2010 "insufficient balance" failure caused by stale locked BTC.
+
+        **Dynamic quantity cap** — caps the requested quantity to the available
+        balance rather than skipping the order entirely:
 
         * BUY:  ``quantity = min(aq, usdt / (micro_price × (1 + BACKTEST_FEE_RATE)))``
         * SELL: ``quantity = min(bq, btc)``
 
         The fee-adjusted divisor for BUY orders ensures the total debit
         (``quantity × micro_price × (1 + fee_rate)``) never exceeds the
-        available USDT balance.  Without it, Binance deducts the taker fee
-        *on top of* the order notional and rejects the order with
-        ``insufficient balance`` when the full balance is committed.
-
-        The order is only skipped (returns ``None``) when the capped quantity
-        is effectively zero, meaning the balance is fully depleted for that
-        direction.  A ``logging.info`` message is emitted whenever a cap is
-        applied so the operator can observe partial fills.
+        available USDT balance.
 
         Args:
             strategy (str): ``"BUY"`` or ``"SELL"``.
@@ -427,10 +532,19 @@ class OrderExecutor:
                     btc,
                     CRYPTOCCY,
                 )
+            # SELL closes the position — clear pending BUY tracking regardless
+            # of which execution path is taken below.
+            self._pending_buy_placed_at = None
+            self._pending_buy_id = None
+
+        # BUY → GTC (dip-buy needs time on the book).
+        # SELL → IOC (fill at best bid immediately or cancel; never locks BTC).
+        time_in_force = "GTC" if strategy == "BUY" else "IOC"
 
         logging.info(
-            "Sending LIMIT %s: level=%d price=%.2f qty=%.6f",
+            "Sending LIMIT %s (%s): level=%d price=%.2f qty=%.6f",
             strategy,
+            time_in_force,
             level_idx,
             micro_price,
             quantity,
@@ -438,28 +552,34 @@ class OrderExecutor:
 
         if self.ws_api_client is not None:
             # Preferred path — lower latency, async response via handle_order_response
+            if strategy == "BUY":
+                self._pending_buy_placed_at = time.time()
             self.ws_api_client.new_order(
                 symbol=SYMBOL,
                 side=strategy,
                 type="LIMIT",
-                timeInForce="GTC",
+                timeInForce=time_in_force,
                 quantity=f"{quantity:.6f}",
                 price=f"{micro_price:.2f}",
                 recvWindow=RECV_WINDOW,
             )
         elif self.rest_client is not None:
             # Fallback path — synchronous REST call (used when WS API is unavailable)
+            if strategy == "BUY":
+                self._pending_buy_placed_at = time.time()
             try:
                 response = self.rest_client.new_order(
                     symbol=SYMBOL,
                     side=strategy,
                     type="LIMIT",
-                    timeInForce="GTC",
+                    timeInForce=time_in_force,
                     quantity=f"{quantity:.6f}",
                     price=f"{micro_price:.2f}",
                     recvWindow=RECV_WINDOW,
                 )
                 self.last_order = response
+                if strategy == "BUY":
+                    self._pending_buy_id = response.get("orderId")
                 self.placed_orders.append(
                     {
                         "orderId": response.get("orderId"),
@@ -477,7 +597,10 @@ class OrderExecutor:
                     quantity,
                     response.get("orderId"),
                 )
+                self._refresh_balance_rest()
             except Exception as e:
+                if strategy == "BUY":
+                    self._pending_buy_placed_at = None
                 logging.error(
                     "REST LIMIT %s failed (level %d, price %.2f): %s",
                     strategy,

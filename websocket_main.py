@@ -11,6 +11,7 @@ from core.order_book_state import OrderBookState
 from execution.order_executor import OrderExecutor
 from strategy.regime_director import RegimeDirector
 from strategy.param_loader import load_best_params
+from strategy.indicators import compute_live_stop_loss_pct
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     HFT_INTERVAL,
@@ -23,6 +24,8 @@ from config_parameters import (
     SYMBOL,
     CCY,
     CRYPTOCCY,
+    STOP_LOSS_ROLLING_DAYS,
+    STOP_LOSS_STD_MULT,
 )
 
 logging.basicConfig(
@@ -161,6 +164,61 @@ except Exception as e:
     logging.warning("Could not fetch BTC start price for P&L attribution: %s", e)
 
 # ---------------------------------------------------------------------------
+# 2b. Adaptive stop-loss threshold (mirrors backtest/pnl.py)
+# ---------------------------------------------------------------------------
+# Computed once at startup from STOP_LOSS_ROLLING_DAYS + buffer days of daily
+# klines, then refreshed once per UTC day inside historical_analysis() via the
+# refresher closure defined below.
+#
+# The "stop_loss_state" dict is the SHARED MUTABLE CONTAINER between the
+# REST-aware websocket_main.py (writer) and the REST-agnostic AnalysisEngine
+# (reader).  This keeps AnalysisEngine decoupled from Binance — it never
+# imports the REST client; it only ever reads a float.
+try:
+    _initial_sl_pct = compute_live_stop_loss_pct(
+        rest_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
+    )
+    logging.info(
+        "Adaptive stop-loss threshold at session start: %.4f%% "
+        "(%d-day rolling std × %.1f).",
+        _initial_sl_pct * 100,
+        STOP_LOSS_ROLLING_DAYS,
+        STOP_LOSS_STD_MULT,
+    )
+except Exception as _sl_exc:
+    _initial_sl_pct = 0.0
+    logging.warning(
+        "Could not compute initial stop-loss threshold (%s) — stop-loss disabled "
+        "for this session until next daily refresh succeeds.",
+        _sl_exc,
+    )
+
+stop_loss_state: dict = {
+    "pct": _initial_sl_pct,  # float — current threshold (e.g. 0.038 = 3.8%)
+    "last_day_utc": int(time.time()) // 86400,  # int — UTC day of last refresh
+}
+
+
+def refresh_stop_loss_pct() -> float | None:
+    """
+    Closure injected into AnalysisEngine so historical_analysis() can refresh
+    the threshold once per UTC day without ever touching the Binance REST
+    client directly (decoupling).
+
+    Returns:
+        float | None: The new threshold, or ``None`` on failure (caller keeps
+            the previous value).
+    """
+    try:
+        return compute_live_stop_loss_pct(
+            rest_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
+        )
+    except Exception as exc:
+        logging.warning("Stop-loss daily refresh failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
 # At the default of 10 min the engine runs:
@@ -238,6 +296,8 @@ engine = AnalysisEngine(
     stop_event=stop_event,
     executor=executor,
     regime_director=regime_director,
+    stop_loss_state=stop_loss_state,
+    refresh_stop_loss_fn=refresh_stop_loss_pct,
 )
 
 low_latency_thread = threading.Thread(
@@ -288,6 +348,16 @@ finally:
     low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
     logging.info("All threads stopped. Exiting.")
+
+    # -----------------------------------------------------------------------
+    # Stop-loss summary
+    # -----------------------------------------------------------------------
+    logging.info(
+        "Adaptive stop-loss summary: %d emergency exit(s) this session "
+        "(final threshold: %.4f%%).",
+        engine._n_stop_loss_fires,
+        stop_loss_state.get("pct", 0.0) * 100,
+    )
 
     # -----------------------------------------------------------------------
     # End-of-session order report

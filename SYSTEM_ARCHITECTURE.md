@@ -15,7 +15,7 @@ FILES
     message_handler.py                — MessageHandler: one active callback (depth) + one superseded (balance)
 
   strategy/
-    analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter)
+    analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter + trend-pause gate + adaptive stop-loss)
     book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity) — NumPy-vectorised; shape-mismatch guard
     regime_director.py                — RegimeDirector: GaussianHMM regime detection on 5-min klines (HMM_INTERVAL="5m", HMM_LOOKBACK="10 hours ago UTC", 120 bars)
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
@@ -25,7 +25,7 @@ FILES
     quotes.py                         — find_best_quote(): best bid/ask selection helpers
 
   execution/
-    order_executor.py                 — OrderExecutor: LIMIT GTC orders via WebSocket API + balance guards
+    order_executor.py                 — OrderExecutor: LIMIT GTC (BUY) / IOC (SELL) orders via WebSocket API + balance refresh + 10-second stale-BUY cancel
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
@@ -76,27 +76,72 @@ FILES
   check `stop_event` on every iteration and exit gracefully when it is set.
 
   Private cross-thread attributes:
-    _vwap_lock       : Lock          — serialises _bid_vwap / _ask_vwap
-    _bid_vwap        : float | None  — latest bid VWAP from historical_analysis
-    _ask_vwap        : float | None  — latest ask VWAP from historical_analysis
-    _regime_lock     : Lock          — serialises regime_director.regime_label
-    _position_open   : bool          — single-open-position guard; mirrors
-                                        open_strategy_qty in backtest/pnl.py
-    _position_guard_skips : int      — BUY signals suppressed this session
+    _vwap_lock            : Lock          — serialises _bid_vwap / _ask_vwap
+    _bid_vwap             : float | None  — latest bid VWAP from historical_analysis
+    _ask_vwap             : float | None  — latest ask VWAP from historical_analysis
+    _regime_lock          : Lock          — serialises regime_director.regime_label
+                                             AND _trend_paused (same source frame,
+                                             same write cadence)
+    _position_open        : bool          — single-open-position guard; mirrors
+                                             open_strategy_qty in backtest/pnl.py.
+                                             Pre-armed to True at session start when
+                                             balance_status[BTC] ≥ 0.0001 so inherited
+                                             BTC is treated as an open position and the
+                                             first SELL closes it naturally (strategy then
+                                             runs USDT-only, matching BACKTEST_INITIAL_BTC=0).
+    _position_guard_skips : int           — BUY signals suppressed this session
+    _pending_buy_placed_at: float | None  — wall-clock time the last GTC BUY was dispatched;
+                                             used by cancel_stale_buy() to detect 10-second timeout
+    _pending_buy_id       : int | None    — Binance orderId of the outstanding GTC BUY order
+                                             (set synchronously on REST, async via handle_order_response on WS)
+    _trend_paused         : bool          — mirrors trend_pause column in
+                                             backtest/signals.py; True ⇒ skip
+                                             BOTH BUY and SELL this tick
+    _trend_pause_skips    : int           — ticks suppressed by the trend-pause
+                                             gate this session
+    _stop_loss_state      : dict          — shared mutable container owned by
+                                             websocket_main.py; keys "pct" and
+                                             "last_day_utc".  AnalysisEngine
+                                             reads it; the refresher closure
+                                             writes it.  Pure decoupling — no
+                                             REST client touches this class.
+    _refresh_stop_loss_fn : Callable | None — closure injected by websocket_main.py
+                                             that re-computes the threshold from
+                                             daily klines.  Called once per UTC
+                                             day from historical_analysis().
+    _stop_loss_lock       : Lock          — serialises _stop_loss_state
+    _avg_entry_price      : float         — VWAP entry price of the open
+                                             strategy position (0.0 when flat);
+                                             stop-loss anchor
+    _n_stop_loss_fires    : int           — emergency exits this session
 
   ▸ low_latency_analysis()  [every HFT_INTERVAL = 1 s]
       Reads balance, copies order book under thread_lock, builds the top
-      N_LEVELS (50) bid/ask pairs, scores candidates (70 % depth / 30 % delta),
-      applies the VWAP gate (mean-reversion dead zone, δ = 0.002) and the
-      two-gate HMM regime filter (confidence ≥ 0.60, direction check), then
-      delegates to OrderExecutor.execute().
+      N_LEVELS (50) bid/ask pairs, scores candidates (70 % depth / 30 % delta).
+      On each iteration (in order):
+      1. **Stale-BUY cancel** — if _position_open is True, calls
+         OrderExecutor.cancel_stale_buy().  If the GTC BUY has been on the book
+         ≥ 10 s and the cancel succeeds, resets _position_open = False so the
+         strategy can re-enter.  If the cancel fails (order likely already filled),
+         keeps the guard armed and waits for a SELL signal.
+      2. **Adaptive stop-loss check** (unconditional): if mid_price < avg_entry ×
+         (1 − pct), fires an emergency SELL and skips the rest of the tick.
+      3. **HMM confidence gate** (≥ 0.60), **trend-pause gate** (skip BOTH sides
+         if _trend_paused is True), **VWAP gate** (mean-reversion dead zone,
+         δ = 0.002), **HMM regime direction filter**, then delegates to
+         OrderExecutor.execute().
 
   ▸ historical_analysis()  [every HIST_INTERVAL = 60 s]
       Always recomputes bid_vwap / ask_vwap from history_order_book and
-      publishes under _vwap_lock.  HMM block fires only when a new 5-minute
-      UTC clock boundary is crossed: fetches fresh 5m klines, then either runs
-      a full BIC re-fit (select_hmm_model) or a cheap Viterbi pass
-      (predict_current_regime), and writes the new label under _regime_lock.
+      publishes under _vwap_lock.  Once per UTC day calls the injected
+      refresh_stop_loss_fn() closure and updates _stop_loss_state under
+      _stop_loss_lock — never touches Binance REST directly.  HMM block
+      fires only when a new 5-minute UTC clock boundary is crossed: fetches
+      fresh 5m klines, runs either a full BIC re-fit (select_hmm_model) or a
+      cheap Viterbi pass (predict_current_regime), then computes the
+      trend-pause flag on the same klines_df via
+      strategy.indicators.add_trend_pause_flag() and writes the new regime
+      label AND the trend-pause flag under _regime_lock.
 
   ▸ Deque fill-up (at WS_SPEED = 100 ms → ~10 entries/sec):
 
@@ -170,12 +215,31 @@ FILES
   → executor.stop() → thread joins → order report → balance P&L decomposition).
 
 ## 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
-  Places LIMIT GTC orders via the Binance WebSocket API and maintains real-time
-  balance via `outboundAccountPosition` push events on the same connection
-  (session.logon → userDataStream.subscribe), eliminating the need for a
-  listenKey.  Falls back to REST if the WebSocket handshake fails.  Dynamic
-  quantity cap: BUY = `min(aq, usdt / (price × (1 + fee)))` to reserve the
-  taker fee; SELL = `min(bq, btc)`.
+  Places orders via the Binance WebSocket API and maintains real-time balance
+  via `outboundAccountPosition` push events (session.logon → userDataStream.subscribe),
+  eliminating the need for a listenKey.  Falls back to REST if the WebSocket
+  handshake fails.
+
+  **Order types per side:**
+  - **BUY**: LIMIT GTC — dip-buy sits on the book until filled or cancelled.
+    On dispatch, `_pending_buy_placed_at` is set (both paths) and
+    `_pending_buy_id` is set synchronously (REST) or asynchronously via
+    `handle_order_response` (WS).
+  - **SELL**: LIMIT IOC — fills at the best available bid immediately or
+    auto-cancels; never locks BTC beyond a single matching cycle (prevents
+    the Binance -2010 "insufficient balance" rejection caused by stale locked BTC).
+
+  **Key methods:**
+  - `execute()`: validates strategy, caps quantity, dispatches the order.
+    Dynamic cap: BUY = `min(aq, usdt / (price × (1 + fee)))` to reserve the
+    taker fee; SELL = `min(bq, btc)`.
+  - `cancel_stale_buy(timeout_sec=10.0)`: cancels the outstanding GTC BUY via
+    REST if it has been open ≥ 10 s.  Returns True (reset `_position_open`) on
+    success; False if cancel fails (order likely filled — keep guard armed).
+  - `_refresh_balance_rest()`: fetches free balances from Binance REST and
+    updates `state.balance_status` under `thread_balance_lock`.  Called after
+    every successful order and after a stale-BUY cancel to keep the free/locked
+    split accurate in REST-fallback mode (no WS push events available).
 
 ## 7. BACKTESTING  (backtest/)
   Full design, pseudocode, data-flow diagrams, approximation caveats, and

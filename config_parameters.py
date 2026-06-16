@@ -149,7 +149,7 @@ VOLUME_DECAY_FACTOR = 0.80
 # Mirrors the live system's HMM_LOOKBACK / HMM_REFIT_INTERVAL constants so
 # the backtest uses the same rolling-window logic as websocket_main.py.
 HMM_LOOKBACK_ROWS = 120  # warm-up window (rows) — 10 h at 5 m (120 × 5 min = 600 min)
-VWAP_WINDOW = 5  # rolling VWAP window (rows) — 25 min at 5 m (micro frame)
+VWAP_WINDOW = 5  # rolling VWAP window (rows) — 5 min at 1 m (micro frame)
 REFIT_EVERY = 480  # full BIC re-fit every N macro candles (= 40 h at 5 m)
 # Shared by sensitivity.py (IS sweep, ~162 refits over 270 days) and runner.py
 # (OOS backtest, ~54 refits over 90 days) so both pipelines use the same HMM
@@ -160,7 +160,20 @@ REFIT_EVERY = 480  # full BIC re-fit every N macro candles (= 40 h at 5 m)
 # 5-min macro candles → regime changes in ≤ 25 min are missed, but the
 # RELATIVE ranking of parameter combinations is preserved (all runs use the
 # same cadence).  runner.py always uses predict_every=1 (every macro candle).
-SENSITIVITY_PREDICT_EVERY = 5  # ~25 min at 5 m — sensitivity-sweep override only
+#
+# ⚠ IS / OOS Sharpe comparability caveat
+# ----------------------------------------
+# IS sweep (sensitivity.py)  → predict_every=5  → regime re-inferred every 25 min
+# OOS run  (runner.py)       → predict_every=1  → regime re-inferred every  5 min
+#
+# A non-zero IS-vs-OOS Sharpe gap is therefore NOT a pure overfitting signal —
+# part of the gap is caused by the cadence difference (the IS sweep responds to
+# regime transitions 20 minutes later than the OOS run, which produces a
+# different signal mix on the same data).  Treat the IS Sharpe as a parameter
+# ranking score, not as an absolute predictor of OOS performance.  Do not lower
+# this value to "match" OOS — the IS sweep would slow down ~5× without any
+# guarantee that the cadence-gap component of the IS/OOS gap is the dominant one.
+SENSITIVITY_PREDICT_EVERY = 5  # ~25 min at 5 m — IS sensitivity-sweep speed override only
 # Between two full-BIC refit calls, predict_current_regime() is called only every
 # 5 macro candles; the last known regime label is reused (~5× Viterbi speedup).
 # runner.py always uses predict_every=1 (every candle).
@@ -183,9 +196,13 @@ SENSITIVITY_RANK_METRIC: str = "sharpe_ratio"
 SENSITIVITY_OAT_THRESHOLD: float = 0.5
 
 # -- P&L simulation (backtest/pnl.py) -------------------------------------
-# Starting balances.  Total = USDT + BTC × first_close ≈ $10 000 at $77k BTC.
-BACKTEST_INITIAL_CAPITAL = 5000.0  # starting USDT balance
-BACKTEST_INITIAL_BTC = 0.065  # starting BTC balance
+# Starting balances mirror the live paper-trading account (~250k USDT + 1 BTC).
+# BACKTEST_INITIAL_BTC is set to 0.0 to avoid "orphan SELL" signals consuming
+# a pre-existing BTC balance before the strategy opens its first BUY.  The 1 BTC
+# is instead folded into BACKTEST_INITIAL_CAPITAL at ~65k/BTC so total starting
+# equity (~315k) matches the live account without distorting PnL metrics.
+BACKTEST_INITIAL_CAPITAL = 315000.0  # starting USDT balance (~250k USDT + 1 BTC @ ~65k)
+BACKTEST_INITIAL_BTC = 0.0  # starting BTC balance (BTC value folded into BACKTEST_INITIAL_CAPITAL)
 
 # Taker fee per side (Binance Spot standard tier).
 BACKTEST_FEE_RATE = 0.001  # 0.10 %

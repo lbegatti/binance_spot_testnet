@@ -945,7 +945,6 @@ def _save_best_params(best_row: pd.Series, force_save: bool = False) -> None:
             return
 
     payload = {
-        "schema_version": 1,  # Increment on breaking changes to JSON structure
         "hmm_lookback_rows": int(best_row["hmm_lookback_rows"]),
         "hmm_max_regimes": int(best_row["hmm_max_regimes"]),
         "vwap_window": int(best_row["vwap_window"]),

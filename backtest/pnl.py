@@ -1041,6 +1041,14 @@ def _compute_stats(
             & signals["regime"].isin(_BUY_BLOCKED_REGIMES)
         ).sum()
     )
+    # NOTE: sim_position_open is computed in signals.py BEFORE pnl.py runs the
+    # stop-loss check, so it does not reflect SELL_STOP_LOSS exits.  Bars
+    # immediately after a stop-loss are still marked sim_position_open=True
+    # even though open_strategy_qty has been reset to 0.  This causes
+    # regime_blocked_sell to be slightly understated post-stop-loss (the
+    # affected bars are filtered out as "exit bypasses" when they are actually
+    # legitimate regime blocks).  Magnitude: bounded by n_stop_loss_fires.
+    # Cash flows and equity curve are NOT affected — diagnostic stat only.
     if "sim_position_open" in signals.columns:
         regime_blocked_sell = int(
             (

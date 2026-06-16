@@ -11,7 +11,10 @@ from strategy.book_utils import (
     collect_candidates,
     select_best_opportunity,
 )
-from strategy.indicators import volume_weighted_average_price
+from strategy.indicators import (
+    add_trend_pause_flag,
+    volume_weighted_average_price,
+)
 from strategy.regime_director import RegimeDirector
 
 from config_parameters import (
@@ -65,47 +68,6 @@ def _add_hmm_features(k_df: pd.DataFrame) -> pd.DataFrame:
     ) * 2 - 1
     klines_df["trade_density"] = klines_df["num_trades"] / klines_df["volume"]
     return klines_df.dropna()
-
-
-def _add_trend_pause_flag(
-    df_macro: pd.DataFrame,
-    n: int,
-    cooldown: int,
-) -> pd.Series:
-    """
-    Compute a boolean ``trend_pause`` Series on the macro (5 m) frame.
-
-    True  → ``n`` or more consecutive same-direction closes detected;
-             mean-reversion entries should be suppressed.
-    False → market is ranging; normal signal logic applies.
-
-    The streak counter resets automatically when the close direction flips,
-    so no explicit "trend end" detection is required.  The cooldown then keeps
-    ``paused=True`` for ``cooldown`` bars after the last trending bar, preventing
-    whipsaw re-entry the instant the streak breaks.
-
-    NaN rows at the start (HMM warm-up period) have direction filled to 0 so
-    they never artificially trigger a trend pause.  Flat streaks (direction == 0,
-    i.e. consecutive equal closes) are excluded from trend detection.
-    """
-    close = df_macro["close"]
-    # +1 up-close, -1 down-close, 0 flat; NaN at row 0 filled to 0 (no direction)
-    direction = np.sign(close.diff()).fillna(0)
-
-    # Cumulative group ID increments on every direction change.
-    # cumcount()+1 gives the streak length: 1 on the first bar of each run.
-    streak = direction.groupby((direction != direction.shift()).cumsum()).cumcount() + 1
-
-    # A bar "is in trend" when streak ≥ n AND direction is not flat.
-    in_trend = (streak >= n) & (direction != 0)
-
-    # Cooldown: OR with shifted versions to stay paused for `cooldown` extra bars
-    # after the last in_trend=True bar (counted from the END of the streak).
-    paused = in_trend.copy()
-    for lag in range(1, cooldown + 1):
-        paused = paused | in_trend.shift(lag).fillna(False)
-
-    return paused.astype(bool)
 
 
 def run_signals(
@@ -182,6 +144,10 @@ def run_signals(
         Minimum fractional dip / rally around VWAP before a signal fires.
         Defaults to ``VWAP_THRESHOLD_MULTIPLIER`` (0.003 → 0.30 % dead
         zone).
+    trend_consecutive_bars : number of consecutive bar closes in the same
+        direction required to trigger the trend-pause flag.
+    trend_cooldown_bars : number of consecutive bar closes in the same direction
+        require to trigger a cooldown-pause flag.
 
     Internal pipeline
     -----------------
@@ -283,7 +249,7 @@ def run_signals(
 
     # Compute trend_pause vectorially on the full macro frame BEFORE the loop.
     # Indexed by position so trend_pause_series.iloc[i] aligns with features_macro[i].
-    trend_pause_series = _add_trend_pause_flag(
+    trend_pause_series = add_trend_pause_flag(
         features_macro, n=_trend_consecutive, cooldown=_trend_cooldown
     )
     logging.info(
@@ -407,6 +373,27 @@ def run_signals(
     # Tracks whether a strategy BUY has been dispatched without a matching SELL.
     # Mirrors _position_open in analysis.py — used to bypass the SELL regime gate
     # for exits (audit Finding 1 fix).
+    #
+    # KNOWN LIMITATION — stop-loss divergence
+    # ----------------------------------------
+    # signals.py pre-computes _sim_position_open from BUY/SELL signal flips ONLY.
+    # backtest/pnl.py later runs a separate stop-loss check that can close the
+    # position via SELL_STOP_LOSS without producing a SELL signal here.  After
+    # such an event:
+    #   • pnl.py:    open_strategy_qty = 0     (real position state, flat)
+    #   • signals.py: sim_position_open = True  (stale, still says "in position")
+    # …until the next BUY/SELL signal flip realigns them.
+    #
+    # Consequence: pnl._compute_stats() uses sim_position_open to decide
+    # whether SELL signals on regime-blocked bars were "real" blocks vs exit
+    # bypasses.  Bars immediately following a stop-loss are incorrectly
+    # classified as "exit-bypassed" when they should be counted as
+    # regime-blocked.  This understates regime_blocked_sell in the filter
+    # hit-rate stats by at most n_stop_loss_fires × (avg bars between SELL
+    # signals) — small in practice.
+    #
+    # P&L itself is UNAFFECTED — pnl.py uses open_strategy_qty (its own state)
+    # to drive all cash flows; sim_position_open is read only for diagnostics.
     _sim_position_open: bool = False
 
     for i in range(len(df_exec)):
