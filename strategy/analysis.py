@@ -2,6 +2,7 @@ from core.order_book_state import OrderBookState
 import threading
 import time
 import logging
+from datetime import datetime, timezone
 import numpy as np
 
 from config_parameters import (
@@ -93,6 +94,7 @@ class AnalysisEngine:
         regime_director: RegimeDirector,
         stop_loss_state: dict | None = None,
         refresh_stop_loss_fn=None,
+        initial_avg_entry_price: float = 0.0,
     ):
         """
         Args:
@@ -111,6 +113,11 @@ class AnalysisEngine:
                 ``websocket_main.py`` before threads start) so the very first
                 ``low_latency_analysis`` iteration has a valid regime to read.
                 Re-fitted on every ``historical_analysis`` iteration.
+            initial_avg_entry_price (float): Session-start BTC price passed from
+                ``websocket_main.py`` (``btc_start_price``).  Used as the
+                stop-loss anchor when the position guard is pre-armed due to an
+                inherited BTC balance.  Defaults to 0.0 (stop-loss disabled for
+                inherited positions when the price fetch fails at startup).
         """
         self.regime_director = regime_director
         self.state = state
@@ -136,19 +143,33 @@ class AnalysisEngine:
         self._position_open: bool = False
         self._position_guard_skips: int = 0
 
+        # Volume-weighted average entry price of the strategy-opened position.
+        # Set on BUY dispatch; reset to 0.0 on SELL or stop-loss exit.  Read by
+        # the stop-loss check inside low_latency_analysis() — anchor of the
+        # "mid < entry × (1 − pct)" floor.
+        # Declared here (before the pre-arm block) so the conditional assignment
+        # below is not overwritten by a later unconditional initialisation.
+        self._avg_entry_price: float = 0.0
+
         # Pre-arm position guard when the account already holds BTC at session
         # start. Treats inherited BTC as an open BUY so the first valid SELL
         # closes it naturally, after which the strategy runs in USDT-only mode
         # matching the backtest's BACKTEST_INITIAL_BTC = 0 assumption.
+        # initial_avg_entry_price (btc_start_price from websocket_main.py) is
+        # used as the stop-loss anchor so the inherited position is protected
+        # even though we never placed the original BUY this session.
         with self.state.thread_balance_lock:
             _initial_btc = self.state.balance_status.get(CRYPTOCCY, 0.0)
         if _initial_btc >= 0.0001:
             self._position_open = True
+            self._avg_entry_price = initial_avg_entry_price
             logging.info(
                 "Position guard pre-armed: %.8f %s on account at startup — "
-                "treating as open position (first SELL will close it).",
+                "treating as open position (first SELL will close it). "
+                "Stop-loss anchor: %.2f.",
                 _initial_btc,
                 CRYPTOCCY,
+                initial_avg_entry_price,
             )
 
         # Trend-pause flag — mirrors backtest/signals.py.
@@ -168,7 +189,7 @@ class AnalysisEngine:
         # stop_loss_state is a SHARED MUTABLE CONTAINER built by
         # websocket_main.py (a dict with keys "pct" and "last_day_utc").  We
         # never call out to Binance REST from here — the refresh_stop_loss_fn
-        # closure does that and we read the resulting float.  Both default to
+        # closure does that, and we read the resulting float.  Both default to
         # disabled fallbacks so unit tests and legacy callers that don't pass
         # these args still work.
         self._stop_loss_state: dict = (
@@ -179,14 +200,15 @@ class AnalysisEngine:
         self._refresh_stop_loss_fn = refresh_stop_loss_fn  # None ⇒ no daily refresh
         self._stop_loss_lock = threading.Lock()
 
-        # Volume-weighted average entry price of the strategy-opened position.
-        # Set on BUY dispatch; reset to 0.0 on SELL or stop-loss exit.  Read by
-        # the stop-loss check inside low_latency_analysis() — anchor of the
-        # "mid < entry × (1 − pct)" floor.
-        self._avg_entry_price: float = 0.0
-
         # Session counter — logged at session end.
         self._n_stop_loss_fires: int = 0
+
+        # ── Equity snapshot history (consumed by visualization/session_chart.py) ──
+        # One entry per HFT tick: (utc_now, usdt_free, btc_free, mid_price).
+        # Written exclusively by the HFT thread; read by the main thread AFTER
+        # hft_thread.join() in websocket_main.py's finally block, so no lock
+        # is needed.  For a 10-minute session this is ~600 entries (~50 KB).
+        self._equity_snapshots: list[tuple] = []
 
     @staticmethod
     def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
@@ -289,11 +311,21 @@ class AnalysisEngine:
         7. **Regime confidence gate** — reads ``regime_director.regime_confidence``
            (posterior probability from ``predict_proba()``) under ``_regime_lock``:
            - Skip **both** sides if ``regime_confidence < HMM_MIN_CONFIDENCE``
-             (default 0.70).  A sub-threshold score means the model cannot
-             distinguish the current state clearly enough to justify an order.
+             (default 0.60) **and** ``_position_open`` is ``False``.  A
+             sub-threshold score means the model cannot distinguish the current
+             state clearly enough to justify a new entry.
+           - When ``_position_open`` is ``True`` the gate is bypassed so a
+             closing SELL is never blocked by a low-confidence reading —
+             risk management filters apply to new entries only.
            - When ``regime_confidence`` is ``None`` (before the first
              ``historical_analysis`` run) the gate is transparent.
-        8. **Regime direction filter** (HMM gate) — reads
+        8. **Trend-pause gate** — skips new BUY/SELL entries when
+           ``_trend_paused`` is ``True`` (written by ``historical_analysis``
+           when the macro frame shows ``TREND_CONSECUTIVE_BARS`` consecutive
+           same-direction closes followed by a ``TREND_COOLDOWN_BARS`` cooldown).
+           Bypassed when ``_position_open`` is ``True`` so a closing SELL can
+           still execute during a trend-pause period.
+        9. **Regime direction filter** (HMM gate) — reads
            ``regime_director.regime_label`` under ``_regime_lock``:
            - BUY:  skip if regime is ``"trending_down"`` or ``"high_volatility"``.
            - SELL: skip if regime is ``"trending_up"`` or ``"high_volatility"``
@@ -303,8 +335,8 @@ class AnalysisEngine:
              becomes permanently stranded in a trending market.
            ``None`` label (before first ``historical_analysis`` run) is treated
            as transparent — all orders are allowed through.
-        9. **Order execution** — delegates to
-           ``OrderExecutor.execute("BUY"|"SELL", opportunity)``.
+        10. **Order execution** — delegates to
+            ``OrderExecutor.execute("BUY"|"SELL", opportunity)``.
 
         Exits cleanly when ``stop_event`` is set, logging how many iterations
         were completed.
@@ -360,6 +392,21 @@ class AnalysisEngine:
             best_sell = self._select_best_opportunity(
                 sell_candidates, "sell", iteration
             )
+
+            # ── Equity snapshot (consumed by end-of-session P&L chart) ─────
+            # Captured every tick regardless of which gate fires below so the
+            # equity curve is dense (~1 Hz).  Re-reads balances under the lock
+            # to reflect any updates from cancel_stale_buy() earlier this tick.
+            # mid_price comes from levels[0][1] — already computed; if levels
+            # is empty (rare: asks not yet streamed) the snapshot is skipped.
+            if levels:
+                _mid_snap = float(levels[0][1])  # level[1] = mid_price
+                with self.state.thread_balance_lock:
+                    _usdt_snap = self.state.balance_status.get(CCY, 0.0)
+                    _btc_snap = self.state.balance_status.get(CRYPTOCCY, 0.0)
+                self._equity_snapshots.append(
+                    (datetime.now(timezone.utc), _usdt_snap, _btc_snap, _mid_snap)
+                )
 
             # ── Adaptive stop-loss check (mirrors backtest/pnl.py) ─────────
             # Fires UNCONDITIONALLY when we hold an open position and the
@@ -436,15 +483,21 @@ class AnalysisEngine:
             # trending_up vs 45 % neutral).  Skip both sides to avoid trading
             # on a coin-flip signal.
             if regime_confidence is not None and regime_confidence < HMM_MIN_CONFIDENCE:
+                if not self._position_open:
+                    logging.info(
+                        "HFT #%d — skipped: regime '%s' confidence %.2f < %.2f",
+                        iteration,
+                        current_regime,
+                        regime_confidence,
+                        HMM_MIN_CONFIDENCE,
+                    )
+                    self.stop_event.wait(HFT_INTERVAL)
+                    continue
                 logging.info(
-                    "HFT #%d — skipped: regime '%s' confidence %.2f < %.2f",
+                    "HFT #%d — low regime confidence %.2f but position open — allowing closing SELL.",
                     iteration,
-                    current_regime,
                     regime_confidence,
-                    HMM_MIN_CONFIDENCE,
                 )
-                self.stop_event.wait(HFT_INTERVAL)
-                continue
 
             # --- trend-pause gate (mirrors backtest/signals.py + pnl.py) ---
             # When the macro frame shows a sustained directional streak the
@@ -459,15 +512,15 @@ class AnalysisEngine:
             if trend_paused:
                 self._trend_pause_skips += 1
                 logging.info(
-                    "HFT #%d — skipped: trend_pause active "
-                    "(consecutive=%d, cooldown=%d, skips so far: %d)",
+                    "HFT #%d — trend_pause active (consecutive=%d, cooldown=%d, skips so far: %d)",
                     iteration,
                     TREND_CONSECUTIVE_BARS,
                     TREND_COOLDOWN_BARS,
                     self._trend_pause_skips,
                 )
-                self.stop_event.wait(HFT_INTERVAL)
-                continue
+                if not self._position_open:
+                    self.stop_event.wait(HFT_INTERVAL)
+                    continue
 
             # After the first historical_analysis iteration (~1 min), _bid_vwap
             # and _ask_vwap are populated.  They act as a threshold-gated
@@ -689,7 +742,7 @@ class AnalysisEngine:
             # Fires once per UTC day.  Uses the refresher closure injected by
             # websocket_main.py so this thread never touches Binance REST
             # directly (keeps AnalysisEngine decoupled from the REST client).
-            # On failure we keep the previous value silently — the refresher
+            # On failure, we keep the previous value silently — the refresher
             # already logged the error.
             if self._refresh_stop_loss_fn is not None:
                 today_utc = int(time.time()) // 86400
@@ -816,3 +869,7 @@ class AnalysisEngine:
             iteration,
             hmm_iteration,
         )
+
+    @property
+    def n_stop_loss_fires(self):
+        return self._n_stop_loss_fires

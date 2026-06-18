@@ -29,6 +29,7 @@ FILES
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
+    session_chart.py                  — End-of-session P&L chart (Plotly HTML): Strategy vs B&H equity index + BUY/SELL markers + USDT/BTC component panel; written to backtest/reporting/session_pnl_<ts>.html by websocket_main.py
 
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
     data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
@@ -231,8 +232,11 @@ FILES
 
   **Key methods:**
   - `execute()`: validates strategy, caps quantity, dispatches the order.
-    Dynamic cap: BUY = `min(aq, usdt / (price × (1 + fee)))` to reserve the
-    taker fee; SELL = `min(bq, btc)`.
+    Dynamic cap: BUY = `min(aq, usdt × MAX_POSITION_PCT / (price × (1 + fee)))`
+    — at most `MAX_POSITION_PCT` (default 10 %) of available USDT per signal,
+    with the taker fee reserved.  SELL = `min(bq, btc)`.  `MAX_POSITION_PCT`
+    is the same constant used by `backtest/pnl.py`, keeping live and backtest
+    BUY sizing aligned.
   - `cancel_stale_buy(timeout_sec=10.0)`: cancels the outstanding GTC BUY via
     REST if it has been open ≥ 10 s.  Returns True (reset `_position_open`) on
     success; False if cancel fails (order likely filled — keep guard armed).

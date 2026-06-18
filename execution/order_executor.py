@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 from binance.lib.utils import websocket_api_signature, get_uuid
 from core.order_book_state import OrderBookState
@@ -11,6 +12,7 @@ from config_parameters import (
     RECV_WINDOW,
     ORDER_REPORT_LIMIT,
     BACKTEST_FEE_RATE,
+    MAX_POSITION_PCT,
 )
 
 
@@ -89,6 +91,14 @@ class OrderExecutor:
         # _pending_buy_id: Binance orderId (REST: set synchronously; WS: async via handle_order_response).
         self._pending_buy_placed_at: float | None = None
         self._pending_buy_id: int | None = None
+
+        # Dispatch timestamp of the most recent in-flight WS order.
+        # Set in execute() at WS dispatch; consumed by handle_order_response
+        # when the matching order placement response arrives and the entry is
+        # appended to placed_orders with a "placed_at" datetime.  The strategy
+        # enforces single-position, so at most one order is in flight at any
+        # time — a single variable is sufficient (no FIFO queue needed).
+        self._last_dispatch_at: datetime | None = None
 
         # Tracks the in-flight session.logon and userDataStream.subscribe requests
         # so handle_order_response can route their responses correctly.
@@ -416,6 +426,11 @@ class OrderExecutor:
         # the orderId only arrives here asynchronously.
         if result.get("side") == "BUY":
             self._pending_buy_id = result.get("orderId")
+        # Pull the dispatch-time stamp from execute() (set just before the WS
+        # send).  Falls back to "now" if missing (e.g. a response arrives for
+        # which no dispatch was tracked — should not happen in practice).
+        _placed_at = self._last_dispatch_at or datetime.now(timezone.utc)
+        self._last_dispatch_at = None  # consumed
         self.placed_orders.append(
             {
                 "orderId": result.get("orderId"),
@@ -423,6 +438,7 @@ class OrderExecutor:
                 "price": result.get("price"),
                 "origQty": result.get("origQty"),
                 "status": result.get("status"),
+                "placed_at": _placed_at,
             }
         )
         logging.info(
@@ -480,34 +496,44 @@ class OrderExecutor:
         # Dynamically cap the quantity to what the available balance can afford,
         # so the algo still trades at a reduced size rather than skipping entirely.
         if strategy == "BUY":
+            # Position cap — MAX_POSITION_PCT × available USDT is the per-signal
+            # budget shared with backtest/pnl.py.  Prevents all-in BUY orders
+            # (e.g. 313k USDT in one trade) and keeps live order sizing aligned
+            # with the simulated sizing the strategy was tuned against.
+            usdt_budget = usdt * MAX_POSITION_PCT
             # Divide by price × (1 + fee_rate) so the total debit
-            # (notional + taker fee) never exceeds the available USDT balance.
-            # Without the fee factor Binance rejects the order with
-            # "insufficient balance" because the fee is charged on top of the
-            # notional and pushes the total spend over the account balance.
+            # (notional + taker fee) never exceeds the budget.  Without the fee
+            # factor Binance rejects the order with "insufficient balance"
+            # because the fee is charged on top of the notional.
             max_affordable = (
-                usdt / (micro_price * (1.0 + BACKTEST_FEE_RATE))
+                usdt_budget / (micro_price * (1.0 + BACKTEST_FEE_RATE))
                 if micro_price > 0
                 else 0.0
             )
             quantity = min(aq, max_affordable)
             if quantity <= 0:
                 logging.warning(
-                    "LIMIT BUY skipped: available %s balance (%.2f) is too low "
-                    "to buy at price %.2f.",
+                    "LIMIT BUY skipped: per-signal budget (%.2f %s = %.0f%% of "
+                    "%.2f %s) too low to buy at price %.2f.",
+                    usdt_budget,
                     CCY,
+                    MAX_POSITION_PCT * 100,
                     usdt,
+                    CCY,
                     micro_price,
                 )
                 return
             if quantity < aq:
                 logging.info(
                     "LIMIT BUY quantity capped: requested %.6f %s → affordable %.6f %s "
-                    "(balance %.2f %s at price %.2f).",
+                    "(budget %.2f %s = %.0f%% of %.2f %s at price %.2f).",
                     aq,
                     CRYPTOCCY,
                     quantity,
                     CRYPTOCCY,
+                    usdt_budget,
+                    CCY,
+                    MAX_POSITION_PCT * 100,
                     usdt,
                     CCY,
                     micro_price,
@@ -554,6 +580,9 @@ class OrderExecutor:
             # Preferred path — lower latency, async response via handle_order_response
             if strategy == "BUY":
                 self._pending_buy_placed_at = time.time()
+            # Stamp dispatch wall-clock time so handle_order_response can
+            # attach it to the resulting placed_orders entry.
+            self._last_dispatch_at = datetime.now(timezone.utc)
             self.ws_api_client.new_order(
                 symbol=SYMBOL,
                 side=strategy,
@@ -565,6 +594,7 @@ class OrderExecutor:
             )
         elif self.rest_client is not None:
             # Fallback path — synchronous REST call (used when WS API is unavailable)
+            _placed_at = datetime.now(timezone.utc)
             if strategy == "BUY":
                 self._pending_buy_placed_at = time.time()
             try:
@@ -587,6 +617,7 @@ class OrderExecutor:
                         "price": response.get("price"),
                         "origQty": response.get("origQty"),
                         "status": response.get("status"),
+                        "placed_at": _placed_at,
                     }
                 )
                 logging.info(

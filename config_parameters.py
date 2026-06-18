@@ -228,10 +228,14 @@ BACKTEST_RISK_FREE_RATE = 0.00  # annualised (0.0 = no risk-free rate adjustment
 BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
 
 # Maximum fraction of available USDT deployed per BUY trade.
-# Prevents all-in behaviour where fee + spread costs compound on 100 % of
-# the balance every round trip.  0.10 → at most 10 % risked per signal.
-# Set to 1.0 to revert to full all-in behaviour.
-BACKTEST_MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal
+# Applies to BOTH the live system (execution/order_executor.py) and the
+# backtest (backtest/pnl.py) so the simulated and live order sizes stay
+# aligned.  Prevents all-in behaviour where fee + spread costs compound on
+# 100 % of the balance every round trip.  0.10 → at most 10 % risked per
+# signal.  Set to 1.0 to revert to full all-in behaviour.
+#
+# Risk-management parameter — DO NOT add to the Optuna search space.
+MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal (live + backtest)
 
 # -- Trend-pause filter (macro frame, backtest/signals.py) ----------------
 # Pauses all new BUY/SELL entries when the macro frame shows N consecutive

@@ -275,7 +275,7 @@ if open_strategy_qty > _POSITION_DUST_BTC
 
 - BUY quantity = `aq` from best-buy candidate, capped at `min(aq, usdt / (price × (1 + fee_rate)))` for BUY to reserve taker fee.
 - SELL quantity = `bq` from best-sell candidate, capped at `min(bq, btc_balance)`.
-- `usdt_budget = usdt × BACKTEST_MAX_POSITION_PCT` (10 %) limits each BUY to ~10 % of available USDT.
+- `usdt_budget = usdt × MAX_POSITION_PCT` (10 %) limits each BUY to ~10 % of available USDT.  Same constant is applied live in `execution/order_executor.py` so live and backtest size BUYs identically.
 - Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`).
 - Fill prices: `close ± half_spread` where `half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000` (default 5 bps, ~$20 at $80k BTC).
 

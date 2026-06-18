@@ -298,6 +298,7 @@ engine = AnalysisEngine(
     regime_director=regime_director,
     stop_loss_state=stop_loss_state,
     refresh_stop_loss_fn=refresh_stop_loss_pct,
+    initial_avg_entry_price=btc_start_price or 0.0,
 )
 
 low_latency_thread = threading.Thread(
@@ -355,7 +356,7 @@ finally:
     logging.info(
         "Adaptive stop-loss summary: %d emergency exit(s) this session "
         "(final threshold: %.4f%%).",
-        engine._n_stop_loss_fires,
+        engine.n_stop_loss_fires,
         stop_loss_state.get("pct", 0.0) * 100,
     )
 
@@ -363,6 +364,34 @@ finally:
     # End-of-session order report
     # -----------------------------------------------------------------------
     executor.order_status_report()
+
+    # -----------------------------------------------------------------------
+    # End-of-session P&L chart (writes HTML to backtest/reporting/)
+    # -----------------------------------------------------------------------
+    # Skipped silently if fewer than 2 equity snapshots were captured (very
+    # short or interrupted session) or if start_total_usdt could not be
+    # computed at session start (REST ticker_price failure).
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        from visualization.session_chart import generate_session_pnl_chart
+        from config_parameters import BACKTEST_REPORTING_DIR
+
+        _chart_path = os.path.join(
+            BACKTEST_REPORTING_DIR,
+            f"session_pnl_{_dt.now(_tz.utc).strftime('%Y%m%d_%H%M%S')}.html",
+        )
+        generate_session_pnl_chart(
+            snapshots=engine._equity_snapshots,
+            orders=executor.placed_orders,
+            start_total_usdt=start_total_usdt or 0.0,
+            btc_start_price=btc_start_price or 0.0,
+            out_path=_chart_path,
+        )
+    except Exception as _chart_exc:
+        logging.warning(
+            "Session P&L chart generation failed (%s) — non-fatal.",
+            _chart_exc,
+        )
 
     # -----------------------------------------------------------------------
     # End-of-session balance report
@@ -424,9 +453,8 @@ finally:
                 "    A  Trading alpha : %+.2f  (Δusdt + Δbtc × end_price)\n"
                 "       Strategy bought/sold BTC; this is the net result\n"
                 "       marked at the END price — isolated from market moves.\n"
-                "    B  Price move    : %+.2f  (starting BTC × price change)\n"
-                "       Your %.8f BTC start position gained/lost value\n"
-                "       purely because BTC moved %+.2f.\n"
+                "    B  Price P&L     : %+.2f  (%.8f BTC × %+.2f BTC/USDT)\n"
+                "       Starting BTC holding × price change this session.\n"
                 "    ─────────────────────────────────────────────────────\n"
                 "    A + B  Total P&L : %+.2f  (%+.3f %%)\n"
                 "====================================================",
@@ -446,7 +474,7 @@ finally:
                 trading_pnl,
                 price_pnl,
                 btc_balance,
-                btc_end_price - btc_start_price,
+                btc_end_price - btc_start_price,  # price change (BTC/USDT)
                 total_pnl,
                 pct_return,
             )
