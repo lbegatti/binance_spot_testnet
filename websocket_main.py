@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from binance.spot import Spot as Client
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from dotenv import load_dotenv
@@ -28,9 +29,24 @@ from config_parameters import (
     STOP_LOSS_STD_MULT,
 )
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True
+# Log to BOTH the console and a timestamped file so a full multi-hour run is
+# preserved on disk — terminal scrollback rolls over and silently loses early
+# lines (e.g. the order-placement logs from the start of a long session).
+_log_dir = "logs"
+os.makedirs(_log_dir, exist_ok=True)
+_log_path = os.path.join(
+    _log_dir, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_path, encoding="utf-8"),
+    ],
+)
+logging.info("Session log file: %s", _log_path)
 
 # Apply best_params.json overrides to strategy.regime_director BEFORE
 # RegimeDirector() is instantiated (see strategy/param_loader.py).
@@ -135,6 +151,56 @@ else:
             for item in account_info["balances"]
             if float(item["free"]) > 0 or float(item["locked"]) > 0
         }
+
+# ---------------------------------------------------------------------------
+# 2a. Flatten any inherited BTC so the session starts flat (matches backtest)
+# ---------------------------------------------------------------------------
+# The backtest assumes BACKTEST_INITIAL_BTC = 0 — it always starts with no open
+# position.  A live testnet account, however, often carries BTC left over from
+# previous sessions (e.g. BUYs that filled but whose SELLs never did).  If we
+# don't clear it, AnalysisEngine pre-arms the position guard on that inherited
+# BTC: the bot can then ONLY exit via a mean-reversion rally or the stop-loss
+# and can NEVER buy, so in a flat market it places zero orders all session.
+# A one-time MARKET sell here drops the account to a flat, USDT-only state
+# identical to the backtest's starting assumption (and to the alt-coin
+# consolidation above, which intentionally skips CRYPTOCCY).
+inherited_btc = balances.get(CRYPTOCCY, {}).get("free", 0.0)
+# Floor to the BTCUSDT LOT_SIZE grid (stepSize 1e-5 → 5 decimals) so the MARKET
+# sell quantity is an exact multiple and not rejected with -1013.
+inherited_btc = int(inherited_btc * 1e5) / 1e5
+if inherited_btc >= 1e-5:
+    logging.warning(
+        "Flattening %s %s of inherited BTC at startup via MARKET sell so the "
+        "session begins flat (matches BACKTEST_INITIAL_BTC = 0).",
+        inherited_btc,
+        CRYPTOCCY,
+    )
+    try:
+        # noinspection PyArgumentList
+        rest_client.new_order(
+            symbol=SYMBOL,
+            side="SELL",
+            type="MARKET",
+            quantity=inherited_btc,
+            recvWindow=RECV_WINDOW,
+        )
+        logging.info("Inherited BTC flattened — re-fetching balances.")
+        # noinspection PyArgumentList
+        account_info = rest_client.account(recvWindow=RECV_WINDOW)
+        balances = {
+            item["asset"]: {
+                "free": float(item["free"]),
+                "locked": float(item["locked"]),
+            }
+            for item in account_info["balances"]
+            if float(item["free"]) > 0 or float(item["locked"]) > 0
+        }
+    except Exception as e:
+        logging.error(
+            "Could not flatten inherited BTC (%s) — the position guard will "
+            "pre-arm on it and the bot may not BUY this session.",
+            e,
+        )
 
 # Check that we have USDT (or the quote asset) available for trading
 usdt_balance = balances.get(CCY, {}).get("free", 0.0)
@@ -434,6 +500,12 @@ finally:
             price_pnl = btc_balance * (btc_end_price - btc_start_price)
             total_pnl = end_total_usdt - start_total_usdt
             pct_return = total_pnl / start_total_usdt * 100 if start_total_usdt else 0.0
+            # Buy & Hold benchmark — identical to the chart's bnh_index: what the
+            # whole starting equity would have returned if held as BTC for the
+            # entire session.  Reference only (NOT part of the strategy's P&L);
+            # a positive "vs B&H" means the strategy beat simply holding BTC.
+            bnh_return_pct = (btc_end_price / btc_start_price - 1.0) * 100
+            strategy_vs_bnh = pct_return - bnh_return_pct
             # Sanity-check: trading_pnl + price_pnl == total_pnl (algebraic identity).
             # Any residual is floating-point rounding noise — shown for transparency.
             residual = total_pnl - (trading_pnl + price_pnl)
@@ -457,6 +529,10 @@ finally:
                 "       Starting BTC holding × price change this session.\n"
                 "    ─────────────────────────────────────────────────────\n"
                 "    A + B  Total P&L : %+.2f  (%+.3f %%)\n"
+                "\n"
+                "  Benchmark  [reference only — not part of P&L; matches chart]\n"
+                "    Buy & Hold return : %+.3f %%  (all start equity held as BTC)\n"
+                "    Strategy vs B&H   : %+.3f %%  (positive = beat holding BTC)\n"
                 "====================================================",
                 CCY,
                 usdt_balance,
@@ -477,6 +553,8 @@ finally:
                 btc_end_price - btc_start_price,  # price change (BTC/USDT)
                 total_pnl,
                 pct_return,
+                bnh_return_pct,
+                strategy_vs_bnh,
             )
             if abs(residual) > 0.01:
                 logging.warning(

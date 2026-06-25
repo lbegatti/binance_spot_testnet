@@ -37,7 +37,14 @@ class OrderBookState:
             up to date by ``OrderExecutor._handle_balance_update`` via
             ``outboundAccountPosition`` push events on the WebSocket API
             connection (``session.logon`` → ``userDataStream.subscribe``).
-            Only the *free* (non-locked) quantity is stored.
+            Holds the *free* (non-locked) quantity only; the locked quantity is
+            kept separately in ``balance_locked`` (below).
+        balance_locked (dict): Live *locked* balances keyed by ``CRYPTOCCY`` and
+            ``CCY`` (quantity tied up in resting LIMIT orders).  Maintained
+            alongside ``balance_status`` by the same two update paths.  Read
+            ONLY by the end-of-session equity snapshot so a position locked in a
+            resting order (e.g. BTC in a LIMIT SELL) still counts toward equity;
+            trading logic never reads it.
         thread_lock (threading.Lock): Mutex that serializes access to
             ``local_book`` and ``history_order_book``.  ``MessageHandler``
             acquires it to write; ``AnalysisEngine`` acquires it to take a
@@ -67,7 +74,15 @@ class OrderBookState:
         self.balance_status = {
             CRYPTOCCY: 0.0,
             CCY: 0.0,
-        }  # seeded by websocket_main.py before threads start
+        }  # FREE balances — seeded by websocket_main.py before threads start
+        # LOCKED balances (BTC/USDT tied up in resting LIMIT orders).  Tracked
+        # in parallel ONLY so the end-of-session equity snapshot can mark the
+        # full position (free + locked) to market.  Trading still reads
+        # balance_status (free) — you can only spend what is free.
+        self.balance_locked = {
+            CRYPTOCCY: 0.0,
+            CCY: 0.0,
+        }
         self.history_order_book = deque(
             maxlen=maxlen
         )  # Store recent order book snapshots

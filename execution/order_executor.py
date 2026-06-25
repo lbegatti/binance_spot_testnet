@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
@@ -25,6 +26,15 @@ class OrderExecutor:
     (``wss://testnet.binance.vision/ws-api/v3``) for lower latency and
     falls back transparently to the REST API when the WebSocket endpoint is
     unavailable.  No logic change is required in the caller.
+
+    **Exchange-filter normalisation** — at construction time the executor
+    calls ``exchange_info()`` once to cache the symbol's ``LOT_SIZE``
+    (``stepSize``, ``minQty``) and ``(MIN_)NOTIONAL`` (``minNotional``)
+    filters.  Every order's quantity is then floored down to the
+    ``stepSize`` grid and rejected before dispatch if it is below
+    ``minQty`` or if the notional is below ``minNotional`` —
+    preventing the silent ``-1013 "Filter failure: LOT_SIZE"``
+    rejection that otherwise drops every order at the Binance gateway.
 
     **Balance tracking** — on connection open the executor authenticates the
     WebSocket session with ``session.logon`` (HMAC-signed timestamp) and then
@@ -91,6 +101,11 @@ class OrderExecutor:
         # _pending_buy_id: Binance orderId (REST: set synchronously; WS: async via handle_order_response).
         self._pending_buy_placed_at: float | None = None
         self._pending_buy_id: int | None = None
+        # Pending non-urgent LIMIT GTC SELL tracking — mirrors the BUY pair.
+        # A planned exit rests on the book (maker) and may not fill at once;
+        # cancel_stale_sell() resolves it after the timeout.
+        self._pending_sell_placed_at: float | None = None
+        self._pending_sell_id: int | None = None
 
         # Dispatch timestamp of the most recent in-flight WS order.
         # Set in execute() at WS dispatch; consumed by handle_order_response
@@ -122,6 +137,72 @@ class OrderExecutor:
                 "Balance updates will use REST snapshot only.",
                 type(e).__name__,
                 e,
+            )
+
+        # Exchange filter cache — populated from Binance exchange_info() so
+        # execute() can floor the requested quantity to the LOT_SIZE stepSize
+        # and reject orders below minNotional, preventing the Binance
+        # -1013 "Filter failure: LOT_SIZE" rejection that previously caused
+        # every order to be silently dropped at the gateway.
+        #
+        # Defaults are BTCUSDT-correct so the executor stays operational
+        # if exchange_info() fails or rest_client is None.
+        self._step_size: float = 1e-5
+        self._min_qty: float = 1e-5
+        self._min_notional: float = 10.0
+        self._qty_decimals: int = 5
+        self._load_symbol_filters()
+
+    def _load_symbol_filters(self) -> None:
+        """
+        Fetch the LOT_SIZE and (MIN_)NOTIONAL filters for SYMBOL once at
+        session start and cache them on the executor.
+
+        Used by :meth:`execute` to:
+
+        1. Floor the requested quantity to an exact multiple of the
+           exchange's ``stepSize`` (Binance rejects any quantity that is
+           not a multiple of ``stepSize`` with error code -1013
+           ``"Filter failure: LOT_SIZE"``).
+        2. Reject orders whose notional (``quantity × price``) is below
+           the exchange minimum (``MIN_NOTIONAL`` / ``NOTIONAL``) before
+           dispatch, so we do not waste a round trip.
+
+        No-ops when ``rest_client`` is ``None``; falls back to the
+        BTCUSDT defaults set in ``__init__`` if the REST call fails so
+        the executor stays operational.
+        """
+        if self.rest_client is None:
+            return
+        try:
+            info = self.rest_client.exchange_info(symbol=SYMBOL)
+            filters = {f["filterType"]: f for f in info["symbols"][0]["filters"]}
+            lot = filters["LOT_SIZE"]
+            self._min_qty = float(lot["minQty"])
+            self._step_size = float(lot["stepSize"])
+            # Binance Spot renamed MIN_NOTIONAL → NOTIONAL on some symbols;
+            # accept either, default to 10.0 USDT if neither is present.
+            notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+            self._min_notional = float(notional.get("minNotional", 10.0))
+            # stepSize like "0.00001000" → 5 decimals for the qty format str.
+            self._qty_decimals = max(0, int(round(-math.log10(self._step_size))))
+            logging.info(
+                "Loaded %s filters: minQty=%s, stepSize=%s, minNotional=%s, qtyDecimals=%d",
+                SYMBOL,
+                self._min_qty,
+                self._step_size,
+                self._min_notional,
+                self._qty_decimals,
+            )
+        except Exception as e:
+            logging.warning(
+                "Failed to load %s filters (%s) — using defaults "
+                "(minQty=%s, stepSize=%s, minNotional=%s).",
+                SYMBOL,
+                e,
+                self._min_qty,
+                self._step_size,
+                self._min_notional,
             )
 
     # ------------------------------------------------------------------
@@ -214,7 +295,9 @@ class OrderExecutor:
 
         Under ``state.thread_balance_lock`` the ``"f"`` (free) field for each
         tracked asset (``CRYPTOCCY``, ``CCY``) is written to
-        ``state.balance_status``.  Locked quantities are intentionally ignored.
+        ``state.balance_status``.  The ``"l"`` (locked) field is also recorded
+        in ``state.balance_locked`` for the equity snapshot; trading reads free
+        only.
 
         Args:
             data (dict): Parsed JSON push event from the Binance WebSocket API.
@@ -224,6 +307,8 @@ class OrderExecutor:
                 asset = asset_data.get("a")
                 if asset in self.state.balance_status:
                     self.state.balance_status[asset] = float(asset_data["f"])
+                    # "l" = locked; recorded only for the equity snapshot.
+                    self.state.balance_locked[asset] = float(asset_data["l"])
             logging.info(
                 "Balance update (WS push) — %s: %.8f | %s: %.2f",
                 CRYPTOCCY,
@@ -253,6 +338,7 @@ class OrderExecutor:
                     asset = item.get("asset")
                     if asset in self.state.balance_status:
                         self.state.balance_status[asset] = float(item["free"])
+                        self.state.balance_locked[asset] = float(item["locked"])
             logging.info(
                 "Balance refreshed — %s: %.8f | %s: %.2f",
                 CRYPTOCCY,
@@ -327,6 +413,76 @@ class OrderExecutor:
             )
             self._pending_buy_placed_at = None  # don't retry on every tick
             return False
+
+    def has_pending_sell(self) -> bool:
+        """True while a non-urgent LIMIT GTC SELL is resting and unresolved."""
+        return self._pending_sell_placed_at is not None
+
+    def cancel_stale_sell(self, timeout_sec: float = 10.0) -> str | None:
+        """
+        Resolve the outstanding LIMIT GTC SELL once it has been open longer than
+        ``timeout_sec`` seconds (mirror of :meth:`cancel_stale_buy`).
+
+        * Cancel succeeds → order was still open, now gone; position still held.
+          Returns ``"still_long"`` — caller keeps the guard armed and retries
+          the exit on the next SELL signal.
+        * Cancel fails (Binance -2011 "Unknown order") → order already FILLED;
+          position is closed.  Returns ``"closed"`` — caller resets to flat.
+
+        Returns ``None`` when there is no pending SELL or the timeout has not
+        elapsed.  ``timeout_sec=0.0`` forces immediate resolution (used by the
+        stop-loss to free locked BTC before its MARKET close).
+        """
+        if self._pending_sell_placed_at is None:
+            return None
+        elapsed = time.time() - self._pending_sell_placed_at
+        if elapsed < timeout_sec:
+            return None
+
+        if self._pending_sell_id is None:
+            # Dispatched but no orderId yet (WS response in flight). Cannot
+            # cancel; assume still long and clear the timer to re-evaluate.
+            logging.warning(
+                "SELL order timed out (%.1fs) with no orderId — keeping position.",
+                elapsed,
+            )
+            self._pending_sell_placed_at = None
+            return "still_long"
+
+        if self.rest_client is None:
+            logging.warning(
+                "Cannot cancel stale SELL order %s: no REST client available.",
+                self._pending_sell_id,
+            )
+            self._pending_sell_placed_at = None
+            self._pending_sell_id = None
+            return "still_long"
+
+        try:
+            self.rest_client.cancel_order(
+                symbol=SYMBOL, orderId=self._pending_sell_id, recvWindow=RECV_WINDOW
+            )
+            logging.info(
+                "Stale SELL order %s cancelled after %.1fs — position still open, "
+                "will retry exit on next signal.",
+                self._pending_sell_id,
+                elapsed,
+            )
+            self._refresh_balance_rest()
+            self._pending_sell_id = None
+            self._pending_sell_placed_at = None
+            return "still_long"
+        except Exception as e:
+            logging.info(
+                "Cancel of SELL order %s failed (%s) — order likely FILLED; "
+                "treating position as closed.",
+                self._pending_sell_id,
+                e,
+            )
+            self._refresh_balance_rest()
+            self._pending_sell_id = None
+            self._pending_sell_placed_at = None
+            return "closed"
 
     # ------------------------------------------------------------------
     # Callback — invoked by the WebSocket API client on every message
@@ -426,6 +582,14 @@ class OrderExecutor:
         # the orderId only arrives here asynchronously.
         if result.get("side") == "BUY":
             self._pending_buy_id = result.get("orderId")
+        # A resting LIMIT SELL: capture its id so cancel_stale_sell() can target
+        # it. A MARKET SELL returns FILLED (no resting order), so only record
+        # while the order is still working.
+        elif result.get("side") == "SELL" and result.get("status") in (
+            "NEW",
+            "PARTIALLY_FILLED",
+        ):
+            self._pending_sell_id = result.get("orderId")
         # Pull the dispatch-time stamp from execute() (set just before the WS
         # send).  Falls back to "now" if missing (e.g. a response arrives for
         # which no dispatch was tracked — should not happen in practice).
@@ -449,10 +613,10 @@ class OrderExecutor:
             result.get("status"),
         )
 
-    def execute(self, strategy: str, opportunity: tuple) -> None:
+    def execute(self, strategy: str, opportunity: tuple, urgent: bool = False) -> None:
         """
-        Send a LIMIT GTC (BUY) or LIMIT IOC (SELL) order via the WebSocket API
-        (preferred) or the REST API (fallback).
+        Send an order via the WebSocket API (preferred) or REST (fallback):
+        a LIMIT GTC BUY, or a SELL that is MARKET when ``urgent`` else LIMIT GTC.
 
         **Order type per side:**
 
@@ -461,9 +625,14 @@ class OrderExecutor:
           ``_pending_buy_placed_at`` is set on dispatch; ``_pending_buy_id`` is
           set synchronously (REST) or asynchronously via ``handle_order_response``
           (WS) so the cancel mechanism can target the correct order.
-        * SELL: LIMIT IOC — fills at the best available bid immediately or
-          cancels; never locks BTC beyond a single matching cycle, eliminating
-          the -2010 "insufficient balance" failure caused by stale locked BTC.
+        * SELL: order type depends on ``urgent``:
+          - ``urgent=True`` → MARKET — the stop-loss exit, which must close the
+            position immediately. Fills against Binance's real server-side book,
+            so it is immune to ``local_book`` staleness and never expires.
+          - ``urgent=False`` (default) → LIMIT GTC at ``micro_price``, symmetric
+            to the BUY: the planned mean-reversion exit rests on the book as a
+            maker order and is resolved by ``cancel_stale_sell`` (10 s timeout)
+            — filled, or cancelled-and-retried.
 
         **Dynamic quantity cap** — caps the requested quantity to the available
         balance rather than skipping the order entirely:
@@ -475,11 +644,22 @@ class OrderExecutor:
         (``quantity × micro_price × (1 + fee_rate)``) never exceeds the
         available USDT balance.
 
+        **Exchange-filter floor** — after the dynamic cap the quantity is
+        floored DOWN to the cached ``LOT_SIZE`` ``stepSize`` so the value
+        sent to Binance is always an exact multiple of the symbol's
+        precision grid (prevents -1013 ``"Filter failure: LOT_SIZE"``).
+        The order is skipped before dispatch when the floored quantity
+        is below ``minQty`` or when ``quantity × micro_price`` is below
+        ``minNotional``.
+
         Args:
             strategy (str): ``"BUY"`` or ``"SELL"``.
             opportunity (tuple): 8-element tuple
                 ``(level_idx, score, delta, total_depth, obi, micro_price, bq, aq)``
                 returned by ``AnalysisEngine._select_best_opportunity()``.
+            urgent (bool): When ``True`` and ``strategy == "SELL"``, send a
+                MARKET order (immediate close, e.g. stop-loss); otherwise the
+                SELL rests as a LIMIT GTC.  Ignored for BUY.
         """
         if strategy not in ("BUY", "SELL"):
             logging.error("Invalid strategy '%s'. Must be 'BUY' or 'SELL'.", strategy)
@@ -563,53 +743,152 @@ class OrderExecutor:
             self._pending_buy_placed_at = None
             self._pending_buy_id = None
 
-        # BUY → GTC (dip-buy needs time on the book).
-        # SELL → IOC (fill at best bid immediately or cancel; never locks BTC).
-        time_in_force = "GTC" if strategy == "BUY" else "IOC"
+        # ── SELL order type & book-health diagnostic ───────────────────
+        # A SELL closes the position and MUST fill, so it is sent as a MARKET
+        # order in the dispatch section below.  A marketable LIMIT/IOC priced
+        # from local_book can expire unfilled when local_book has gone stale:
+        # core/message_handler.py has no depth-diff gap recovery, so a single
+        # missed "remove level" message leaves a phantom top-of-book bid that
+        # max(bids) keeps returning.  A MARKET order fills against Binance's
+        # real server-side book and is immune to that.
+        # We log book health here so the staleness can be confirmed/fixed at
+        # the source: a CROSSED book (best_bid >= best_ask) is direct proof
+        # local_book is stale.  BUY is unaffected (LIMIT GTC at micro_price).
+        if strategy == "SELL":
+            with self.state.thread_lock:
+                _bids = self.state.local_book.get("bids", {})
+                _asks = self.state.local_book.get("asks", {})
+                _best_bid = max((float(p) for p in _bids), default=0.0)
+                _best_ask = min((float(p) for p in _asks), default=0.0)
+                _book_id = self.state.local_book.get("lastUpdateId", 0)
+            if _best_ask > 0.0 and _best_bid >= _best_ask:
+                logging.warning(
+                    "Book-health: CROSSED/STALE local_book at SELL — "
+                    "best_bid=%.2f >= best_ask=%.2f (lastUpdateId=%s).",
+                    _best_bid,
+                    _best_ask,
+                    _book_id,
+                )
+            else:
+                logging.info(
+                    "Book-health at SELL — best_bid=%.2f best_ask=%.2f lastUpdateId=%s",
+                    _best_bid,
+                    _best_ask,
+                    _book_id,
+                )
 
-        logging.info(
-            "Sending LIMIT %s (%s): level=%d price=%.2f qty=%.6f",
-            strategy,
-            time_in_force,
-            level_idx,
-            micro_price,
-            quantity,
-        )
+        # ── Exchange-filter normalisation ──────────────────────────────
+        # Floor quantity DOWN to the LOT_SIZE stepSize so Binance does not
+        # reject the order with -1013 "Filter failure: LOT_SIZE".  Round
+        # DOWN (math.floor) — never UP — so the resulting quantity can
+        # never exceed the budget computed above.
+        quantity = math.floor(quantity / self._step_size) * self._step_size
+        # round() cleans up the float-precision noise that math.floor
+        # introduces (e.g. 0.00478 stored as 0.0047799999…).
+        quantity = round(quantity, self._qty_decimals)
+        if quantity < self._min_qty:
+            logging.warning(
+                "LIMIT %s skipped: qty %.8f < minQty %.8f after step-size floor.",
+                strategy,
+                quantity,
+                self._min_qty,
+            )
+            return
+        if quantity * micro_price < self._min_notional:
+            logging.warning(
+                "LIMIT %s skipped: notional %.2f < minNotional %.2f "
+                "(qty=%.8f, price=%.2f).",
+                strategy,
+                quantity * micro_price,
+                self._min_notional,
+                quantity,
+                micro_price,
+            )
+            return
+
+        # Pre-formatted qty string — used by both WS and REST dispatch
+        # paths below so the decimal width always matches stepSize
+        # (sending more decimals than stepSize allows is a -1013).
+        qty_str = f"{quantity:.{self._qty_decimals}f}"
+
+        # Order type per side:
+        #   BUY  → LIMIT GTC  (dip-buy rests on the book until filled/cancelled).
+        #   SELL → MARKET     (closes the position against Binance's real
+        #          server-side book; immune to local_book staleness that makes
+        #          a marketable LIMIT/IOC expire — see book-health note above).
+        if strategy == "BUY":
+            order_kwargs = {
+                "symbol": SYMBOL,
+                "side": "BUY",
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": qty_str,
+                "price": f"{micro_price:.2f}",
+                "recvWindow": RECV_WINDOW,
+            }
+            order_desc = f"LIMIT BUY (GTC) price={micro_price:.2f}"
+        else:  # SELL
+            if urgent:
+                # Immediate close (stop-loss): MARKET against the real book.
+                order_kwargs = {
+                    "symbol": SYMBOL,
+                    "side": "SELL",
+                    "type": "MARKET",
+                    "quantity": qty_str,
+                    "recvWindow": RECV_WINDOW,
+                }
+                order_desc = "MARKET SELL (urgent)"
+            else:
+                # Planned exit: resting LIMIT GTC at micro_price, like the BUY.
+                order_kwargs = {
+                    "symbol": SYMBOL,
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": qty_str,
+                    "price": f"{micro_price:.2f}",
+                    "recvWindow": RECV_WINDOW,
+                }
+                order_desc = f"LIMIT SELL (GTC) price={micro_price:.2f}"
+
+        logging.info("Sending %s: level=%d qty=%s", order_desc, level_idx, qty_str)
 
         if self.ws_api_client is not None:
             # Preferred path — lower latency, async response via handle_order_response
             if strategy == "BUY":
                 self._pending_buy_placed_at = time.time()
+            elif not urgent:
+                # Resting LIMIT SELL — arm the stale-resolve timer (orderId
+                # captured asynchronously in handle_order_response).
+                self._pending_sell_placed_at = time.time()
+            else:
+                # Urgent MARKET SELL force-closes — clear any resting-exit timer.
+                self._pending_sell_placed_at = None
+                self._pending_sell_id = None
             # Stamp dispatch wall-clock time so handle_order_response can
             # attach it to the resulting placed_orders entry.
             self._last_dispatch_at = datetime.now(timezone.utc)
-            self.ws_api_client.new_order(
-                symbol=SYMBOL,
-                side=strategy,
-                type="LIMIT",
-                timeInForce=time_in_force,
-                quantity=f"{quantity:.6f}",
-                price=f"{micro_price:.2f}",
-                recvWindow=RECV_WINDOW,
-            )
+            self.ws_api_client.new_order(**order_kwargs)
         elif self.rest_client is not None:
             # Fallback path — synchronous REST call (used when WS API is unavailable)
             _placed_at = datetime.now(timezone.utc)
             if strategy == "BUY":
                 self._pending_buy_placed_at = time.time()
+            elif not urgent:
+                self._pending_sell_placed_at = time.time()
+            else:
+                self._pending_sell_placed_at = None
+                self._pending_sell_id = None
             try:
-                response = self.rest_client.new_order(
-                    symbol=SYMBOL,
-                    side=strategy,
-                    type="LIMIT",
-                    timeInForce=time_in_force,
-                    quantity=f"{quantity:.6f}",
-                    price=f"{micro_price:.2f}",
-                    recvWindow=RECV_WINDOW,
-                )
+                response = self.rest_client.new_order(**order_kwargs)
                 self.last_order = response
                 if strategy == "BUY":
                     self._pending_buy_id = response.get("orderId")
+                elif not urgent and response.get("status") in (
+                    "NEW",
+                    "PARTIALLY_FILLED",
+                ):
+                    self._pending_sell_id = response.get("orderId")
                 self.placed_orders.append(
                     {
                         "orderId": response.get("orderId"),
@@ -621,22 +900,23 @@ class OrderExecutor:
                     }
                 )
                 logging.info(
-                    "REST LIMIT %s placed: level=%d price=%.2f qty=%s | orderId=%s",
-                    strategy,
+                    "REST %s placed: level=%d qty=%s | orderId=%s",
+                    order_desc,
                     level_idx,
-                    micro_price,
-                    quantity,
+                    qty_str,
                     response.get("orderId"),
                 )
                 self._refresh_balance_rest()
             except Exception as e:
                 if strategy == "BUY":
                     self._pending_buy_placed_at = None
+                elif not urgent:
+                    self._pending_sell_placed_at = None
+                    self._pending_sell_id = None
                 logging.error(
-                    "REST LIMIT %s failed (level %d, price %.2f): %s",
-                    strategy,
+                    "REST %s failed (level %d): %s",
+                    order_desc,
                     level_idx,
-                    micro_price,
                     e,
                 )
         else:

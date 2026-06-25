@@ -30,7 +30,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 10  # default session length
+DEFAULT_SESSION_MINUTES = 20  # default session length
 # at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
@@ -173,7 +173,9 @@ REFIT_EVERY = 480  # full BIC re-fit every N macro candles (= 40 h at 5 m)
 # ranking score, not as an absolute predictor of OOS performance.  Do not lower
 # this value to "match" OOS — the IS sweep would slow down ~5× without any
 # guarantee that the cadence-gap component of the IS/OOS gap is the dominant one.
-SENSITIVITY_PREDICT_EVERY = 5  # ~25 min at 5 m — IS sensitivity-sweep speed override only
+SENSITIVITY_PREDICT_EVERY = (
+    5  # ~25 min at 5 m — IS sensitivity-sweep speed override only
+)
 # Between two full-BIC refit calls, predict_current_regime() is called only every
 # 5 macro candles; the last known regime label is reused (~5× Viterbi speedup).
 # runner.py always uses predict_every=1 (every candle).
@@ -202,7 +204,9 @@ SENSITIVITY_OAT_THRESHOLD: float = 0.5
 # is instead folded into BACKTEST_INITIAL_CAPITAL at ~65k/BTC so total starting
 # equity (~315k) matches the live account without distorting PnL metrics.
 BACKTEST_INITIAL_CAPITAL = 315000.0  # starting USDT balance (~250k USDT + 1 BTC @ ~65k)
-BACKTEST_INITIAL_BTC = 0.0  # starting BTC balance (BTC value folded into BACKTEST_INITIAL_CAPITAL)
+BACKTEST_INITIAL_BTC = (
+    0.0  # starting BTC balance (BTC value folded into BACKTEST_INITIAL_CAPITAL)
+)
 
 # Taker fee per side (Binance Spot standard tier).
 BACKTEST_FEE_RATE = 0.001  # 0.10 %

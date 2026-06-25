@@ -59,6 +59,12 @@ FILES
     balance_status       : dict   — {"BTC": float, "USDT": float}
                                       free balances; seeded from REST; updated in
                                       real time via outboundAccountPosition push events.
+    balance_locked       : dict   — {"BTC": float, "USDT": float}
+                                      locked balances (tied up in resting LIMIT
+                                      orders); updated by the same two paths as
+                                      balance_status. Read ONLY by the equity
+                                      snapshot so a position resting in a LIMIT
+                                      order still counts; trading reads free only.
     thread_lock          : Lock   — serialises local_book + history_order_book
                                       (MessageHandler writes; AnalysisEngine reads)
     thread_balance_lock  : Lock   — serialises balance_status independently of
@@ -88,8 +94,12 @@ FILES
                                              Pre-armed to True at session start when
                                              balance_status[BTC] ≥ 0.0001 so inherited
                                              BTC is treated as an open position and the
-                                             first SELL closes it naturally (strategy then
-                                             runs USDT-only, matching BACKTEST_INITIAL_BTC=0).
+                                             first SELL closes it naturally. This is a
+                                             FALLBACK: websocket_main.py step 2a normally
+                                             flattens inherited BTC at startup (MARKET sell)
+                                             so the account is already USDT-only here,
+                                             matching BACKTEST_INITIAL_BTC=0; the pre-arm
+                                             only fires if that flatten failed.
     _position_guard_skips : int           — BUY signals suppressed this session
     _pending_buy_placed_at: float | None  — wall-clock time the last GTC BUY was dispatched;
                                              used by cancel_stale_buy() to detect 10-second timeout
@@ -125,12 +135,23 @@ FILES
          ≥ 10 s and the cancel succeeds, resets _position_open = False so the
          strategy can re-enter.  If the cancel fails (order likely already filled),
          keeps the guard armed and waits for a SELL signal.
-      2. **Adaptive stop-loss check** (unconditional): if mid_price < avg_entry ×
+      2. **Resting-SELL resolve** — if _position_open is True, calls
+         OrderExecutor.cancel_stale_sell().  A planned LIMIT GTC exit that has
+         rested ≥ 10 s is cancelled-and-retried ("still_long") or, if the cancel
+         fails because it already filled ("closed"), resets the guard to flat.
+      3. **Equity snapshot** — appends (utc, usdt_total, btc_total, mid) for the
+         end-of-session chart, where *_total = balance_status (free) +
+         balance_locked.  Counting locked keeps a position resting in a LIMIT
+         order on the equity curve instead of collapsing the index to ~0.
+      4. **Adaptive stop-loss check** (unconditional): if mid_price < avg_entry ×
          (1 − pct), fires an emergency SELL and skips the rest of the tick.
-      3. **HMM confidence gate** (≥ 0.60), **trend-pause gate** (skip BOTH sides
+      5. **HMM confidence gate** (≥ 0.60), **trend-pause gate** (skip BOTH sides
          if _trend_paused is True), **VWAP gate** (mean-reversion dead zone,
          δ = 0.002), **HMM regime direction filter**, then delegates to
-         OrderExecutor.execute().
+         OrderExecutor.execute().  The BUY-side ghost-position reset (guard armed
+         but free BTC ≈ 0 ⇒ assume the LIMIT BUY never filled) fires ONLY when no
+         LIMIT SELL is resting — otherwise the BTC is merely locked in that exit,
+         and disarming would orphan it (cancel_stale_sell is gated on the guard).
 
   ▸ historical_analysis()  [every HIST_INTERVAL = 60 s]
       Always recomputes bid_vwap / ask_vwap from history_order_book and
@@ -209,11 +230,35 @@ FILES
 
 ## 5. SESSION DRIVER  (websocket_main.py)
   Orchestrates the full lifecycle: loads API keys, consolidates non-BTC/USDT
-  balances, seeds `OrderBookState`, runs the pre-session HMM fit (so
-  `regime_label` is never `None` on the first low-latency tick), opens the
-  WebSocket stream, starts both analysis threads, blocks for
-  `DEFAULT_SESSION_MINUTES`, then shuts down cleanly (stop_event → ws_client.stop()
-  → executor.stop() → thread joins → order report → balance P&L decomposition).
+  balances, **flattens any inherited BTC** (step 2a — see below), seeds
+  `OrderBookState`, runs the pre-session HMM fit (so `regime_label` is never
+  `None` on the first low-latency tick), opens the WebSocket stream, starts both
+  analysis threads, blocks for `DEFAULT_SESSION_MINUTES`, then shuts down cleanly
+  (stop_event → ws_client.stop() → executor.stop() → thread joins → order report
+  → balance P&L decomposition).
+
+  **Step 2a — inherited-BTC flatten (start flat, matches backtest):** The
+  backtest assumes `BACKTEST_INITIAL_BTC = 0` (always starts with no open
+  position). A live testnet account often carries BTC left over from previous
+  sessions (BUYs that filled but whose SELLs never did). Before the portfolio
+  snapshot, any free BTC ≥ `1e-5` is sold with a one-time REST **MARKET** order
+  (floored to the LOT_SIZE 5-decimal grid) and balances are re-fetched, so the
+  account begins flat and USDT-only. Without this, `AnalysisEngine` pre-arms the
+  position guard on the inherited BTC: the bot can then ONLY exit (via a
+  mean-reversion rally or the stop-loss) and can NEVER buy, so in a flat market
+  it places **zero orders all session**. Flattening before the snapshot also
+  zeroes price-P&L component **B**, so all session P&L is attributable to
+  trading alpha. The pre-arm logic (below) remains as a fallback for the case
+  where the flatten MARKET sell fails.
+
+  **End-of-session report — Buy & Hold benchmark:** alongside the `A + B = Total`
+  P&L decomposition, the balance report prints a **Buy & Hold** line —
+  `(btc_end / btc_start − 1) × 100` — i.e. what the whole starting equity would
+  have returned if simply held as BTC, plus **Strategy vs B&H** (positive ⇒ the
+  strategy beat holding BTC). This is the SAME baseline drawn in the session P&L
+  chart (`session_chart.py`'s `bnh_index`), surfaced as a number so the text
+  report and the chart share one frame of reference. It is a benchmark only, NOT
+  part of the strategy's P&L.
 
 ## 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
   Places orders via the Binance WebSocket API and maintains real-time balance
@@ -226,9 +271,42 @@ FILES
     On dispatch, `_pending_buy_placed_at` is set (both paths) and
     `_pending_buy_id` is set synchronously (REST) or asynchronously via
     `handle_order_response` (WS).
-  - **SELL**: LIMIT IOC — fills at the best available bid immediately or
-    auto-cancels; never locks BTC beyond a single matching cycle (prevents
-    the Binance -2010 "insufficient balance" rejection caused by stale locked BTC).
+  - **SELL**: order type depends on **urgency** (the `urgent` arg of
+    `execute()`):
+    - **Urgent (stop-loss exit) → MARKET.** Closes the position immediately by
+      filling against Binance's **real server-side book**, so the close always
+      executes and never expires. Immune to `local_book` staleness (a marketable
+      LIMIT/IOC priced from `local_book` can expire `EXPIRED`/`execQty=0` when
+      `core/message_handler.py` — which has no depth-diff **gap recovery** — has
+      left a phantom top-of-book bid). Before the MARKET close the stop-loss
+      first calls `cancel_stale_sell(timeout_sec=0.0)` to cancel any resting
+      LIMIT exit and free the BTC it locked. Trade-off: real-book slippage
+      instead of the backtest's single half-spread — accepted for guaranteed exit.
+    - **Non-urgent (planned mean-reversion exit) → LIMIT GTC at `micro_price`**,
+      symmetric to the BUY: it rests on the book as a maker order. Because a
+      resting LIMIT may not fill (the rally can fade before a buyer crosses), it
+      is tracked by `_pending_sell_placed_at` / `_pending_sell_id` and resolved
+      by **`cancel_stale_sell()`** after a 10 s timeout — exactly like
+      `cancel_stale_buy`: cancel succeeds → `"still_long"` (position kept, retry
+      on the next signal); cancel fails (-2011) → `"closed"` (order filled,
+      strategy now flat). The position guard stays armed and the stop-loss anchor
+      intact until the exit actually fills, so a BUY can never stack behind an
+      unfilled SELL. At dispatch a **book-health** line is logged (`best_bid`,
+      `best_ask`, `lastUpdateId`); a crossed book (`best_bid ≥ best_ask`) is
+      direct proof `local_book` is stale.
+
+  **Exchange-filter normalisation:**
+  At construction the executor calls `exchange_info()` once to cache the
+  symbol's `LOT_SIZE` (`stepSize`, `minQty`) and `(MIN_)NOTIONAL`
+  (`minNotional`) filters.  Every order's quantity is then floored DOWN
+  to the `stepSize` grid (never up — keeps the order within budget) and
+  rejected before dispatch if it is below `minQty` or if its notional
+  is below `minNotional`.  This prevents the silent Binance
+  `-1013 "Filter failure: LOT_SIZE"` rejection that otherwise drops
+  every order at the gateway when the strategy-computed quantity is not
+  an exact multiple of the symbol's precision step (e.g. `0.004785`
+  for a stepSize of `0.00001`).  BTCUSDT-correct defaults are used if
+  the `exchange_info()` call fails so the executor stays operational.
 
   **Key methods:**
   - `execute()`: validates strategy, caps quantity, dispatches the order.

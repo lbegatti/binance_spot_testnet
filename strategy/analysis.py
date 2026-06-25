@@ -204,7 +204,9 @@ class AnalysisEngine:
         self._n_stop_loss_fires: int = 0
 
         # ── Equity snapshot history (consumed by visualization/session_chart.py) ──
-        # One entry per HFT tick: (utc_now, usdt_free, btc_free, mid_price).
+        # One entry per HFT tick: (utc_now, usdt_total, btc_total, mid_price),
+        # where *_total = free + locked so a position resting in a LIMIT order
+        # still counts toward equity.
         # Written exclusively by the HFT thread; read by the main thread AFTER
         # hft_thread.join() in websocket_main.py's finally block, so no lock
         # is needed.  For a 10-minute session this is ~600 entries (~50 KB).
@@ -377,6 +379,25 @@ class AnalysisEngine:
                 self.stop_event.wait(HFT_INTERVAL)
                 continue
 
+            # ── Resolve a resting LIMIT SELL (planned exit) ──────────────────
+            # A non-urgent exit rests on the book like the BUY.  After the 10 s
+            # window cancel_stale_sell() reports the outcome:
+            #   "closed"     → it filled; we are flat again — reset the guard.
+            #   "still_long" → cancelled unfilled (or never got an orderId);
+            #                  keep the position and retry on the next signal.
+            #   None         → no resting SELL, or the window has not elapsed.
+            if self._position_open:
+                _sell_outcome = self.order_executor.cancel_stale_sell()
+                if _sell_outcome == "closed":
+                    self._position_open = False
+                    self._avg_entry_price = 0.0
+                    logging.info(
+                        "HFT #%d — LIMIT SELL filled; position closed, now flat.",
+                        iteration,
+                    )
+                    self.stop_event.wait(HFT_INTERVAL)
+                    continue
+
             # Mirrors backtest/signals.py: the SELL block uses `and signal == 0`
             # to ensure at most one signal per bar.  In the live system we
             # achieve the same exclusivity with a per-tick local flag set when
@@ -402,8 +423,16 @@ class AnalysisEngine:
             if levels:
                 _mid_snap = float(levels[0][1])  # level[1] = mid_price
                 with self.state.thread_balance_lock:
-                    _usdt_snap = self.state.balance_status.get(CCY, 0.0)
-                    _btc_snap = self.state.balance_status.get(CRYPTOCCY, 0.0)
+                    # Mark the FULL position (free + locked) so BTC locked in a
+                    # resting LIMIT SELL (or USDT locked in a resting BUY) still
+                    # counts toward equity — otherwise the index collapses while
+                    # an exit rests on the book.
+                    _usdt_snap = self.state.balance_status.get(
+                        CCY, 0.0
+                    ) + self.state.balance_locked.get(CCY, 0.0)
+                    _btc_snap = self.state.balance_status.get(
+                        CRYPTOCCY, 0.0
+                    ) + self.state.balance_locked.get(CRYPTOCCY, 0.0)
                 self._equity_snapshots.append(
                     (datetime.now(timezone.utc), _usdt_snap, _btc_snap, _mid_snap)
                 )
@@ -418,12 +447,7 @@ class AnalysisEngine:
                 _sl_pct = self._stop_loss_state.get("pct", 0.0)
             _avg_ep = self._avg_entry_price
 
-            if (
-                self._position_open
-                and _sl_pct > 0.0
-                and _avg_ep > 0.0
-                and levels
-            ):
+            if self._position_open and _sl_pct > 0.0 and _avg_ep > 0.0 and levels:
                 _mid_price = float(levels[0][1])  # level[1] = mid_price
                 _sl_floor = _avg_ep * (1.0 - _sl_pct)
                 if _mid_price < _sl_floor:
@@ -462,7 +486,10 @@ class AnalysisEngine:
                     self._n_stop_loss_fires += 1
                     self._position_open = False
                     self._avg_entry_price = 0.0
-                    self.order_executor.execute("SELL", _sell_target)
+                    # Cancel any resting LIMIT exit first so the BTC it locked is
+                    # freed for the urgent MARKET close, then force the exit.
+                    self.order_executor.cancel_stale_sell(timeout_sec=0.0)
+                    self.order_executor.execute("SELL", _sell_target, urgent=True)
                     self.stop_event.wait(HFT_INTERVAL)
                     continue  # skip normal signal evaluation this tick
 
@@ -581,11 +608,22 @@ class AnalysisEngine:
                     # is ~0, the limit BUY likely never filled (price moved away
                     # before the order matched).  Reset so the strategy can
                     # re-enter on the next signal (audit Finding 7).
-                    if btc_balance < 0.0001:
+                    if (
+                        btc_balance < 0.0001
+                        and not self.order_executor.has_pending_sell()
+                    ):
+                        # Genuine ghost: guard armed, free BTC ≈ 0, AND no planned
+                        # exit resting → the LIMIT BUY never filled.  Reset so the
+                        # strategy can re-enter on the next signal.
+                        # If a LIMIT SELL exit IS resting, the BTC is LOCKED in it
+                        # (free reads 0 but the position is real) — do NOT disarm,
+                        # or cancel_stale_sell() (gated on _position_open) would
+                        # orphan the resting exit for the rest of the session.
                         self._position_open = False
                         logging.info(
                             "HFT #%d [buy] — position guard reset: armed but BTC "
-                            "balance %.8f ≈ 0 (limit order likely unfilled).",
+                            "balance %.8f ≈ 0 and no resting exit (LIMIT BUY likely "
+                            "unfilled).",
                             iteration,
                             btc_balance,
                         )
@@ -638,9 +676,21 @@ class AnalysisEngine:
                         VWAP_THRESHOLD_MULTIPLIER,
                     )
                 else:
-                    self._position_open = False  # reset guard — strategy is now flat
-                    self._avg_entry_price = 0.0  # clear stop-loss anchor
-                    self.order_executor.execute("SELL", best_sell)
+                    # Planned exit: rest a LIMIT GTC on the book (maker), like
+                    # the BUY.  Keep the position guard armed and the stop-loss
+                    # anchor intact until the order actually fills — resolved by
+                    # cancel_stale_sell() at the top of the loop.  Do NOT mark
+                    # flat here, or a BUY could fire while we still hold the
+                    # position behind a resting SELL.  Skip if an exit is already
+                    # working.
+                    if self.order_executor.has_pending_sell():
+                        logging.info(
+                            "HFT #%d [sell] — exit already resting on the book; "
+                            "skipping duplicate.",
+                            iteration,
+                        )
+                    else:
+                        self.order_executor.execute("SELL", best_sell)
 
             self.stop_event.wait(HFT_INTERVAL)  # sleep AFTER work, not before
 
