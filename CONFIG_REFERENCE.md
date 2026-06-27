@@ -13,6 +13,8 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `MAX_ORDERS_PER_ITER` | 1 | Max orders placed per low-latency iteration |
 | `MIN_VWAP_HISTORY_SIZE` | 5 | Minimum snapshots for VWAP calculation |
 | `DEFAULT_SESSION_MINUTES` | 10 | Session duration (live trading) |
+| `BALANCE_REFRESH_INTERVAL` | 60 s | Cadence of the driver-side REST balance-refresh daemon. Active only in REST-only mode (WS user-data push down): polls `account()` so balances and the equity chart stay current during idle stretches. No-op when the WS push is healthy. |
+| `FLATTEN_ON_START` | `False` | Startup inventory policy. `True` = MARKET-sell inherited BTC so the session starts flat (matches `BACKTEST_INITIAL_BTC = 0`; per-session skill test, report component B ≡ 0). `False` = carry inherited BTC across restarts; the position guard pre-arms on it and report component B attributes its market drift. While `False`, a carried position's stop-loss is anchored at the session-start price until position persistence (Phase 2) is added. |
 
 ## HMM Regime Detection
 
@@ -63,6 +65,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `BEST_PARAMS_FILE` | `"backtest/results/best_params.json"` | Sensitivity sweep output (centralized) |
 | `BACKTEST_RESULTS_DIR` | `"backtest/results"` | Machine artefacts (JSON, Optuna SQLite) |
 | `BACKTEST_REPORTING_DIR` | `"backtest/reporting"` | Human reports (CSVs, Plotly charts) |
+| `LIVE_POSITION_STATE_PATH` | `"state/live_position.json"` | Live carried-position state (cost basis). Written on shutdown; read at startup only when `FLATTEN_ON_START = False`. Git-ignored runtime artifact. |
 
 ## Sensitivity Analysis Parameters
 

@@ -22,12 +22,16 @@ from config_parameters import (
     WS_SPEED,
     HTF_JOIN_TIMEOUT,
     HIST_JOIN_TIMEOUT,
+    BALANCE_REFRESH_INTERVAL,
     SYMBOL,
     CCY,
     CRYPTOCCY,
     STOP_LOSS_ROLLING_DAYS,
     STOP_LOSS_STD_MULT,
+    FLATTEN_ON_START,
+    LIVE_POSITION_STATE_PATH,
 )
+from strategy.position_store import load_position, save_position
 
 # Log to BOTH the console and a timestamped file so a full multi-hour run is
 # preserved on disk — terminal scrollback rolls over and silently loses early
@@ -153,22 +157,25 @@ else:
         }
 
 # ---------------------------------------------------------------------------
-# 2a. Flatten any inherited BTC so the session starts flat (matches backtest)
+# 2a. Startup inventory policy — flatten inherited BTC, or carry it (FLATTEN_ON_START)
 # ---------------------------------------------------------------------------
 # The backtest assumes BACKTEST_INITIAL_BTC = 0 — it always starts with no open
 # position.  A live testnet account, however, often carries BTC left over from
-# previous sessions (e.g. BUYs that filled but whose SELLs never did).  If we
-# don't clear it, AnalysisEngine pre-arms the position guard on that inherited
-# BTC: the bot can then ONLY exit via a mean-reversion rally or the stop-loss
-# and can NEVER buy, so in a flat market it places zero orders all session.
-# A one-time MARKET sell here drops the account to a flat, USDT-only state
-# identical to the backtest's starting assumption (and to the alt-coin
-# consolidation above, which intentionally skips CRYPTOCCY).
+# previous sessions (e.g. BUYs that filled but whose SELLs never did).
+#
+# FLATTEN_ON_START controls what we do with that inherited BTC:
+#   True  → MARKET-sell it now so the session starts flat (matches the backtest;
+#           per-session skill test).
+#   False → keep it.  AnalysisEngine pre-arms the position guard on the inherited
+#           BTC, treating it as an open position: the bot can then only exit it
+#           (mean-reversion rally or stop-loss) before buying again.  This is the
+#           realistic "carry inventory across restarts" mode; component B in the
+#           end-of-session report attributes the carried bag's market drift.
 inherited_btc = balances.get(CRYPTOCCY, {}).get("free", 0.0)
 # Floor to the BTCUSDT LOT_SIZE grid (stepSize 1e-5 → 5 decimals) so the MARKET
 # sell quantity is an exact multiple and not rejected with -1013.
 inherited_btc = int(inherited_btc * 1e5) / 1e5
-if inherited_btc >= 1e-5:
+if FLATTEN_ON_START and inherited_btc >= 1e-5:
     logging.warning(
         "Flattening %s %s of inherited BTC at startup via MARKET sell so the "
         "session begins flat (matches BACKTEST_INITIAL_BTC = 0).",
@@ -201,10 +208,29 @@ if inherited_btc >= 1e-5:
             "pre-arm on it and the bot may not BUY this session.",
             e,
         )
+elif inherited_btc >= 1e-5:
+    # FLATTEN_ON_START is False: keep the inherited BTC.  The AnalysisEngine
+    # position guard pre-arms on it (treated as an open position), and the
+    # report's component B attributes its market drift separately.
+    logging.info(
+        "\nFLATTEN_ON_START is False — carrying %s %s of inherited BTC into the "
+        "session; the position guard will pre-arm on it (stop-loss anchored at "
+        "the session-start price until position persistence is added).\n",
+        inherited_btc,
+        CRYPTOCCY,
+    )
 
 # Check that we have USDT (or the quote asset) available for trading
 usdt_balance = balances.get(CCY, {}).get("free", 0.0)
 btc_balance = balances.get(CRYPTOCCY, {}).get("free", 0.0)
+# Locked balances present at session start belong to PRE-EXISTING orders not
+# placed by this strategy (shared testnet account).  Captured so the equity
+# chart can subtract them: snapshots mark free+locked, but only the locked the
+# STRATEGY itself adds during the session (e.g. BTC resting in its own LIMIT
+# SELL) should count toward its equity.  Foreign locked would otherwise inflate
+# the curve — and since start_total is free-only, it causes a spurious jump.
+locked_usdt_at_start = balances.get(CCY, {}).get("locked", 0.0)
+locked_btc_at_start = balances.get(CRYPTOCCY, {}).get("locked", 0.0)
 logging.info(f"Available {CCY}: {usdt_balance} | Available {CRYPTOCCY}: {btc_balance}")
 
 if usdt_balance == 0 and btc_balance == 0:
@@ -313,6 +339,12 @@ snapshot = rest_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
 state = OrderBookState()
 state.balance_status[CCY] = usdt_balance
 state.balance_status[CRYPTOCCY] = btc_balance
+# Seed locked balances too, so the FIRST equity snapshot already includes any
+# foreign-locked amount (otherwise snapshot #0 is free-only while later ones add
+# locked once the first REST refresh runs — the chart's locked_*_at_start
+# subtraction would then over-correct t0 and spike the index down).
+state.balance_locked[CCY] = locked_usdt_at_start
+state.balance_locked[CRYPTOCCY] = locked_btc_at_start
 state.local_book = {
     "bids": {price: qty for price, qty in snapshot["bids"]},
     "asks": {price: qty for price, qty in snapshot["asks"]},
@@ -345,7 +377,7 @@ handler = MessageHandler(state=state)
 # and balances rely on the startup REST snapshot.
 executor = OrderExecutor(
     state=state,
-    stream_url="wss://testnet.binance.vision/ws-api/v3",
+    stream_url="wss://ws-api.testnet.binance.vision/ws-api/v3",
     api_key=api_key,
     api_secret=api_secret,
     rest_client=rest_client,
@@ -357,6 +389,41 @@ logging.info(
     "pending" if executor.ws_api_client is not None else "REST-only",
 )
 
+# Resolve the position guard's stop-loss anchor.  Default: the session-start
+# price (Phase-1 behaviour).  When carrying inventory (FLATTEN_ON_START=False)
+# and a persisted position matches the BTC actually on the account, restore the
+# TRUE cost basis saved at the previous shutdown so the stop-loss anchors
+# correctly.  Purely additive and fail-safe: any miss falls back to the
+# session-start price, and the strategy/engine code is unchanged — only the
+# value handed to the existing initial_avg_entry_price parameter differs.
+initial_avg_entry_price = btc_start_price or 0.0
+if not FLATTEN_ON_START and btc_balance >= 0.0001:
+    _persisted = load_position(LIVE_POSITION_STATE_PATH, symbol=SYMBOL)
+    if (
+        _persisted
+        and _persisted.get("position_open")
+        and abs(_persisted.get("btc_qty", 0.0) - btc_balance)
+        <= max(1e-5, 0.01 * btc_balance)
+    ):
+        initial_avg_entry_price = float(_persisted["avg_entry_price"])
+        logging.info(
+            "Restored carried position cost basis %.2f (%.8f BTC, saved %s) — "
+            "stop-loss will anchor here instead of the session-start price.",
+            initial_avg_entry_price,
+            _persisted["btc_qty"],
+            _persisted.get("saved_at", "?"),
+        )
+    elif _persisted:
+        logging.info(
+            "Persisted position state found but not restored (open=%s, saved "
+            "qty=%.8f vs account %.8f) — anchoring stop-loss at session-start "
+            "price %.2f.",
+            _persisted.get("position_open"),
+            _persisted.get("btc_qty", 0.0),
+            btc_balance,
+            initial_avg_entry_price,
+        )
+
 engine = AnalysisEngine(
     state=state,
     stop_event=stop_event,
@@ -364,7 +431,7 @@ engine = AnalysisEngine(
     regime_director=regime_director,
     stop_loss_state=stop_loss_state,
     refresh_stop_loss_fn=refresh_stop_loss_pct,
-    initial_avg_entry_price=btc_start_price or 0.0,
+    initial_avg_entry_price=initial_avg_entry_price,
 )
 
 low_latency_thread = threading.Thread(
@@ -372,6 +439,35 @@ low_latency_thread = threading.Thread(
 )
 hist_thread = threading.Thread(
     target=engine.historical_analysis, daemon=True, name="hist-analysis"
+)
+
+
+def _balance_refresh_loop() -> None:
+    """
+    Defense-in-depth balance poller (driver-side; touches no strategy code).
+
+    When the WS user-data push is live, ``outboundAccountPosition`` keeps
+    balances current.  When it is NOT (REST-only fallback), balances are only
+    refreshed as a side effect of placing/cancelling an order — so during a long
+    idle stretch with no qualifying signal, ``balance_status`` freezes and the
+    end-of-session equity snapshots freeze with it.  This loop polls a fresh REST
+    snapshot every ``BALANCE_REFRESH_INTERVAL`` seconds while in REST-only mode
+    so the equity curve (and any balance-dependent logic) stays current.  It is a
+    no-op once the WS push is confirmed healthy.
+    """
+    while not stop_event.wait(timeout=BALANCE_REFRESH_INTERVAL):
+        if not executor._user_data_active:
+            try:
+                executor._refresh_balance_rest()
+            except Exception as _bal_exc:
+                logging.warning(
+                    "Periodic REST balance refresh failed (%s) — non-fatal.",
+                    _bal_exc,
+                )
+
+
+balance_refresh_thread = threading.Thread(
+    target=_balance_refresh_loop, daemon=True, name="balance-refresh"
 )
 
 # ---------------------------------------------------------------------------
@@ -395,6 +491,7 @@ time.sleep(1)
 
 low_latency_thread.start()
 hist_thread.start()
+balance_refresh_thread.start()
 logging.info("Analysis threads started. Running for %d minute(s)...\n", session_minutes)
 
 # ---------------------------------------------------------------------------
@@ -414,6 +511,7 @@ finally:
     executor.stop()  # close the WebSocket API order + user-data connection
     low_latency_thread.join(timeout=HTF_JOIN_TIMEOUT)
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
+    balance_refresh_thread.join(timeout=HTF_JOIN_TIMEOUT)
     logging.info("All threads stopped. Exiting.")
 
     # -----------------------------------------------------------------------
@@ -452,6 +550,8 @@ finally:
             start_total_usdt=start_total_usdt or 0.0,
             btc_start_price=btc_start_price or 0.0,
             out_path=_chart_path,
+            locked_usdt_at_start=locked_usdt_at_start,
+            locked_btc_at_start=locked_btc_at_start,
         )
     except Exception as _chart_exc:
         logging.warning(
@@ -478,6 +578,27 @@ finally:
         # noinspection PyArgumentList
         btc_end_price = float(rest_client.ticker_price(symbol=SYMBOL)["price"])
         end_total_usdt = final_usdt + final_btc * btc_end_price
+
+        # Persist the open-position state (cost basis) for the next restart.
+        # Decorative + fail-safe: a failure here never affects the session, and
+        # the engine attributes are only READ (strategy code untouched).  Uses
+        # free + locked BTC so a position resting in a LIMIT order still counts;
+        # honored on startup only when FLATTEN_ON_START is False.
+        try:
+            _btc_total = sum(
+                float(it["free"]) + float(it["locked"])
+                for it in final_info["balances"]
+                if it["asset"] == CRYPTOCCY
+            )
+            save_position(
+                LIVE_POSITION_STATE_PATH,
+                position_open=engine._position_open,
+                avg_entry_price=engine._avg_entry_price,
+                btc_qty=_btc_total,
+                symbol=SYMBOL,
+            )
+        except Exception as _ps_exc:
+            logging.warning("Position state save failed (%s) — non-fatal.", _ps_exc)
 
         # ── P&L attribution ────────────────────────────────────────────────
         # trading_pnl  = what the STRATEGY contributed.
@@ -509,6 +630,14 @@ finally:
             # Sanity-check: trading_pnl + price_pnl == total_pnl (algebraic identity).
             # Any residual is floating-point rounding noise — shown for transparency.
             residual = total_pnl - (trading_pnl + price_pnl)
+            # When the session carried inventory (FLATTEN_ON_START = False),
+            # component B is non-zero and worth calling out — it is market drift
+            # on the carried bag, NOT trading skill.  Empty when starting flat.
+            b_note = (
+                "  ← carried inventory drifted with the market (not trading P&L)"
+                if abs(price_pnl) >= 0.01
+                else ""
+            )
 
             logging.info(
                 "\n"
@@ -525,7 +654,7 @@ finally:
                 "    A  Trading alpha : %+.2f  (Δusdt + Δbtc × end_price)\n"
                 "       Strategy bought/sold BTC; this is the net result\n"
                 "       marked at the END price — isolated from market moves.\n"
-                "    B  Price P&L     : %+.2f  (%.8f BTC × %+.2f BTC/USDT)\n"
+                "    B  Price P&L     : %+.2f  (%.8f BTC × %+.2f BTC/USDT)%s\n"
                 "       Starting BTC holding × price change this session.\n"
                 "    ─────────────────────────────────────────────────────\n"
                 "    A + B  Total P&L : %+.2f  (%+.3f %%)\n"
@@ -551,6 +680,7 @@ finally:
                 price_pnl,
                 btc_balance,
                 btc_end_price - btc_start_price,  # price change (BTC/USDT)
+                b_note,
                 total_pnl,
                 pct_return,
                 bnh_return_pct,

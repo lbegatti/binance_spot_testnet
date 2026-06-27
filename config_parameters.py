@@ -34,6 +34,32 @@ DEFAULT_SESSION_MINUTES = 20  # default session length
 # at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
+# Cadence of the REST balance-refresh daemon (driver-side, defense in depth).
+# Only active when the WS user-data push is NOT live (REST-only fallback): it
+# polls a fresh account() snapshot so balances — and the end-of-session equity
+# chart — stay current during long idle stretches with no orders.  No-op when
+# the WS push is healthy.  ~1 account() call per interval (trivial on weight).
+BALANCE_REFRESH_INTERVAL = 60  # seconds
+
+# Startup inventory policy (live session only).
+#   True  → MARKET-sell any inherited BTC at startup so the session begins flat,
+#           matching the backtest's BACKTEST_INITIAL_BTC = 0.  Each session is an
+#           isolated skill test; all P&L is trading alpha (report component B ≡ 0).
+#   False → keep inherited BTC and let AnalysisEngine's position guard pre-arm on
+#           it (carry inventory across restarts; more realistic).  The end-of-
+#           session report's component B then attributes the carried bag's market
+#           drift separately from trading alpha.
+# NOTE: while False, the carried position's stop-loss is anchored at the session-
+# start price (not the true cost basis) until position persistence (Phase 2) is
+# added.
+FLATTEN_ON_START: bool = False
+
+# Path to the live position-state file (cost basis carried across restarts).
+# Written on shutdown; read at startup ONLY when FLATTEN_ON_START is False, so a
+# carried position's stop-loss anchors at its true entry price instead of the
+# session-start price.  Runtime artifact — git-ignored; deleting it simply
+# reverts to the session-start-price anchor.
+LIVE_POSITION_STATE_PATH: str = "state/live_position.json"
 
 # ---------------------------------------------------------------------------
 # Binance REST / WebSocket connection

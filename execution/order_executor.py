@@ -23,7 +23,7 @@ class OrderExecutor:
     balance updates via the Binance WebSocket API.
 
     **Order execution** — prefers the Binance WebSocket API
-    (``wss://testnet.binance.vision/ws-api/v3``) for lower latency and
+    (``wss://ws-api.testnet.binance.vision/ws-api/v3``) for lower latency and
     falls back transparently to the REST API when the WebSocket endpoint is
     unavailable.  No logic change is required in the caller.
 
@@ -85,7 +85,7 @@ class OrderExecutor:
         Args:
             state (OrderBookState): Shared order book and balance state.
             stream_url (str): Binance WebSocket API endpoint
-                (e.g. ``"wss://testnet.binance.vision/ws-api/v3"``).
+                (e.g. ``"wss://ws-api.testnet.binance.vision/ws-api/v3"``).
             api_key (str): Binance API key.
             api_secret (str): Binance API secret.
             rest_client: Optional ``binance.spot.Spot`` instance used as a
@@ -966,6 +966,13 @@ class OrderExecutor:
             orig_qty = float(result.get("origQty", record.get("origQty", 0)))
             exec_qty = float(result.get("executedQty", 0))
             quote_spent = float(result.get("cummulativeQuoteQty", 0))
+            # Enrich the record in place with the FINAL outcome so the
+            # end-of-session P&L chart can distinguish an order that actually
+            # traded from one that was placed but cancelled / never matched.
+            # order_status_report() runs before the chart is built, and the
+            # marker is otherwise drawn at dispatch time regardless of fill.
+            record["final_status"] = status
+            record["exec_qty"] = exec_qty
 
             if status == "FILLED":
                 label = "✔ FILLED"

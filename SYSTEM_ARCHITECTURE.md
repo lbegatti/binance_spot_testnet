@@ -29,7 +29,7 @@ FILES
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
-    session_chart.py                  — End-of-session P&L chart (Plotly HTML): Strategy vs B&H equity index + BUY/SELL markers + USDT/BTC component panel; written to backtest/reporting/session_pnl_<ts>.html by websocket_main.py
+    session_chart.py                  — End-of-session P&L chart (Plotly HTML): Strategy vs B&H equity index + filled/unfilled BUY/SELL markers (solid = traded, hollow grey = cancelled / never matched) + USDT/BTC component panel; written to backtest/reporting/session_pnl_<ts>.html by websocket_main.py
 
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
     data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
@@ -94,12 +94,13 @@ FILES
                                              Pre-armed to True at session start when
                                              balance_status[BTC] ≥ 0.0001 so inherited
                                              BTC is treated as an open position and the
-                                             first SELL closes it naturally. This is a
-                                             FALLBACK: websocket_main.py step 2a normally
-                                             flattens inherited BTC at startup (MARKET sell)
-                                             so the account is already USDT-only here,
-                                             matching BACKTEST_INITIAL_BTC=0; the pre-arm
-                                             only fires if that flatten failed.
+                                             first SELL closes it naturally. Primary path
+                                             when FLATTEN_ON_START=False (carry inventory);
+                                             also a FALLBACK when FLATTEN_ON_START=True if
+                                             the step-2a MARKET flatten fails. When the
+                                             flatten succeeds the account is USDT-only here
+                                             (matching BACKTEST_INITIAL_BTC=0) and the
+                                             pre-arm does not fire.
     _position_guard_skips : int           — BUY signals suppressed this session
     _pending_buy_placed_at: float | None  — wall-clock time the last GTC BUY was dispatched;
                                              used by cancel_stale_buy() to detect 10-second timeout
@@ -142,7 +143,12 @@ FILES
       3. **Equity snapshot** — appends (utc, usdt_total, btc_total, mid) for the
          end-of-session chart, where *_total = balance_status (free) +
          balance_locked.  Counting locked keeps a position resting in a LIMIT
-         order on the equity curve instead of collapsing the index to ~0.
+         order on the equity curve instead of collapsing the index to ~0.  The
+         chart then subtracts the locked balances that existed at session start
+         (foreign resting orders not placed by this strategy — see
+         `session_chart.py`'s `locked_*_at_start`) so only the strategy's OWN
+         locks count; otherwise foreign locked USDT/BTC would inflate the curve
+         against the free-only `start_total` and make the index jump.
       4. **Adaptive stop-loss check** (unconditional): if mid_price < avg_entry ×
          (1 − pct), fires an emergency SELL and skips the rest of the tick.
       5. **HMM confidence gate** (≥ 0.60), **trend-pause gate** (skip BOTH sides
@@ -230,26 +236,65 @@ FILES
 
 ## 5. SESSION DRIVER  (websocket_main.py)
   Orchestrates the full lifecycle: loads API keys, consolidates non-BTC/USDT
-  balances, **flattens any inherited BTC** (step 2a — see below), seeds
+  balances, **applies the startup inventory policy** (step 2a — flatten or carry
+  inherited BTC per `FLATTEN_ON_START`; see below), seeds
   `OrderBookState`, runs the pre-session HMM fit (so `regime_label` is never
-  `None` on the first low-latency tick), opens the WebSocket stream, starts both
-  analysis threads, blocks for `DEFAULT_SESSION_MINUTES`, then shuts down cleanly
-  (stop_event → ws_client.stop() → executor.stop() → thread joins → order report
-  → balance P&L decomposition).
+  `None` on the first low-latency tick), opens the WebSocket stream, starts the
+  two analysis threads **plus a REST balance-refresh daemon**, blocks for
+  `DEFAULT_SESSION_MINUTES`, then shuts down cleanly (stop_event →
+  ws_client.stop() → executor.stop() → thread joins → order report → session P&L
+  chart → balance P&L decomposition → position-state save).
 
-  **Step 2a — inherited-BTC flatten (start flat, matches backtest):** The
-  backtest assumes `BACKTEST_INITIAL_BTC = 0` (always starts with no open
-  position). A live testnet account often carries BTC left over from previous
-  sessions (BUYs that filled but whose SELLs never did). Before the portfolio
-  snapshot, any free BTC ≥ `1e-5` is sold with a one-time REST **MARKET** order
-  (floored to the LOT_SIZE 5-decimal grid) and balances are re-fetched, so the
-  account begins flat and USDT-only. Without this, `AnalysisEngine` pre-arms the
-  position guard on the inherited BTC: the bot can then ONLY exit (via a
-  mean-reversion rally or the stop-loss) and can NEVER buy, so in a flat market
-  it places **zero orders all session**. Flattening before the snapshot also
-  zeroes price-P&L component **B**, so all session P&L is attributable to
-  trading alpha. The pre-arm logic (below) remains as a fallback for the case
-  where the flatten MARKET sell fails.
+  **REST balance-refresh daemon (`BALANCE_REFRESH_INTERVAL`, default 60 s):**
+  the WS user-data push (`outboundAccountPosition` over
+  `wss://ws-api.testnet.binance.vision/ws-api/v3`) keeps balances live, but if
+  that connection is down the executor runs REST-only and balances are refreshed
+  only as a side effect of placing/cancelling an order.  During a long idle
+  stretch (no qualifying signal) `balance_status` would then freeze — and with
+  it the end-of-session equity snapshots (the chart's Strategy line goes flat).
+  The daemon polls a fresh REST `account()` snapshot every interval while in
+  REST-only mode (`not executor._user_data_active`) so balances and the equity
+  curve stay current; it is a no-op once the WS push is confirmed healthy.
+
+  **Step 2a — startup inventory policy (`FLATTEN_ON_START`):** The backtest
+  assumes `BACKTEST_INITIAL_BTC = 0` (always starts with no open position). A
+  live testnet account often carries BTC left over from previous sessions (BUYs
+  that filled but whose SELLs never did). The `FLATTEN_ON_START` flag chooses
+  what to do with it:
+
+  - **`True` — flatten (start flat, matches backtest):** before the portfolio
+    snapshot, any free BTC ≥ `1e-5` is sold with a one-time REST **MARKET** order
+    (floored to the LOT_SIZE 5-decimal grid) and balances are re-fetched, so the
+    account begins flat and USDT-only. This zeroes price-P&L component **B**, so
+    all session P&L is attributable to trading alpha, and makes each session an
+    isolated skill test directly comparable to the backtest.
+  - **`False` — carry inventory (default):** the inherited BTC is kept and
+    `AnalysisEngine` pre-arms the position guard on it (treated as an open
+    position): the bot can then only exit it (mean-reversion rally or stop-loss)
+    before buying again. This is the realistic "carry across restarts" mode; the
+    end-of-session report's component **B** becomes non-zero and attributes the
+    carried bag's market drift separately from trading alpha (flagged inline in
+    the report). The carried position's stop-loss anchor (cost basis) is
+    restored from the persisted state file when available (see below).
+
+  **Position persistence (`strategy/position_store.py`):** on shutdown the
+  driver writes `LIVE_POSITION_STATE_PATH` (default `state/live_position.json`,
+  git-ignored) — `position_open`, `avg_entry_price`, and total BTC qty
+  (free + locked). On the next startup, **only when `FLATTEN_ON_START = False`**,
+  the driver reloads it and — if the saved BTC qty matches the account balance
+  within `max(1e-5, 1%)` — passes the saved `avg_entry_price` as the position
+  guard's stop-loss anchor instead of the session-start price, so a carried
+  position's stop-loss reflects its true cost basis. Purely additive and
+  fail-safe: a missing / corrupt / mismatched / wrong-symbol file (or a hard
+  kill that skipped the save) falls back to the session-start-price anchor, and
+  no strategy/engine code is involved — only the value handed to the existing
+  `initial_avg_entry_price` parameter. Atomic write (temp file + `os.replace`)
+  prevents a half-written file; deleting the file reverts to Phase-1 behaviour.
+
+  Note the failure mode of `True` with no flatten: if the MARKET sell fails, the
+  pre-arm fires on the inherited BTC, so the bot can ONLY exit and can NEVER buy
+  — in a flat market it places **zero orders all session**. The pre-arm logic
+  (below) is shared by both the `False` path and that fallback.
 
   **End-of-session report — Buy & Hold benchmark:** alongside the `A + B = Total`
   P&L decomposition, the balance report prints a **Buy & Hold** line —
@@ -259,6 +304,19 @@ FILES
   chart (`session_chart.py`'s `bnh_index`), surfaced as a number so the text
   report and the chart share one frame of reference. It is a benchmark only, NOT
   part of the strategy's P&L.
+
+  **Session P&L chart — filled vs. unfilled markers:** an order marker sits at
+  the order's *dispatch* time regardless of whether it traded, so a LIMIT order
+  that was placed then cancelled (or never matched) would look identical to one
+  that actually moved the position. To remove that ambiguity the chart draws
+  **filled** orders as solid markers and **unfilled** ones (final
+  `executedQty == 0`) as hollow grey markers. The final outcome is read from
+  `exec_qty`, which `OrderExecutor.order_status_report()` enriches onto each
+  `placed_orders` record (from Binance `GET /api/v3/order`) before the chart is
+  built; an order with no `exec_qty` is assumed filled so a genuine fill is
+  never hidden. This explains why the strategy equity line stays flat at some
+  BUY/SELL markers (no fill → no position change) and moves at others (a fill
+  opened a position that was then marked to market while held).
 
 ## 6. EXECUTION  (execution/order_executor.py — OrderExecutor)
   Places orders via the Binance WebSocket API and maintains real-time balance
