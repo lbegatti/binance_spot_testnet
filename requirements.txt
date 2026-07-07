@@ -46,3 +46,7 @@ urllib3==2.6.3
 websocket-client==1.9.0
 websockets==16.0
 yarl==1.23.0
+
+# Testing — Tier B (Core) pytest suite (tests/); run: .venv314/bin/python -m pytest tests/
+pytest==9.1.1
+pytest-mock==3.15.1

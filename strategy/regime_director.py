@@ -43,6 +43,11 @@ class RegimeDirector:
     * ``obi_proxy``     — taker-flow imbalance proxy, rescaled to ``[-1, +1]``
       (``(taker_buy_base_vol / volume) × 2 − 1``).  Approximates the live OBI
       when full order-book history is unavailable.
+      NOTE: this is an **aggressor / taker-flow** imbalance, NOT the resting
+      bid/ask depth OBI used for micro candidate scoring in
+      ``strategy/book_utils.py`` (``(bq − aq) / total_depth``).  The two share
+      the "OBI" name but measure different quantities: taker flow is a noisier,
+      lower-frequency directional proxy suited to macro regime detection.
     * ``trade_density`` — trade fragmentation
       (``num_trades / volume``): high → many small trades (retail / HFT);
       low → few large trades (institutional blocks).
@@ -319,6 +324,21 @@ class RegimeDirector:
         train_end = max(2, int(n_rows * 2 / 3))
         train_features = features[:train_end]
 
+        # Feature-distribution sanity gate: warn when any feature is
+        # near-constant on the training slice.  A near-zero-variance column produces
+        # a degenerate z-score and pushes the covariance toward singular — the fit
+        # still proceeds (min_covar floor + seed retry absorb it) but the resulting
+        # regimes are low-information, so we surface it rather than fail silently.
+        _feat_std = train_features.std(axis=0)
+        if (_feat_std < 1e-8).any():
+            _flat = [HMM_FEATURE_COLS[i] for i, s in enumerate(_feat_std) if s < 1e-8]
+            logging.warning(
+                "RegimeDirector: near-zero-variance feature(s) %s on the %d-row "
+                "train slice — regimes may be low-information.",
+                _flat,
+                train_end,
+            )
+
         # --- feature scaling ---
         # Fit the scaler ONLY on the training rows so that the mean and std
         # of recent (held-out) candles cannot leak into the model.
@@ -399,7 +419,11 @@ class RegimeDirector:
 
                 # Valid, non-degenerate fit found for this n.
                 logging.info(
-                    "RegimeDirector: n=%d seed+%d  BIC=%.1f", n, seed_offset, bic
+                    "RegimeDirector: n=%d seed+%d  BIC=%.1f  converged=%s",
+                    n,
+                    seed_offset,
+                    bic,
+                    m.monitor_.converged,
                 )
                 if bic < best_hmm_bic:
                     best_hmm_bic, best_hmm_model = bic, m

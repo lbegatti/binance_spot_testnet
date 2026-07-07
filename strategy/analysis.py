@@ -533,9 +533,9 @@ class AnalysisEngine:
             # reversion target.  Skip BOTH BUY and SELL for this tick.
             # Backtest equivalent: pnl.py sets _skip_signals=True on bars
             # where trend_pause is True (see backtest/pnl.py around line 425).
-            # Note: an open position is not closed here — Fix 7's stop-loss
-            # is the safety net.  Until Fix 7 ships, an open position can be
-            # stranded by trend-pause until the cooldown ends.
+            # Note: an open position is not closed here — the adaptive stop-loss
+            # (checked earlier in this method) is the safety net; without it a
+            # position could be stranded by trend-pause until the cooldown ends.
             if trend_paused:
                 self._trend_pause_skips += 1
                 logging.info(
@@ -607,7 +607,7 @@ class AnalysisEngine:
                     # Ghost-position check: if the guard is armed but BTC balance
                     # is ~0, the limit BUY likely never filled (price moved away
                     # before the order matched).  Reset so the strategy can
-                    # re-enter on the next signal (audit Finding 7).
+                    # re-enter on the next signal.
                     if (
                         btc_balance < 0.0001
                         and not self.order_executor.has_pending_sell()
@@ -655,7 +655,7 @@ class AnalysisEngine:
                 # Regime gate applies only when flat (no open position).
                 # When _position_open is True the SELL closes an existing long,
                 # not a new short entry — blocking it would strand the position
-                # for the rest of the session (audit Finding 1).
+                # for the rest of the session.
                 if not self._position_open and (
                     current_regime == "trending_up"
                     or current_regime == "high_volatility"

@@ -31,7 +31,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # WebSocket session
 # ---------------------------------------------------------------------------
 DEFAULT_SESSION_MINUTES = 20  # default session length
-# at 10 min: ~600 low-latency iterations (every 1 s), ~10 historical runs (every 60 s)
+# at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 # Cadence of the REST balance-refresh daemon (driver-side, defense in depth).
@@ -67,6 +67,13 @@ LIVE_POSITION_STATE_PATH: str = "state/live_position.json"
 RECV_WINDOW = 5000  # ms — Binance REST request validity window
 SNAPSHOT_DEPTH = 100  # number of order book levels in the seed snapshot
 WS_SPEED = 100  # ms — WebSocket diff-depth update interval
+# Minimum seconds between local-book REST resyncs after a diff-depth gap /
+# reconnect.  When the diff stream drops an event, the first
+# update ID (U) of the next event exceeds lastUpdateId+1; MessageHandler then
+# re-pulls a fresh depth snapshot to rebuild local_book.  This cooldown prevents
+# a resync storm when several gapped events arrive in a burst — the book still
+# recovers on the next event after the interval elapses.
+DEPTH_RESYNC_MIN_INTERVAL_SEC: float = 2.0
 
 # ---------------------------------------------------------------------------
 # Quote calculation throttle

@@ -45,7 +45,7 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 
 | # | Script | Purpose | Typical runtime | Command |
 |---|--------|---------|----------------|---------|
-| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 10 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
+| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 20 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
 | 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
 | 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
@@ -132,7 +132,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Analysis cadence** | `HFT_INTERVAL` | `1` s | Time between low-latency evaluations |
 | **Analysis cadence** | `HIST_INTERVAL` | `60` s | Time between historical analyses (1 min) |
 | **Analysis cadence** | `MIN_SNAPSHOTS` | `100` | Minimum snapshots required before historical analysis runs |
-| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `10` min | Default session length (fixed — no startup prompt) |
+| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `20` min | Default session length (fixed — no startup prompt) |
 | **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `low_latency_analysis` thread on shutdown |
 | **WebSocket session** | `HIST_JOIN_TIMEOUT` | `15` s | Max wait for `historical_analysis` thread on shutdown |
 | **Binance connection** | `RECV_WINDOW` | `5000` ms | Binance REST request validity window |
@@ -218,6 +218,38 @@ For a compact per-category summary and the full per-module import list, see **[C
    # WebSocket (real-time)
    python websocket_main.py
    ```
+
+---
+
+## Running Tests
+
+A **Tier B (Core) pytest suite** covers the project's deterministic pure logic
+(order-book scoring, indicators, P&L simulation, parameter loading, and the
+shared state container). Tests make **no network calls** (Binance clients are
+mocked via `pytest-mock`) and write nothing outside pytest's `tmp_path`.
+
+```bash
+# Run against the canonical environment (.venv314 — matches requirements.txt)
+.venv314/bin/python -m pytest tests/ -q
+```
+
+**Coverage (44 tests):**
+
+| Test file | Module under test | Tests |
+|---|---|---|
+| `tests/test_book_utils.py` | `strategy/book_utils.py` | 12 |
+| `tests/test_indicators.py` | `strategy/indicators.py` | 9 |
+| `tests/test_param_loader.py` | `strategy/param_loader.py` | 8 |
+| `tests/test_pnl.py` | `backtest/pnl.py` | 7 |
+| `tests/test_order_book_state.py` | `core/order_book_state.py` | 5 |
+| `tests/test_signals.py` | `backtest/signals.py` (`_add_hmm_features`) | 3 |
+
+Tests pin **current** behaviour — a test that would need a source change to pass
+is treated as a finding, not a silent edit. Out of scope for Tier B (deferred to
+higher tiers): the HMM fit/predict path (`regime_director.py`), the live
+`AnalysisEngine` gate threads, the authenticated `OrderExecutor`, and full
+end-to-end backtest replays. Requires `pytest` + `pytest-mock` (pinned in
+`requirements.txt`).
 
 ---
 
@@ -366,7 +398,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 3. Consolidate non-BTC/USDT balances into USDT via market sell orders.
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
 5. Snapshot `btc_start_price` via `ticker_price(symbol)` and compute `start_total_usdt = usdt_balance + btc_balance × btc_start_price` — stored for the end-of-session P&L decomposition.
-6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (10 min) — no user prompt.
+6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (20 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) to seed `OrderBookState.local_book`.
 7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of **5-minute klines** (last 10 hours) via `HMM_INTERVAL` / `HMM_LOOKBACK`, fits `GaussianHMM` models for 2–3 states (from `HMM_MAX_REGIMES`), selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://ws-api.testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.

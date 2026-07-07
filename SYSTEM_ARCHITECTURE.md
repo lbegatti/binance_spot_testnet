@@ -75,8 +75,20 @@ FILES
   `thread_lock` (zero-qty levels are deleted; positive-qty levels are upserted),
   appends a best-bid/ask snapshot to `history_order_book` on every tick, and
   calls `calculate_best_quote()` every `QUOTE_EVERY_N_TICKS` (~1 s) to print
-  the live spread.  A stale-update guard discards any tick whose update ID is
-  ≤ `local_book["lastUpdateId"]`.
+  the live spread.  A stale-update guard discards any tick whose final update
+  ID `u` is ≤ `local_book["lastUpdateId"]`.
+
+  **Gap recovery / resync.**  Each event also carries a *first*
+  update ID `U`.  A healthy stream is contiguous (`U == lastUpdateId + 1`); if
+  `U > lastUpdateId + 1` the handler has missed one or more events (network
+  drop or reconnect) and `local_book` is no longer trustworthy.  It then
+  re-pulls a fresh `depth(limit=SNAPSHOT_DEPTH)` snapshot via the injected REST
+  client and rebuilds `bids/asks/lastUpdateId` under `thread_lock`, dropping the
+  gapped event (the next straddling event re-establishes the chain).  The resync
+  is **fail-safe** (a REST error keeps the current book and retries on the next
+  gap) and rate-limited by `DEPTH_RESYNC_MIN_INTERVAL_SEC` (default 2 s) so a
+  burst of gapped events cannot storm the REST endpoint.  The WS callback is
+  single-threaded, so no event buffering is required.
 
 ## 4. ANALYSIS ENGINE  (analysis.py — AnalysisEngine)
   Owns two background threads (started by `websocket_main.py`), both of which
@@ -384,3 +396,25 @@ FILES
 ## 7. BACKTESTING  (backtest/)
   Full design, pseudocode, data-flow diagrams, approximation caveats, and
   step-by-step implementation notes → **BACKTESTING.md**.
+
+## 8. TESTS  (tests/)
+  Tier B (Core) pytest suite — deterministic unit tests for the project's pure
+  logic.  No network calls (Binance clients mocked via pytest-mock); no writes
+  outside pytest's tmp_path.  Tests pin CURRENT behaviour.
+
+  tests/
+  ├── conftest.py                — project-root import shim + RNG seeding
+  ├── fixtures/
+  │   ├── fake_order_book.py     — {price: qty} → live {str: str} book builder
+  │   └── fake_klines.py         — OHLCV + signals DataFrame builders
+  ├── test_book_utils.py         — build_levels / collect_candidates / select_best (12)
+  ├── test_indicators.py         — VWAP, trend-pause, stop-loss, REST indicators (9)
+  ├── test_param_loader.py       — rows_to_lookback + best_params loader (8)
+  ├── test_pnl.py                — buy-and-hold, simulate_pnl, round-trips (7)
+  ├── test_order_book_state.py   — OrderBookState container (5)
+  └── test_signals.py            — _add_hmm_features (3)
+
+  Run:  .venv314/bin/python -m pytest tests/ -q      (44 tests)
+
+  Deferred to higher tiers: regime_director.py (HMM fit/predict), analysis.py
+  gate threads, order_executor.py (authenticated WS), end-to-end backtest replays.

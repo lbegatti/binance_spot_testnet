@@ -77,7 +77,10 @@ def _cache_path(
     issues with long or special-character strings, while keeping a
     human-readable prefix (``BTCUSDT_5m_<hash>.parquet``) for easy inspection.
     """
-    key = f"{symbol}|{interval}|{start_str}|{end_str or 'now'}"
+    # Include the current UTC date so a RELATIVE lookback string ("360 days ago
+    # UTC") maps to a fresh file each calendar day instead of serving a window
+    # up to 24 h stale.  Same-day runs still share the cache.
+    key = f"{symbol}|{interval}|{start_str}|{end_str or 'now'}|{time.strftime('%Y%m%d')}"
     slug = hashlib.md5(key.encode()).hexdigest()[:12]
     prefix = f"{symbol}_{interval}".replace(" ", "_")
     return _CACHE_DIR / f"{prefix}_{slug}.parquet"

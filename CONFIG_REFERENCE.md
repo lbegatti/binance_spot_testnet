@@ -12,9 +12,10 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `N_LEVELS` | 50 | Order book depth (50 bids + 50 asks) |
 | `MAX_ORDERS_PER_ITER` | 1 | Max orders placed per low-latency iteration |
 | `MIN_VWAP_HISTORY_SIZE` | 5 | Minimum snapshots for VWAP calculation |
-| `DEFAULT_SESSION_MINUTES` | 10 | Session duration (live trading) |
+| `DEFAULT_SESSION_MINUTES` | 20 | Session duration (live trading) |
 | `BALANCE_REFRESH_INTERVAL` | 60 s | Cadence of the driver-side REST balance-refresh daemon. Active only in REST-only mode (WS user-data push down): polls `account()` so balances and the equity chart stay current during idle stretches. No-op when the WS push is healthy. |
 | `FLATTEN_ON_START` | `False` | Startup inventory policy. `True` = MARKET-sell inherited BTC so the session starts flat (matches `BACKTEST_INITIAL_BTC = 0`; per-session skill test, report component B ≡ 0). `False` = carry inherited BTC across restarts; the position guard pre-arms on it and report component B attributes its market drift. While `False`, a carried position's stop-loss is anchored at the session-start price until position persistence (Phase 2) is added. |
+| `DEPTH_RESYNC_MIN_INTERVAL_SEC` | 2.0 s | Minimum interval between local-book REST resyncs after a diff-depth gap/reconnect. When the diff stream drops an event, the next event's first update ID `U` exceeds `lastUpdateId + 1`; `MessageHandler` re-pulls a fresh `depth()` snapshot to rebuild `local_book`. The cooldown prevents a resync storm on a burst of gapped events (the book still recovers on the next event after the interval). |
 
 ## HMM Regime Detection
 

@@ -151,7 +151,7 @@ _PARAM_GRID: dict[str, list[Any]] = {
 
 _OPTUNA_SPACE: dict[str, tuple] = {
     "hmm_lookback_rows": ("int", 30, 240, 10),
-    "hmm_max_regimes": ("int", 2, 4, 1),
+    "hmm_max_regimes": ("int", 2, 3, 1),  # matches HMM_MAX_REGIMES = len(features)-1 = 3
     "vwap_window": (
         "int",
         5,
@@ -981,7 +981,7 @@ def run_sensitivity(
     Parameters
     ----------
     full_grid : bool
-        If ``True`` (default), run the full 36-combination factorial grid.
+        If ``True`` (default), run the full 30-combination factorial grid.
         If ``False``, run the OAT sweep (8 combinations, ~15–35 min).
     lookback : str | None
         dateutil string overriding ``BACKTEST_LOOKBACK`` (IS start) for this

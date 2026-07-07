@@ -1,9 +1,15 @@
 import json
 import logging
+import time
 
 from strategy.best_quote_calculator import calculate_best_quote
 from core.order_book_state import OrderBookState
-from config_parameters import QUOTE_EVERY_N_TICKS
+from config_parameters import (
+    QUOTE_EVERY_N_TICKS,
+    SYMBOL,
+    SNAPSHOT_DEPTH,
+    DEPTH_RESYNC_MIN_INTERVAL_SEC,
+)
 
 
 class MessageHandler:
@@ -37,16 +43,36 @@ class MessageHandler:
             construction and also consumed by ``AnalysisEngine``.
     """
 
-    def __init__(self, state: OrderBookState):
+    def __init__(
+        self,
+        state: OrderBookState,
+        rest_client=None,
+        symbol: str = SYMBOL,
+        snapshot_depth: int = SNAPSHOT_DEPTH,
+    ):
         """
         Args:
             state (OrderBookState): The shared order book and balance state
                 instance that provides ``local_book``, ``history_order_book``,
                 ``thread_lock``, ``balance_status``, and
                 ``thread_balance_lock``.
+            rest_client: Optional ``binance.spot.Spot`` client used to re-pull a
+                fresh depth snapshot when a diff-depth gap or reconnect is
+                detected.  ``None`` disables resync — the handler
+                then logs the gap and keeps the (possibly stale) book.
+            symbol (str): Trading pair for the resync ``depth()`` call.
+            snapshot_depth (int): Number of levels requested in the resync
+                snapshot (``SNAPSHOT_DEPTH``).
         """
         self.state = state
+        self.rest_client = rest_client
+        self.symbol = symbol
+        self.snapshot_depth = snapshot_depth
         self._tick_count: int = 0
+        # Diff-depth gap recovery: count resyncs for the
+        # end-of-session log and rate-limit them via a cooldown anchor.
+        self._resync_count: int = 0
+        self._last_resync_ts: float = 0.0
 
     def handle_depth_message(self, _, message):
         """
@@ -83,8 +109,29 @@ class MessageHandler:
         if "result" in data and "b" not in data:
             logging.info("WebSocket subscription confirmed.")
             return
-        # SYNC LOGIC: Ignore updates that are older than our snapshot
-        if data["u"] <= self.state.local_book["lastUpdateId"]:
+        # ── Diff-depth ordering + gap recovery ──────────────────────────────
+        # Reads of lastUpdateId outside thread_lock are safe: this callback is
+        # the ONLY writer of local_book (single-threaded WS dispatch), so the
+        # read cannot race a concurrent write.
+        u = data["u"]  # final update id of this event
+        U = data.get("U")  # first update id (absent on legacy / non-diff frames)
+        last = self.state.local_book["lastUpdateId"]
+
+        # Stale / duplicate — this event was already applied.
+        if u <= last:
+            return
+
+        # Gap: a healthy stream has U == last + 1.  U > last + 1 means one or
+        # more events were dropped (network hiccup / reconnect) and local_book is
+        # now inconsistent — re-seed it from a fresh REST snapshot (cooldown-
+        # guarded) and drop this event; the straddling event re-establishes the
+        # chain.  U is None only on frames without the field — fall back to the
+        # legacy "apply anything newer" behaviour there.
+        if U is not None and U > last + 1:
+            now = time.time()
+            if now - self._last_resync_ts >= DEPTH_RESYNC_MIN_INTERVAL_SEC:
+                self._last_resync_ts = now
+                self._resync_from_snapshot(U=U, last=last)
             return
         # 1. Logic to sync with lastUpdateId goes here
         # 2. Update local_book dictionary — bids ('b') and asks ('a')
@@ -131,6 +178,55 @@ class MessageHandler:
             self._tick_count += 1
             if self._tick_count % QUOTE_EVERY_N_TICKS == 0:
                 calculate_best_quote(self.state.local_book)
+
+    def _resync_from_snapshot(self, U: int, last: int) -> bool:
+        """
+        Rebuild ``local_book`` from a fresh REST depth snapshot after a
+        diff-depth gap or reconnect.
+
+        Called by :meth:`handle_depth_message` when an event's first update ID
+        (``U``) exceeds ``lastUpdateId + 1`` — i.e. one or more events were
+        missed and the incremental book can no longer be trusted.
+
+        Fail-safe: never raises.  Returns ``False`` (and keeps the current book)
+        when no REST client is available or the snapshot fetch fails; the next
+        gapped event retries after the cooldown.
+
+        Args:
+            U (int): First update ID of the event that exposed the gap (logged).
+            last (int): Local ``lastUpdateId`` at detection time (logged).
+
+        Returns:
+            bool: ``True`` if the book was rebuilt, ``False`` otherwise.
+        """
+        if self.rest_client is None:
+            logging.warning(
+                "Depth gap (U=%s, lastUpdateId=%s) but no REST client — cannot "
+                "resync; continuing with the current book.",
+                U,
+                last,
+            )
+            return False
+        try:
+            snap = self.rest_client.depth(symbol=self.symbol, limit=self.snapshot_depth)
+        except Exception as exc:
+            logging.warning(
+                "Depth resync snapshot failed (%s) — retrying on the next gap.",
+                exc,
+            )
+            return False
+        with self.state.thread_lock:
+            self.state.local_book["bids"] = {p: q for p, q in snap["bids"]}
+            self.state.local_book["asks"] = {p: q for p, q in snap["asks"]}
+            self.state.local_book["lastUpdateId"] = snap["lastUpdateId"]
+        self._resync_count += 1
+        logging.warning(
+            "Local book resynced from REST snapshot after depth gap "
+            "(new lastUpdateId=%s, resync #%d).",
+            snap["lastUpdateId"],
+            self._resync_count,
+        )
+        return True
 
     # def handle_balance_message(self, _, message):
     #     """

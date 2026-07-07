@@ -313,9 +313,9 @@ def refresh_stop_loss_pct() -> float | None:
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
-# At the default of 10 min the engine runs:
-#   • low_latency_analysis → 10 × 60 / 1  =  600 iterations  (every 1 s)
-#   • historical_analysis  → 10 × 60 / 60 =   10 iterations  (every 60 s / 1 min)
+# At the default of 20 min the engine runs:
+#   • low_latency_analysis → 20 × 60 / 1  = 1200 iterations  (every 1 s)
+#   • historical_analysis  → 20 × 60 / 60 =   20 iterations  (every 60 s / 1 min)
 
 session_minutes = DEFAULT_SESSION_MINUTES
 session_seconds = session_minutes * 60
@@ -367,7 +367,7 @@ stop_event = threading.Event()
 # ---------------------------------------------------------------------------
 # 5. Instantiate engine and handler
 # ---------------------------------------------------------------------------
-handler = MessageHandler(state=state)
+handler = MessageHandler(state=state, rest_client=rest_client)
 
 # OrderExecutor owns its own WebSocket API connection for lower-latency
 # order placement.  On connection open it sends session.logon (HMAC-signed)
@@ -498,9 +498,9 @@ logging.info("Analysis threads started. Running for %d minute(s)...\n", session_
 # 7. Block the main thread for the session duration, then shut down cleanly
 # ---------------------------------------------------------------------------
 try:
-    threading.Event().wait(
+    stop_event.wait(
         timeout=session_seconds
-    )  # interruptible by KeyboardInterrupt
+    )  # interruptible by KeyboardInterrupt; also wakes if stop_event is set early
 except KeyboardInterrupt:
     logging.info("KeyboardInterrupt received — shutting down early.")
 finally:

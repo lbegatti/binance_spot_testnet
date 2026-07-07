@@ -135,14 +135,14 @@ def run_signals(
         Defaults to ``VWAP_WINDOW`` (5).
     refit_every : int | None
         Full BIC re-fit cadence counted in **5-minute macro bars**.
-        Defaults to ``REFIT_EVERY`` (120 → re-fit every 10 h).
+        Defaults to ``REFIT_EVERY`` (480 → re-fit every 40 h).
     predict_every : int | None
         Cheap Viterbi pass cadence in macro bars.  Sensitivity sweeps
         may pass a higher value to cut Viterbi overhead.  Default 1
         (predict every macro bar).
     vwap_threshold : float | None
         Minimum fractional dip / rally around VWAP before a signal fires.
-        Defaults to ``VWAP_THRESHOLD_MULTIPLIER`` (0.003 → 0.30 % dead
+        Defaults to ``VWAP_THRESHOLD_MULTIPLIER`` (0.002 → 0.20 % dead
         zone).
     trend_consecutive_bars : number of consecutive bar closes in the same
         direction required to trigger the trend-pause flag.
@@ -239,7 +239,23 @@ def run_signals(
 
     rd = RegimeDirector(max_regimes=_max_regimes)
     rd.klines_df = features_macro.iloc[:_lookback]
-    rd.select_hmm_model()
+    try:
+        rd.select_hmm_model()
+    except RuntimeError as exc:
+        # The initial warm-up slice can be too flat/low-variance to fit
+        # (unlike the rolling refit in the loop below, which keeps the previous model
+        # on failure — here there is no previous model to fall back on).  Re-raise with
+        # context instead of the raw hmmlearn error so the failure is diagnosable.
+        # We deliberately do NOT widen the window forward: that would train the seed on
+        # bars that are future relative to the first labelled timestamp (index
+        # _lookback), introducing look-ahead bias into the warm-up stretch.
+        _win = rd.klines_df
+        raise RuntimeError(
+            f"Initial HMM fit failed on the first {len(_win)}-row warm-up window "
+            f"({_win.index[0]} … {_win.index[-1]}): {exc}.  The window is likely too "
+            f"flat/low-variance to fit up to {_max_regimes} regimes — try a larger "
+            f"hmm_lookback_rows or a different backtest window."
+        ) from exc
     rd.assign_regime_labels()
     logging.info(
         "Initial HMM fit on 5 m bars — regime: '%s' (confidence: %.2f)",
@@ -372,7 +388,7 @@ def run_signals(
 
     # Tracks whether a strategy BUY has been dispatched without a matching SELL.
     # Mirrors _position_open in analysis.py — used to bypass the SELL regime gate
-    # for exits (audit Finding 1 fix).
+    # for exits.
     #
     # KNOWN LIMITATION — stop-loss divergence
     # ----------------------------------------
@@ -492,7 +508,7 @@ def run_signals(
                     _sim_position_open = True  # track simulated open position
 
             if best_sell and best_sell_micro is not None and signal == 0:
-                # Regime gate applies only when flat — mirrors analysis.py fix (audit Finding 1).
+                # Regime gate applies only when flat — mirrors the analysis.py exit-bypass behaviour.
                 # When _sim_position_open is True this SELL is an exit close, not a new
                 # short entry — blocking it would strand the position in trending markets.
                 regime_ok = _sim_position_open or regime not in (
