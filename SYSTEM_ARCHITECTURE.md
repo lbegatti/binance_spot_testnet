@@ -1,7 +1,8 @@
 # SYSTEM ARCHITECTURE: MULTI-TIMEFRAME ORDER BOOK STRATEGY
 
 -----------------------------------------------------------------------------
-SYMBOL    : BTCUSDT  (production WebSocket stream / testnet REST client)
+SYMBOL    : BTCUSDT  (market data: production stream + production REST snapshots,
+                      keyless — trading/account: authenticated testnet REST/WS API)
 CURRENCY  : USDT  |  CRYPTO CCY : BTC
 
 FILES
@@ -83,7 +84,13 @@ FILES
   `U > lastUpdateId + 1` the handler has missed one or more events (network
   drop or reconnect) and `local_book` is no longer trustworthy.  It then
   re-pulls a fresh `depth(limit=SNAPSHOT_DEPTH)` snapshot via the injected REST
-  client and rebuilds `bids/asks/lastUpdateId` under `thread_lock`, dropping the
+  client — the keyless PRODUCTION `market_data_client`, which MUST come from
+  the same exchange as the diff stream: update IDs form one continuous
+  sequence only within a single exchange, and a mismatched pair (prod stream +
+  testnet snapshots, as wired before 2026-07-09) silently discards every
+  stream frame, degrades the book to a 2 s REST poll, and starves the VWAP
+  deque so the VWAP gate never activates —
+  and rebuilds `bids/asks/lastUpdateId` under `thread_lock`, dropping the
   gapped event (the next straddling event re-establishes the chain).  The resync
   is **fail-safe** (a REST error keeps the current book and retries on the next
   gap) and rate-limited by `DEPTH_RESYNC_MIN_INTERVAL_SEC` (default 2 s) so a
@@ -131,8 +138,11 @@ FILES
                                              REST client touches this class.
     _refresh_stop_loss_fn : Callable | None — closure injected by websocket_main.py
                                              that re-computes the threshold from
-                                             daily klines.  Called once per UTC
-                                             day from historical_analysis().
+                                             PRODUCTION daily klines (keyless
+                                             market_data_client — mirrors
+                                             backtest/signals.py, which uses
+                                             production data).  Called once per
+                                             UTC day from historical_analysis().
     _stop_loss_lock       : Lock          — serialises _stop_loss_state
     _avg_entry_price      : float         — VWAP entry price of the open
                                              strategy position (0.0 when flat);
@@ -167,9 +177,16 @@ FILES
          if _trend_paused is True), **VWAP gate** (mean-reversion dead zone,
          δ = 0.002), **HMM regime direction filter**, then delegates to
          OrderExecutor.execute().  The BUY-side ghost-position reset (guard armed
-         but free BTC ≈ 0 ⇒ assume the LIMIT BUY never filled) fires ONLY when no
-         LIMIT SELL is resting — otherwise the BTC is merely locked in that exit,
-         and disarming would orphan it (cancel_stale_sell is gated on the guard).
+         but free BTC ≈ 0 ⇒ assume the LIMIT BUY never filled) fires ONLY when
+         ALL three conditions hold: (1) no LIMIT SELL is resting — the BTC would
+         merely be locked in that exit, and disarming would orphan it
+         (cancel_stale_sell is gated on the guard); (2) no BUY is unresolved — a
+         resting or just-filled LIMIT BUY is resolved by cancel_stale_buy after
+         its 10 s window, NOT here (disarming earlier re-fired the same signal
+         every tick and stacked 8 duplicate BUYs in 14 s on 2026-07-08); and
+         (3) a FRESH REST balance read (OrderExecutor.refresh_and_check_flat)
+         confirms the account is truly flat — the guard is never disarmed on a
+         balance snapshot up to 60 s old.
 
   ▸ historical_analysis()  [every HIST_INTERVAL = 60 s]
       Always recomputes bid_vwap / ask_vwap from history_order_book and
@@ -254,8 +271,18 @@ FILES
   `None` on the first low-latency tick), opens the WebSocket stream, starts the
   two analysis threads **plus a REST balance-refresh daemon**, blocks for
   `DEFAULT_SESSION_MINUTES`, then shuts down cleanly (stop_event →
-  ws_client.stop() → executor.stop() → thread joins → order report → session P&L
-  chart → balance P&L decomposition → position-state save).
+  ws_client.stop() → executor.stop() → thread joins → cancel of the session's
+  still-open orders → order report → session P&L chart → balance P&L
+  decomposition → position-state save).
+
+  **Shutdown order cancel (`OrderExecutor.cancel_session_open_orders`):** after
+  the threads join, every order THIS session placed that is still open on the
+  book is cancelled via REST, so no funds stay locked (and no unattended fills
+  happen) once the session ends — on 2026-07-08, 38 resting BUYs held ~305k
+  USDT locked at shutdown and 13 of them filled unattended afterwards.  Only
+  the session's own orderIds are touched; foreign open orders on the shared
+  testnet account are left alone.  The order report that follows shows these
+  orders as CANCELED rather than OPEN.
 
   **REST balance-refresh daemon (`BALANCE_REFRESH_INTERVAL`, default 60 s):**
   the WS user-data push (`outboundAccountPosition` over
@@ -308,6 +335,13 @@ FILES
   — in a flat market it places **zero orders all session**. The pre-arm logic
   (below) is shared by both the `False` path and that fallback.
 
+  **End-of-session report — balance valuation:** the final balances are valued
+  free + locked, minus the foreign locked captured at session start (the same
+  `locked_*_at_start` correction the equity chart applies), so funds resting in
+  the strategy's own open LIMIT orders still count.  Free-only valuation
+  counted them as gone — the 2026-07-08 session printed -98.97% when the true
+  result was +0.025%.
+
   **End-of-session report — Buy & Hold benchmark:** alongside the `A + B = Total`
   P&L decomposition, the balance report prints a **Buy & Hold** line —
   `(btc_end / btc_start − 1) × 100` — i.e. what the whole starting equity would
@@ -334,7 +368,14 @@ FILES
   Places orders via the Binance WebSocket API and maintains real-time balance
   via `outboundAccountPosition` push events (session.logon → userDataStream.subscribe),
   eliminating the need for a listenKey.  Falls back to REST if the WebSocket
-  handshake fails.
+  handshake fails.  Because the client's `on_open` callback fires from the
+  socket thread DURING the `SpotWebsocketAPIClient` constructor — before
+  `ws_api_client` is assigned — the first `session.logon` attempt can be
+  silently swallowed (its `if ws_api_client is None: return` guard trips);
+  `__init__` therefore re-sends the logon after construction when `_logon_id`
+  is still `None`.  Without this retry the user-data stream never activates
+  and balances degrade to 60 s REST polls for the whole session (observed
+  2026-07-08).
 
   **Order types per side:**
   - **BUY**: LIMIT GTC — dip-buy sits on the book until filled or cancelled.

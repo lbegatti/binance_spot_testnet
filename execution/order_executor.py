@@ -130,6 +130,15 @@ class OrderExecutor:
                 on_open=self._on_ws_open,
             )
             logging.info("WebSocket API client connected: %s", stream_url)
+            # _on_ws_open fires from the socket thread DURING the constructor
+            # above, while self.ws_api_client is still None — so its
+            # _send_session_logon() call no-ops silently and the user-data
+            # stream never activates (observed all session on 2026-07-08:
+            # "sending session.logon" logged, "session.logon sent" never).
+            # Retry here, now that the attribute is assigned; _logon_id is
+            # still None exactly when the first attempt was swallowed.
+            if self._logon_id is None:
+                self._send_session_logon()
         except Exception as e:
             logging.warning(
                 "WebSocket API unavailable (%s: %s). "
@@ -411,12 +420,44 @@ class OrderExecutor:
                 self._pending_buy_id,
                 e,
             )
+            # Pull the fill into the balance state immediately so the ghost-
+            # position check next tick sees the BTC and does not disarm.
+            self._refresh_balance_rest()
             self._pending_buy_placed_at = None  # don't retry on every tick
             return False
+
+    def has_pending_buy(self) -> bool:
+        """True while a LIMIT GTC BUY is dispatched and unresolved."""
+        return self._pending_buy_placed_at is not None
 
     def has_pending_sell(self) -> bool:
         """True while a non-urgent LIMIT GTC SELL is resting and unresolved."""
         return self._pending_sell_placed_at is not None
+
+    def refresh_and_check_flat(self, min_qty: float = 0.0001) -> bool:
+        """
+        Refresh balances from REST, then report whether the account holds no
+        BTC (free + locked below ``min_qty``).
+
+        Used by the AnalysisEngine's ghost-position check so the position
+        guard is only disarmed on a CONFIRMED-fresh flat balance — never on a
+        stale snapshot (the 2026-07-08 session disarmed 161 times on balances
+        up to 60 s old and re-bought the same signal 8× in 14 s).
+
+        Args:
+            min_qty (float): BTC total below which the account counts as flat.
+
+        Returns:
+            bool: ``True`` when the freshly-read BTC total is below
+                ``min_qty``; ``False`` otherwise (or when only a stale
+                balance is available and it shows BTC on the account).
+        """
+        self._refresh_balance_rest()
+        with self.state.thread_balance_lock:
+            btc_total = self.state.balance_status.get(
+                CRYPTOCCY, 0.0
+            ) + self.state.balance_locked.get(CRYPTOCCY, 0.0)
+        return btc_total < min_qty
 
     def cancel_stale_sell(self, timeout_sec: float = 10.0) -> str | None:
         """
@@ -924,6 +965,64 @@ class OrderExecutor:
                 "LIMIT %s skipped: no WebSocket API client and no REST client available.",
                 strategy,
             )
+
+    def cancel_session_open_orders(self) -> None:
+        """
+        Cancel every order placed by THIS session that is still open on the
+        book, so no funds stay locked (and no unattended fills happen) after
+        the session ends.
+
+        Only the session's own orderIds are cancelled — pre-existing (foreign)
+        open orders on the shared testnet account are left untouched.
+        Fail-safe: every failure is logged and skipped; never raises.
+        """
+        if self.rest_client is None or not self.placed_orders:
+            return
+        try:
+            open_orders = self.rest_client.get_open_orders(
+                symbol=SYMBOL, recvWindow=RECV_WINDOW
+            )
+        except Exception as e:
+            logging.warning(
+                "Shutdown cancel: could not fetch open orders (%s) — "
+                "session orders may remain on the book.",
+                e,
+            )
+            return
+        session_ids = {r.get("orderId") for r in self.placed_orders}
+        to_cancel = [o for o in open_orders if o.get("orderId") in session_ids]
+        if not to_cancel:
+            logging.info("Shutdown cancel: no session orders left open.")
+            return
+        cancelled = failed = 0
+        freed_usdt = freed_btc = 0.0
+        for o in to_cancel:
+            try:
+                self.rest_client.cancel_order(
+                    symbol=SYMBOL, orderId=o["orderId"], recvWindow=RECV_WINDOW
+                )
+                remaining = float(o["origQty"]) - float(o["executedQty"])
+                if o.get("side") == "BUY":
+                    freed_usdt += remaining * float(o["price"])
+                else:
+                    freed_btc += remaining
+                cancelled += 1
+            except Exception as e:
+                failed += 1
+                logging.warning(
+                    "Shutdown cancel of order %s failed (%s).", o.get("orderId"), e
+                )
+        logging.info(
+            "Shutdown cancel: %d session order(s) cancelled (%d failed) — "
+            "freed ≈ %.2f %s + %.6f %s from locked.",
+            cancelled,
+            failed,
+            freed_usdt,
+            CCY,
+            freed_btc,
+            CRYPTOCCY,
+        )
+        self._refresh_balance_rest()
 
     def stop(self) -> None:
         """

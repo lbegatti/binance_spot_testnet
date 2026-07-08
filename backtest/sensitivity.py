@@ -151,7 +151,12 @@ _PARAM_GRID: dict[str, list[Any]] = {
 
 _OPTUNA_SPACE: dict[str, tuple] = {
     "hmm_lookback_rows": ("int", 30, 240, 10),
-    "hmm_max_regimes": ("int", 2, 3, 1),  # matches HMM_MAX_REGIMES = len(features)-1 = 3
+    "hmm_max_regimes": (
+        "int",
+        2,
+        3,
+        1,
+    ),  # matches HMM_MAX_REGIMES = len(features)-1 = 3
     "vwap_window": (
         "int",
         5,

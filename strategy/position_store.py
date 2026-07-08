@@ -117,13 +117,17 @@ def load_position(path: str, *, symbol: str | None = None) -> dict | None:
     if data.get("schema") != _SCHEMA_VERSION:
         log.warning(
             "Position state %s has schema %s (expected %s) — ignoring.",
-            path, data.get("schema"), _SCHEMA_VERSION,
+            path,
+            data.get("schema"),
+            _SCHEMA_VERSION,
         )
         return None
     if symbol is not None and data.get("symbol") != symbol:
         log.warning(
             "Position state %s is for %s, not %s — ignoring.",
-            path, data.get("symbol"), symbol,
+            path,
+            data.get("symbol"),
+            symbol,
         )
         return None
     return data

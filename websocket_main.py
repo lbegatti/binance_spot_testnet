@@ -72,6 +72,16 @@ rest_client = Client(
     api_secret,
     base_url="https://testnet.binance.vision",
 )
+# Market-data REST client — PRODUCTION, keyless (public endpoints only).
+# The local book streams from the production diff-depth stream, so its seed
+# snapshot and gap-recovery snapshots must come from the production REST book
+# too: update IDs form one continuous sequence only within a single exchange.
+# (Mixing the prod stream with testnet snapshots put every frame ~5,000× out
+# of sequence — 7,297 resyncs on 2026-07-08, ALL stream data discarded and
+# the VWAP gate never activated.)  Signals thus read the real market, like
+# the HMM klines and the backtest already do; all account and trading calls
+# stay on the authenticated testnet rest_client.
+market_data_client = Client(base_url="https://api.binance.com")
 # ---------------------------------------------------------------------------
 # NOTE on balance tracking:
 # The old listenKey / User Data Stream mechanism was discontinued by Binance
@@ -267,8 +277,10 @@ except Exception as e:
 # (reader).  This keeps AnalysisEngine decoupled from Binance — it never
 # imports the REST client; it only ever reads a float.
 try:
+    # Production daily klines (market_data_client) — mirrors backtest/signals.py,
+    # which computes the same threshold from production data.
     _initial_sl_pct = compute_live_stop_loss_pct(
-        rest_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
+        market_data_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
     )
     logging.info(
         "Adaptive stop-loss threshold at session start: %.4f%% "
@@ -303,7 +315,7 @@ def refresh_stop_loss_pct() -> float | None:
     """
     try:
         return compute_live_stop_loss_pct(
-            rest_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
+            market_data_client, SYMBOL, STOP_LOSS_ROLLING_DAYS, STOP_LOSS_STD_MULT
         )
     except Exception as exc:
         logging.warning("Stop-loss daily refresh failed: %s", exc)
@@ -331,7 +343,7 @@ logging.info(
 # ---------------------------------------------------------------------------
 logging.info("Fetching order book snapshot...")
 # noinspection PyArgumentList
-snapshot = rest_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
+snapshot = market_data_client.depth(symbol=SYMBOL, limit=SNAPSHOT_DEPTH)
 
 # OrderBookState is the single source of truth shared by MessageHandler and
 # AnalysisEngine.  Both classes receive the same instance so they operate on
@@ -367,7 +379,7 @@ stop_event = threading.Event()
 # ---------------------------------------------------------------------------
 # 5. Instantiate engine and handler
 # ---------------------------------------------------------------------------
-handler = MessageHandler(state=state, rest_client=rest_client)
+handler = MessageHandler(state=state, rest_client=market_data_client)
 
 # OrderExecutor owns its own WebSocket API connection for lower-latency
 # order placement.  On connection open it sends session.logon (HMAC-signed)
@@ -473,10 +485,13 @@ balance_refresh_thread = threading.Thread(
 # ---------------------------------------------------------------------------
 # 6. Open WebSocket stream
 # ---------------------------------------------------------------------------
-# NOTE: The Binance Spot Testnet does not support WebSocket market-data streams.
-# We use the production stream endpoint for real-time depth data (read-only, no auth).
-# Trading orders and balance updates are routed through the testnet WebSocket API
-# connection owned by OrderExecutor.
+# PRODUCTION diff-depth stream (the SpotWebsocketStreamClient default;
+# read-only, no auth — account type is irrelevant for market data).  It MUST
+# be paired with the production market_data_client above for the seed and
+# resync snapshots: update IDs only form a continuous sequence within one
+# exchange, and a mismatched pair silently discards every stream frame.
+# Trading orders and balance updates are routed through the TESTNET WebSocket
+# API connection owned by OrderExecutor.
 ws_client = SpotWebsocketStreamClient(
     on_message=handler.handle_depth_message,
 )
@@ -513,6 +528,13 @@ finally:
     hist_thread.join(timeout=HIST_JOIN_TIMEOUT)
     balance_refresh_thread.join(timeout=HTF_JOIN_TIMEOUT)
     logging.info("All threads stopped. Exiting.")
+
+    # -----------------------------------------------------------------------
+    # Cancel the session's still-open orders (frees locked funds; prevents
+    # unattended fills after shutdown — e.g. 38 resting BUYs holding ~305k
+    # USDT locked on 2026-07-08, 13 of which filled after the session ended)
+    # -----------------------------------------------------------------------
+    executor.cancel_session_open_orders()
 
     # -----------------------------------------------------------------------
     # Stop-loss summary
@@ -564,13 +586,18 @@ finally:
     # -----------------------------------------------------------------------
     try:
         final_info = rest_client.account(recvWindow=RECV_WINDOW)
+        # free + locked: funds resting in the strategy's own open LIMIT orders
+        # still belong to the portfolio (free-only under-reported the session
+        # by the full locked amount, e.g. -98.97% on 2026-07-08).  Foreign
+        # locked captured at session start is subtracted, mirroring the equity
+        # chart's locked_*_at_start correction.
         final_balances = {
-            item["asset"]: float(item["free"])
+            item["asset"]: float(item["free"]) + float(item["locked"])
             for item in final_info["balances"]
             if item["asset"] in (CCY, CRYPTOCCY)
         }
-        final_usdt = final_balances.get(CCY, 0.0)
-        final_btc = final_balances.get(CRYPTOCCY, 0.0)
+        final_usdt = final_balances.get(CCY, 0.0) - locked_usdt_at_start
+        final_btc = final_balances.get(CRYPTOCCY, 0.0) - locked_btc_at_start
         d_usdt = final_usdt - usdt_balance
         d_btc = final_btc - btc_balance
 

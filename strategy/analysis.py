@@ -608,17 +608,22 @@ class AnalysisEngine:
                     # is ~0, the limit BUY likely never filled (price moved away
                     # before the order matched).  Reset so the strategy can
                     # re-enter on the next signal.
+                    #
+                    # Three conditions must ALL hold before disarming:
+                    #   1. no resting LIMIT SELL — its locked BTC reads as free≈0
+                    #      (disarming would orphan the exit for the session);
+                    #   2. no unresolved BUY — a resting/just-filled LIMIT BUY is
+                    #      handled by cancel_stale_buy() after its 10 s window,
+                    #      NOT here (disarming early re-fires the same signal
+                    #      every tick: 8 duplicate BUYs in 14 s on 2026-07-08);
+                    #   3. a FRESH REST balance confirms the account is truly
+                    #      flat — never disarm on a snapshot up to 60 s old.
                     if (
                         btc_balance < 0.0001
                         and not self.order_executor.has_pending_sell()
+                        and not self.order_executor.has_pending_buy()
+                        and self.order_executor.refresh_and_check_flat()
                     ):
-                        # Genuine ghost: guard armed, free BTC ≈ 0, AND no planned
-                        # exit resting → the LIMIT BUY never filled.  Reset so the
-                        # strategy can re-enter on the next signal.
-                        # If a LIMIT SELL exit IS resting, the BTC is LOCKED in it
-                        # (free reads 0 but the position is real) — do NOT disarm,
-                        # or cancel_stale_sell() (gated on _position_open) would
-                        # orphan the resting exit for the rest of the session.
                         self._position_open = False
                         logging.info(
                             "HFT #%d [buy] — position guard reset: armed but BTC "
