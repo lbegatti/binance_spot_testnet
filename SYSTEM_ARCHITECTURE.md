@@ -452,10 +452,11 @@ FILES
   ├── test_indicators.py         — VWAP, trend-pause, stop-loss, REST indicators (9)
   ├── test_param_loader.py       — rows_to_lookback + best_params loader (8)
   ├── test_pnl.py                — buy-and-hold, simulate_pnl, round-trips (7)
+  ├── test_message_handler.py    — depth-diff apply + gap-recovery resync (7)
   ├── test_order_book_state.py   — OrderBookState container (5)
   └── test_signals.py            — _add_hmm_features (3)
 
-  Run:  .venv314/bin/python -m pytest tests/ -q      (44 tests)
+  Run:  .venv314/bin/python -m pytest tests/ -q      (51 tests)
 
   Deferred to higher tiers: regime_director.py (HMM fit/predict), analysis.py
   gate threads, order_executor.py (authenticated WS), end-to-end backtest replays.

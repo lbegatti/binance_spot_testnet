@@ -224,16 +224,17 @@ For a compact per-category summary and the full per-module import list, see **[C
 ## Running Tests
 
 A **Tier B (Core) pytest suite** covers the project's deterministic pure logic
-(order-book scoring, indicators, P&L simulation, parameter loading, and the
-shared state container). Tests make **no network calls** (Binance clients are
-mocked via `pytest-mock`) and write nothing outside pytest's `tmp_path`.
+(order-book scoring, indicators, P&L simulation, parameter loading, the shared
+state container, and the WebSocket depth-message / gap-recovery handler). Tests
+make **no network calls** (Binance clients are mocked via `pytest-mock`) and
+write nothing outside pytest's `tmp_path`.
 
 ```bash
 # Run against the canonical environment (.venv314 — matches requirements.txt)
 .venv314/bin/python -m pytest tests/ -q
 ```
 
-**Coverage (44 tests):**
+**Coverage (51 tests):**
 
 | Test file | Module under test | Tests |
 |---|---|---|
@@ -241,6 +242,7 @@ mocked via `pytest-mock`) and write nothing outside pytest's `tmp_path`.
 | `tests/test_indicators.py` | `strategy/indicators.py` | 9 |
 | `tests/test_param_loader.py` | `strategy/param_loader.py` | 8 |
 | `tests/test_pnl.py` | `backtest/pnl.py` | 7 |
+| `tests/test_message_handler.py` | `core/message_handler.py` | 7 |
 | `tests/test_order_book_state.py` | `core/order_book_state.py` | 5 |
 | `tests/test_signals.py` | `backtest/signals.py` (`_add_hmm_features`) | 3 |
 
