@@ -30,7 +30,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 250  # default session length
+DEFAULT_SESSION_MINUTES = 20  # default session length
 # at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
@@ -247,7 +247,7 @@ BACKTEST_FEE_RATE = 0.001  # 0.10 %
 # Annualised risk-free rate for Sharpe / Sortino.
 # pnl.py converts this to a per-period rate automatically.
 # Set to 0.04–0.05 for a US T-bill proxy;
-BACKTEST_RISK_FREE_RATE = 0.00  # annualised (0.0 = no risk-free rate adjustment)
+BACKTEST_RISK_FREE_RATE = 0.04  # annualised (0.0 = no risk-free rate adjustment)
 
 # Fill-cost model: simulated bid-ask half-spread in basis points.
 #   half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000
