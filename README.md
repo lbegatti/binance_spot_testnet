@@ -100,7 +100,7 @@ binance_spot_testnet/
 │   ├── data.py                        # Historical kline downloader — fetch_macro_klines() (5 m, HMM) + fetch_micro_klines() (1 m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
 │   ├── synthetic_book.py              # Synthetic 50-level order book builder (per kline row)
 │   ├── signals.py                     # Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m, Phase 2 merge_asof stitch, Phase 3 1m execution loop + gates
-│   ├── pnl.py                         # P&L simulation — balance guard, bps-based fill, intra-candle whipsaw guard, position guard, equity curve, metrics
+│   ├── pnl.py                         # P&L simulation — balance guard, bps-based fill, intra-candle whipsaw guard, pyramiding + cash-reserve floor, equity curve, metrics
 │   ├── runner.py                      # Top-level runner — fetches 5m macro + 1m micro OOS frames; plot ON by default (--no-plot to suppress); --csv; --flush-cache
 │   ├── visualization.py               # Step 7 — interactive Plotly chart (6-panel); shown by default from CLI, or run_backtest(plot=True) programmatically
 │   ├── sensitivity.py                 # Step 8 — Bayesian (Optuna TPE, default) / OAT / full-grid sweep; writes best_params.json
@@ -321,7 +321,7 @@ Binance REST API (production,      Binance WebSocket (production)
 | `OrderBookState` | Shared order book (`local_book`, `history_order_book`) and balance data (`balance_status`); serialised via `thread_lock` and `thread_balance_lock` |
 | `MessageHandler` | Merges diff-depth WebSocket ticks into `local_book`; appends snapshots to history; triggers throttled quote calculation every 10 ticks |
 | `RegimeDirector` | Detects market regime via HMM on 5-minute bars (2/3-1/3 train/test split, adaptive per window). Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability) protected by `_regime_lock` |
-| `AnalysisEngine` | Runs `low_latency_analysis` (1 s cadence, scores order-book candidates) and `historical_analysis` (60 s cadence, updates HMM + VWAPs). Enforces single-open-position guard (`_position_open` flag). Normally the account is flat at session start (`websocket_main.py` flattens any inherited BTC via a startup MARKET sell), so the guard pre-arm (BTC balance ≥ 0.0001 → treat inherited BTC as an open position) only fires as a fallback when that flatten fails |
+| `AnalysisEngine` | Runs `low_latency_analysis` (1 s cadence, scores order-book candidates) and `historical_analysis` (60 s cadence, updates HMM + VWAPs). BUY legs stack via the pyramiding exposure gate (`MAX_PYRAMID_LEGS` + `MIN_CASH_RESERVE_PCT` reserve floor); a full SELL or stop-loss closes the position. With `FLATTEN_ON_START = False` (default), inherited BTC (balance ≥ 0.0001) is carried as the session's starting position and traded around normally; with `FLATTEN_ON_START = True` it is MARKET-sold at startup so the session begins flat |
 | `OrderExecutor` | Places orders via Binance WebSocket API: LIMIT GTC for BUY; SELL is MARKET when urgent (stop-loss) else a resting LIMIT GTC. Maintains real-time balance via `outboundAccountPosition` push events; cancels stale resting BUY/SELL orders after 10 s (`cancel_stale_buy` / `cancel_stale_sell`); refreshes balance from REST after every order. Falls back to REST for order placement if WS is unavailable |
 | `websocket_main` | Session orchestrator — creates state, injects into handlers, runs pre-session regime fit, opens WebSocket streams, starts threads |
 
@@ -355,17 +355,17 @@ Both analysis loops in `AnalysisEngine` are designed to run indefinitely:
 
 Rather than running forever, `websocket_main.py` uses a fixed session duration set by `DEFAULT_SESSION_MINUTES` (no startup prompt).
 
-The **default of 10 minutes** is chosen deliberately:
+The **default of 20 minutes** is chosen deliberately:
 
-| Metric | Value at 10 min |
+| Metric | Value at 20 min |
 |--------|----------------|
-| Low-latency iterations (`low_latency_analysis`) | $10 \times 60 / 1 = \mathbf{600}$ |
-| Historical iterations (`historical_analysis`) | $10 \times 60 / 60 = \mathbf{10}$ |
-| Order book snapshots in history | up to $10 \times 60 \times 10 = \mathbf{6{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
+| Low-latency iterations (`low_latency_analysis`) | $20 \times 60 / 1 = \mathbf{1{,}200}$ |
+| Historical iterations (`historical_analysis`) | $20 \times 60 / 60 = \mathbf{20}$ |
+| Order book snapshots in history | up to $20 \times 60 \times 10 = \mathbf{12{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
 
 When the session duration elapses, `websocket_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
-> **Thread Timeline** — For a step-by-step t=0s … t=10 min walkthrough of both threads, see [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
+> **Thread Timeline** — For a step-by-step t=0s … t=20 min walkthrough of both threads, see [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
 
 ### Deque Fill-Up (`history_order_book`)
 
@@ -377,7 +377,7 @@ The deque size is driven by the **WebSocket tick rate** (~10 entries/sec at 100 
 | 3 min | ~1 800 | 1 800 | 3rd runs (reads 1 800 entries) |
 | 5 min | ~3 000 | **3 000 (full)** | 5th runs (reads 3 000 entries) |
 | 10 min | ~6 000 sent | **3 000 (capped — oldest evicted)** | 10th runs (reads 3 000 entries) |
-| 10 min | ~6 000 sent | **3 000 (capped)** | 10th runs (reads 3 000 entries) |
+| 20 min | ~12 000 sent | **3 000 (capped)** | 20th runs (reads 3 000 entries) |
 
 After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling window** of the last ~5 minutes. Each `historical_analysis` iteration operates on whatever is currently in the window — not a fixed block.
 
@@ -745,7 +745,7 @@ websocket_main.py startup
 │
 ├── Pre-session: RegimeDirector.get_klines_data()     ← fetches last 2 h of 1-min klines (~120 rows)
 │               StandardScaler.fit_transform(rows[:80]) ← scale training rows in-sample
-│               RegimeDirector.select_hmm_model()     ← fits HMM n=2..4, selects best BIC
+│               RegimeDirector.select_hmm_model()     ← fits HMM n=2..3, selects best BIC
 │               RegimeDirector.assign_regime_labels() ← sets regime_label + regime_confidence
 │               Both are set BEFORE threads start
 │
@@ -801,7 +801,7 @@ in **[`BACKTESTING.md`](BACKTESTING.md)**.
 | `backtest/data.py` | ✅ done | Download historical klines — `fetch_macro_klines()` (5m, HMM) + `fetch_micro_klines()` (1m, PnL); Parquet cache (`cache/klines/`, 24h TTL, `--flush-cache`); IS/OOS boundary enforced via `end_str` / `lookback` |
 | `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
 | `backtest/signals.py` | ✅ done | Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m macro frame, Phase 2 `merge_asof` stitch (zero look-ahead), Phase 3 1m execution loop + confidence/regime/VWAP gates → signal +1/−1/0 |
-| `backtest/pnl.py` | ✅ done | Simulated P&L — **intra-candle whipsaw guard** (`SELL_WHIPSAW` at `low−half_spread` when same 1m bar hits BUY+SELL zones; `n_whipsaw_exits` in stats); **single-position mean-reversion guard** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY fires only when flat, SELL closes the full open position in one shot; balance guard; bps-based `half_spread` fill (`BACKTEST_FILL_SPREAD_BPS`); per-trade position cap (`MAX_POSITION_PCT`, shared with live `execution/order_executor.py`); equity curve; FIFO round-trip pairing; explicit taker-fee deduction in `_pair_round_trips`; Step 5 metrics |
+| `backtest/pnl.py` | ✅ done | Simulated P&L — **intra-candle whipsaw guard** (`SELL_WHIPSAW` at `low−half_spread` when same 1m bar hits BUY+SELL zones; `n_whipsaw_exits` in stats); **pyramiding with a cash-reserve floor** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY legs stack (each ≤ `MAX_POSITION_PCT` of available USDT) until ~90 % invested, always keeping ≥ `MIN_CASH_RESERVE_PCT` (10 %) of equity as USDT, SELL closes the full stacked position in one shot; balance guard; bps-based `half_spread` fill (`BACKTEST_FILL_SPREAD_BPS`); per-leg position cap (`MAX_POSITION_PCT`) and reserve clamp (`MIN_CASH_RESERVE_PCT`) now **shared with the live path** (`execution/order_executor.py` sizing + `strategy/analysis.py` exposure gate, with a live-only `MAX_PYRAMID_LEGS` guard); equity curve; FIFO round-trip pairing; explicit taker-fee deduction in `_pair_round_trips`; Step 5 metrics |
 | `backtest/runner.py` | ✅ done | Top-level orchestration — fetches **OOS window** (`BACKTEST_OOS_START → today`, ~25,920 rows at 5 m / ~129,600 rows at 1 m) via `fetch_macro_klines` + `fetch_micro_klines` (cached); chains all modules, delegates report/CSV to `reporting/`; **plot is ON by default** (use `--no-plot` to suppress in headless/CI mode), `--save-png`, and `--flush-cache` flags.  Loads `fee_rate` from `best_params.json` and passes to `simulate_pnl()` |
 | `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored |
 | `backtest/diagnostics/regime_validation.py` | ✅ done | Offline long-horizon regime validation — **70/30 train-test split** on 2 years (~210,000 rows, `VALIDATION_LOOKBACK = "730 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~63,000 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation` |
@@ -843,12 +843,18 @@ guided grid search but far more efficient in high-dimensional spaces.
 | Parameter | Low | High | Step |
 |---|---|---|---|
 | `hmm_lookback_rows` | 30 | 240 | 10 |
-| `hmm_max_regimes` | 2 | 4 | 1 |
+| `hmm_max_regimes` | 3 | 3 | 1 |
 | `vwap_window` | 5 | 60 | 5 |
 | `vwap_threshold` | 0.001 | 0.005 | 0.0005 |
 
 `fee_rate` is always fixed at `BACKTEST_FEE_RATE = 0.001` — it is a fixed
 exchange cost, not a strategy knob.
+
+`hmm_max_regimes` is **pinned at 3** (low = high = 3). A 2-state BIC ceiling can
+only ever produce `trending_up` + `trending_down` — there is no leftover state to
+label `neutral`, so the mean-reversion BUY gate is blocked in every regime (this
+caused a 2-hour, zero-trade live session on 2026-07-09). Three states is the
+minimum that lets a `neutral` regime exist and equals `len(HMM_FEATURE_COLS) − 1`.
 
 **Key design details:**
 

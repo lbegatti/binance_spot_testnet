@@ -46,7 +46,7 @@ from strategy.regime_director import RegimeDirector
 regime_director = RegimeDirector()             # 1. instantiate — no data yet
 regime_director.get_klines_data()              # 2. download ~120 rows of 5-min klines
                                                #    (last 10 h, HMM_INTERVAL="5m", public endpoint)
-regime_director.select_hmm_model()             # 3. fit HMM n=2..4, pick best BIC
+regime_director.select_hmm_model()             # 3. fit HMM n=2..3, pick best BIC
 regime_director.assign_regime_labels()         # 4. map state int → label string
 # → regime_director.regime_label == e.g. "trending_up"
 
@@ -223,10 +223,10 @@ historical_analysis()                       low_latency_analysis()
          else:                                 ⑥ VWAP FILTER (mean-reversion + dead zone)
            predict_current_regime() ← fast          BUY  blocked if micro ≥ bid_vwap × (1−δ)
          assign_regime_labels()                     SELL blocked if micro < ask_vwap × (1+δ)
-           under _regime_lock                  ⑦ POSITION GUARD (single-open-position MR)
-                                                     BUY  blocked if _position_open == True
-                                                          → _position_guard_skips++
-                                                     SELL resets _position_open = False
+           under _regime_lock                  ⑦ EXPOSURE GATE (pyramiding → stack to reserve)
+                                                     BUY  new leg unless leg-cap / reserve hit
+                                                          blocked leg → _position_guard_skips++
+                                                     SELL closes the full stacked position
                                                ⑧ OrderExecutor.execute()
                                                     LIMIT GTC via WebSocket API
 ```

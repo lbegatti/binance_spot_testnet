@@ -55,6 +55,9 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `BACKTEST_INITIAL_BTC` | 0.0 | Starting BTC balance. Set to `0.0` to avoid orphan SELL signals consuming a pre-existing balance before the first strategy BUY. The equivalent BTC value is folded into `BACKTEST_INITIAL_CAPITAL`. |
 | `BACKTEST_INITIAL_CAPITAL` | 315,000 USDT | Starting USDT balance (~250k USDT + 1 BTC @ ~65k), mirroring the live paper-trading account. |
 | `BACKTEST_FEE_RATE` | 0.001 | Taker fee per side (0.10 %) |
+| `MAX_POSITION_PCT` | 0.20 | Per-BUY-leg cap: at most 20 % of *available* USDT spent per BUY signal. Legs may pyramid (stack) — see `MIN_CASH_RESERVE_PCT`. Shared live + backtest. |
+| `MIN_CASH_RESERVE_PCT` | 0.10 | Cash-reserve floor: stacked BUY legs invest until exposure reaches (1 − 0.10) = 90 % of mark-to-market equity, always keeping ≥ 10 % as USDT (aggressive — most room to trade). **Active on BOTH paths** — `backtest/pnl.py` and live (`execution/order_executor.py` sizing clamp + `strategy/analysis.py` exposure gate). Raise toward 0.50 to bound drawdown. Risk-management — NOT in the Optuna search space. |
+| `MAX_PYRAMID_LEGS` | 12 | **Live-only** hard cap on concurrently-stacked BUY legs. With legs of 20 % of *remaining* cash, invested ≈ 1 − 0.8ⁿ, so reaching the 90 % ceiling (10 % reserve) needs ~11 legs; 12 lets the floor bind with one leg of margin (the reserve clamp trims the final leg). Keeps live consistent with the backtest (no leg cap, reaches 90 % from the reserve alone). Guards the 2026-07-08 runaway-pyramiding path. Not in the Optuna search space. |
 | `BACKTEST_FILL_SPREAD_BPS` | 5 | Synthetic fill cost (basis points) |
 | `BACKTEST_MAX_ROWS` | None | Max kline rows (unlimited; use for testing) |
 | `CACHE_TTL_HOURS` | 24 | Parquet cache time-to-live |
@@ -104,11 +107,12 @@ Which modules import each constant from `config_parameters.py`:
 - `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS` (stop-loss constants read indirectly via the refresher closure injected by `websocket_main.py`)
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
-- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`, `MAX_POSITION_PCT`
+- `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`, `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`
+- `strategy/analysis.py` — `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `MAX_PYRAMID_LEGS` (+ VWAP / regime / stop-loss / trend-pause constants)
 - `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`, `BACKTEST_MACRO_INTERVAL`, `BACKTEST_MICRO_INTERVAL`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
-- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `MAX_POSITION_PCT`, `HMM_MIN_CONFIDENCE`
+- `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `HMM_MIN_CONFIDENCE`
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `backtest/sensitivity.py` — `REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`

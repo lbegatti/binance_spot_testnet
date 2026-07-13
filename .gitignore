@@ -3,8 +3,3 @@ __pycache__/
 *.pyc
 logs/
 state/
-
-# Audit / publication-prep artefacts — internal, never published
-FINAL_AUDIT_PLAN.md
-FINAL_AUDIT_REPORT.md
-LINKEDIN_POST.md

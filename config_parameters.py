@@ -49,9 +49,9 @@ BALANCE_REFRESH_INTERVAL = 60  # seconds
 #           it (carry inventory across restarts; more realistic).  The end-of-
 #           session report's component B then attributes the carried bag's market
 #           drift separately from trading alpha.
-# NOTE: while False, the carried position's stop-loss is anchored at the session-
-# start price (not the true cost basis) until position persistence (Phase 2) is
-# added.
+# NOTE: while False, the carried position's stop-loss anchors at the true cost
+# basis when a matching persisted position is restored at startup (see
+# LIVE_POSITION_STATE_PATH), otherwise it falls back to the session-start price.
 FLATTEN_ON_START: bool = False
 
 # Path to the live position-state file (cost basis carried across restarts).
@@ -268,11 +268,49 @@ BACKTEST_FILL_SPREAD_BPS: float = 5.0  # full bid-ask spread in basis points
 # Applies to BOTH the live system (execution/order_executor.py) and the
 # backtest (backtest/pnl.py) so the simulated and live order sizes stay
 # aligned.  Prevents all-in behaviour where fee + spread costs compound on
-# 100 % of the balance every round trip.  0.10 → at most 10 % risked per
-# signal.  Set to 1.0 to revert to full all-in behaviour.
+# 100 % of the balance every round trip.  0.20 → at most 20 % of available
+# USDT risked per BUY leg (legs may still pyramid up to the cash-reserve floor).
+# Set to 1.0 to revert to full all-in behaviour.
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
-MAX_POSITION_PCT: float = 0.10  # 10 % of USDT per BUY signal (live + backtest)
+MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + backtest)
+
+# Cash-reserve floor (fraction of mark-to-market equity that must always remain
+# in USDT).  BUY legs may PYRAMID — each leg is still ≤ MAX_POSITION_PCT of the
+# available USDT, but successive legs stack until invested exposure reaches
+# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.10 → at most 90 % invested, always
+# ≥ 10 % cash held back.  Replaces the old single-position rule that left the
+# book ~90 % idle in cash, without ever going fully all-in.  Applies to BOTH the
+# live system and the backtest so simulated and live sizing stay aligned.
+#
+# Set to 0.10 to give the strategy the most room to trade (up to 90 % invested).
+# Trade-off: exposure — and therefore drawdown — scales with the invested
+# fraction (~20 % IS tail drawdown at 90 % invested), so this is the aggressive
+# end of the dial.  Raise toward 0.50 to bound the tail if a live drawdown feels
+# too large.  Re-run the OOS backtest after changing.  NOTE: the live path also
+# needs MAX_PYRAMID_LEGS high enough to reach this floor (see below).
+#
+# Risk-management parameter — DO NOT add to the Optuna search space.
+MIN_CASH_RESERVE_PCT: float = 0.10  # keep ≥ 10 % of equity as USDT (live + backtest)
+
+# -- Pyramiding control (live path — execution/order_executor.py +
+#    strategy/analysis.py) ------------------------------------------------
+# Hard ceiling on how FAR the LIVE strategy may stack BUY legs, independent of
+# the reserve-floor maths above.  A safety net for the case where the reserve
+# floor is fed a stale balance: no matter what, no more than MAX_PYRAMID_LEGS
+# legs open before a full SELL resets the count.  Serialization (one order in
+# flight at a time, in strategy/analysis.py) already bounds how FAST legs stack.
+# The backtest fills instantly and does not use this cap.
+#
+# Risk-management parameter — DO NOT add to the Optuna search space.
+# Each leg spends MAX_POSITION_PCT (20 %) of REMAINING free cash, so invested
+# exposure after n legs ≈ 1 − 0.8ⁿ of cash: n=7 → ~79 %, n=11 → ~91 %.  To let
+# the 10 % MIN_CASH_RESERVE_PCT floor (→ 90 % invested) actually bind, the cap
+# must allow ~11 legs; 12 leaves one leg of margin (the reserve clamp trims the
+# final leg to land exactly at the floor).  Also keeps the live cap consistent
+# with the backtest, which has no leg cap and reaches 90 % from the reserve
+# alone.  Lower this to cap live exposure by leg count regardless of the floor.
+MAX_PYRAMID_LEGS: int = 12  # hard cap on concurrently-stacked live BUY legs
 
 # -- Trend-pause filter (macro frame, backtest/signals.py) ----------------
 # Pauses all new BUY/SELL entries when the macro frame shows N consecutive

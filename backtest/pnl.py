@@ -44,7 +44,7 @@ Usage
     signals  = run_signals()
     # fee_rate defaults to BACKTEST_FEE_RATE; override to use best_params.json value:
     trades, equity, stats = simulate_pnl(signals, fee_rate=0.001)
-    print(stats["n_position_guard_skips"])   # BUY signals suppressed by position guard
+    print(stats["n_position_guard_skips"])   # BUY signals suppressed by cash-reserve floor
 """
 
 import logging
@@ -60,6 +60,7 @@ from config_parameters import (
     BACKTEST_INITIAL_CAPITAL,
     BACKTEST_RISK_FREE_RATE,
     MAX_POSITION_PCT,
+    MIN_CASH_RESERVE_PCT,
     HMM_MIN_CONFIDENCE,
 )
 
@@ -203,15 +204,19 @@ def simulate_pnl(
     to the live ``OrderExecutor``, and marking the portfolio to market at
     every candle (including HOLD rows) to build a continuous equity curve.
 
-    Position model — single open position at a time
-    ------------------------------------------------
-    The strategy is mean-reversion: enter on a dip, exit on a rally, repeat.
-    To prevent grid-trading accumulation (stacking many small BUY legs on
-    every dip signal), ``simulate_pnl`` enforces a **one-position-at-a-time**
-    rule via ``open_strategy_qty``:
+    Position model — pyramiding with a cash-reserve floor
+    -----------------------------------------------------
+    The strategy is mean-reversion: scale into dips, exit the whole book on a
+    rally, repeat.  BUY legs may **stack (pyramid)** — each leg spends at most
+    ``MAX_POSITION_PCT`` of the *available* USDT, and successive legs accumulate
+    via ``open_strategy_qty`` until invested exposure reaches
+    ``(1 − MIN_CASH_RESERVE_PCT)`` of mark-to-market equity:
 
-    * **BUY** fires only when ``open_strategy_qty == 0`` (flat).
-      If already long, the signal is skipped and logged at DEBUG level.
+    * **BUY** fires whenever cash sits above the reserve floor
+      (``usdt − MIN_CASH_RESERVE_PCT × equity > 0``).  The leg is clamped so the
+      trade never spends into the reserve; once the floor is reached the signal
+      is skipped and counted in ``n_position_guard_skips``.  The entry price is
+      tracked as a VWAP across all open legs.
     * **SELL** always closes the **full open position** in one shot
       (``qty = open_strategy_qty``), ignoring the synthetic book quantity
       for the exit leg.  This guarantees the strategy returns to flat on
@@ -259,15 +264,17 @@ def simulate_pnl(
     usdt = float(initial_usdt)
     btc = float(initial_btc)
 
-    # Tracks BTC opened exclusively by strategy BUY signals.
-    # Does NOT include initial_btc (pre-existing balance).
-    # BUY: only fires when this is 0 (flat).
+    # Tracks BTC opened exclusively by strategy BUY signals (summed across all
+    # pyramided legs).  Does NOT include initial_btc (pre-existing balance).
+    # BUY: adds each leg's qty (stacking allowed up to the cash-reserve floor).
     # SELL: closes this entire amount in one shot, then resets to 0.
     open_strategy_qty: float = 0.0
 
-    # Count of BUY signals suppressed by the position guard (already long).
-    # Reported in stats and the summary report so the user can see how many
-    # signals the position guard absorbed vs. how many actually executed.
+    # Count of BUY signals suppressed because the cash-reserve floor was already
+    # reached (no spendable USDT above MIN_CASH_RESERVE_PCT × equity).  Reported
+    # in stats and the summary report so the user can see how many BUY signals
+    # the reserve floor absorbed vs. how many actually executed.  (The stat key
+    # name is retained for backward-compat with existing reports.)
     n_position_guard_skips: int = 0
 
     # Count of forced pessimistic exits triggered by the intra-candle whipsaw
@@ -428,35 +435,41 @@ def simulate_pnl(
 
         # BUY
         if sig == 1 and not _skip_signals:
-            # Position guard: skip if already holding a strategy-opened position.
-            # Prevents stacking multiple overlapping BUY legs (grid behaviour)
-            # and converts the strategy to proper single-position mean-reversion.
-            if open_strategy_qty > _POSITION_DUST_BTC:
+            raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0  # type: ignore[union-attr]
+            half_spread = float(row.half_spread) if pd.notna(row.half_spread) else 0.0  # type: ignore[union-attr]
+
+            # Fill at the synthetic ask: close + half_spread.
+            # This is the natural taker cost — you cross the spread when buying.
+            # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
+            eff_price = close + half_spread
+
+            # Per-leg budget: MAX_POSITION_PCT of *available* USDT (each leg ≤ 20 %).
+            usdt_budget = usdt * MAX_POSITION_PCT
+
+            # Cash-reserve floor: pyramiding is allowed (successive BUY legs may
+            # stack via open_strategy_qty), but the trade is clamped so at least
+            # MIN_CASH_RESERVE_PCT of the portfolio's mark-to-market equity always
+            # stays in USDT.  This caps invested exposure at (1 − reserve) = 90 %
+            # instead of the old single-position rule that left ~90 % idle in cash.
+            # Shared with execution/order_executor.py so live and backtest size
+            # BUYs identically.
+            equity = usdt + btc * close
+            spendable = usdt - MIN_CASH_RESERVE_PCT * equity
+            usdt_budget = min(usdt_budget, spendable)
+
+            if usdt_budget <= 0:
+                # Cash already at/through the reserve floor — suppress this leg.
                 n_position_guard_skips += 1
                 log.info(
-                    "HOLD │ position open │ %s │ held=%.6f BTC │ BUY opportunity suppressed",
+                    "HOLD │ cash-reserve floor │ %s │ cash=%.2f ≤ %.0f%% of equity=%.2f │ BUY suppressed",
                     ts,
-                    open_strategy_qty,
+                    usdt,
+                    MIN_CASH_RESERVE_PCT * 100,
+                    equity,
                 )
             else:
-                raw_qty = float(row.buy_qty) if pd.notna(row.buy_qty) else 0.0  # type: ignore[union-attr]
-                half_spread = (
-                    float(row.half_spread) if pd.notna(row.half_spread) else 0.0
-                )  # type: ignore[union-attr]
-
-                # Fill at the synthetic ask: close + half_spread.
-                # This is the natural taker cost — you cross the spread when buying.
-                # half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20_000 (bps-based).
-                eff_price = close + half_spread
-
-                # Balance guard: cannot spend more USDT than available.
+                # Balance guard: never spend more than the reserve-clamped budget.
                 # Total debit per unit = eff_price × (1 + fee_rate).
-                # Also cap at MAX_POSITION_PCT of available USDT so the strategy
-                # never bets 100 % of its balance on a single signal — the old
-                # all-in behaviour caused full fee erosion over 180 days.  This
-                # cap is shared with execution/order_executor.py so live and
-                # backtest size every BUY identically.
-                usdt_budget = usdt * MAX_POSITION_PCT
                 max_affordable = (
                     usdt_budget / (eff_price * (1.0 + fee_rate))
                     if eff_price > 0
@@ -471,11 +484,10 @@ def simulate_pnl(
                     usdt -= net_cost
                     btc += qty
                     open_strategy_qty += qty  # track position opened by this BUY
-                    # Update VWAP average entry price.
-                    # With the single-position guard (open_strategy_qty was 0 before
-                    # this BUY), btc_held_before is 0 and this simplifies to
-                    # avg_entry_price = eff_price.  The VWAP formula is kept for
-                    # correctness if the guard is ever relaxed (multi-chunk entries).
+                    # Update the VWAP average entry price across all pyramided legs.
+                    # open_strategy_qty already includes this leg, so _btc_before is
+                    # the size held before it: 0 for the first leg (→ avg = eff_price),
+                    # non-zero for stacked legs (→ each fill blends into the running VWAP).
                     _btc_before = open_strategy_qty - qty
                     avg_entry_price = (
                         avg_entry_price * _btc_before + eff_price * qty

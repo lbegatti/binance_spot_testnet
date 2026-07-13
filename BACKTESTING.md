@@ -267,15 +267,17 @@ if open_strategy_qty > _POSITION_DUST_BTC
 - **Backward-compat:** if the `high` / `low` columns are absent (legacy frames,
   unit tests) the guard is silently disabled.
 
-### Position model — single open position at a time
+### Position model — pyramiding with a cash-reserve floor
 
-`simulate_pnl()` enforces a **one-position-at-a-time** rule via `open_strategy_qty` (BTC held exclusively by strategy signals, excluding `initial_btc`). BUY fires only when `open_strategy_qty ≤ 1e-6` (threshold below which position is treated as flat). SELL always closes the full position in one shot, guaranteeing the strategy returns to flat. The position guard counts suppressed BUY signals in `n_position_guard_skips` (returned in the `stats` dict).
+`simulate_pnl()` lets BUY legs **stack (pyramid)** via `open_strategy_qty` (BTC held exclusively by strategy signals, excluding `initial_btc`). Each leg spends at most `MAX_POSITION_PCT` (20 %) of the *available* USDT, and successive legs accumulate until invested exposure reaches `(1 − MIN_CASH_RESERVE_PCT)` = 90 % of mark-to-market equity — i.e. at least 10 % of the portfolio is always held as USDT. A BUY that would spend into the reserve is clamped; one fully blocked (cash already at/below the floor) is counted in `n_position_guard_skips` (returned in the `stats` dict). SELL always closes the full stacked position in one shot, guaranteeing the strategy returns to flat. The entry price is tracked as a VWAP across all open legs, which the adaptive stop-loss uses as its anchor.
+
+> **Note (live/backtest parity):** as of Phase 1 this pyramiding model is active in the **backtest only** (`backtest/pnl.py`). The live path (`execution/order_executor.py` + `strategy/analysis.py`) still enforces the earlier single-position rule; live parity is Phase 2 of the pyramiding rollout.
 
 ### Trade sizing and costs
 
 - BUY quantity = `aq` from best-buy candidate, capped at `min(aq, usdt / (price × (1 + fee_rate)))` for BUY to reserve taker fee.
 - SELL quantity = `bq` from best-sell candidate, capped at `min(bq, btc_balance)`.
-- `usdt_budget = usdt × MAX_POSITION_PCT` (10 %) limits each BUY to ~10 % of available USDT.  Same constant is applied live in `execution/order_executor.py` so live and backtest size BUYs identically.
+- `usdt_budget = usdt × MAX_POSITION_PCT` (20 %) limits each BUY **leg** to ~20 % of available USDT; the budget is then clamped by the cash-reserve floor `spendable = usdt − MIN_CASH_RESERVE_PCT × equity` so stacked legs never invest past 90 % of equity.  Both `MAX_POSITION_PCT` and the reserve clamp are now shared live in `execution/order_executor.py` + `strategy/analysis.py` (Phase 2 complete).
 - Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`).
 - Fill prices: `close ± half_spread` where `half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000` (default 5 bps, ~$20 at $80k BTC).
 
@@ -357,7 +359,7 @@ matches the live paper-trading account (~250k USDT + 1 BTC ≈ 315k).
 | **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain)                                                                                                                                                                                                                             |
 | **Regime filter hit rate**     | `regime_filter_hit_rate_pct`     | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate                                                                                                                                                                                                                                             |
 | **VWAP filter hit rate**       | `vwap_filter_hit_rate_pct`       | Residual: `raw − executed − confidence_blocked − regime_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (third and final gate)                                                                                                                                                                                                                                         |
-| **Position guard skips**       | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the strategy already held an open position (`open_strategy_qty > 0`) — single-position mean-reversion mode                                                                                                                                                                                                                            |
+| **Position guard skips**       | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the **cash-reserve floor** was already reached (no spendable USDT above `MIN_CASH_RESERVE_PCT × equity`, i.e. the book is at its ~90 % invested cap). Stat key retained for backward-compat.                                                                                                                                          |
 | **Whipsaw exits**              | `n_whipsaw_exits`                | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread`                                                                                                                                                                                      |
 | **Stop-loss fires**            | `n_stop_loss_fires`              | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance                                                                                                                                                                                                   |
 | **Trend-pause skips**          | `n_trend_pause_skips`            | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars                                                                                                                                                            |
@@ -837,12 +839,13 @@ concrete file in `backtest/`.
   simulated trades (using ``bq``/``aq`` quantities and the balance guard)
   and computes the Step 5 performance metrics: total return, win rate,
   max drawdown, Sharpe, Sortino, profit factor, average holding period,
-  and regime / VWAP filter hit rates.  **Single-position mean-reversion
-  guard** (``open_strategy_qty`` / ``_POSITION_DUST_BTC = 1e-6``): BUY
-  fires only when flat; SELL closes the full strategy-opened position in
-  one shot and resets to flat; suppressed BUY count returned as
-  ``n_position_guard_skips`` in the stats dict and reported in the console
-  summary.  **Intra-candle whipsaw guard** (Step 9): fires when same 1-minute
+  and regime / VWAP filter hit rates.  **Pyramiding with a cash-reserve
+  floor** (``open_strategy_qty`` / ``_POSITION_DUST_BTC = 1e-6``): BUY legs
+  stack, each ≤ ``MAX_POSITION_PCT`` of available USDT, until invested
+  exposure hits ``(1 − MIN_CASH_RESERVE_PCT)`` = 90 % of equity; SELL closes
+  the full stacked position in one shot and resets to flat; BUYs blocked by
+  the reserve floor are returned as ``n_position_guard_skips`` in the stats
+  dict and reported in the console summary.  **Intra-candle whipsaw guard** (Step 9): fires when same 1-minute
   bar's `low ≤ best_buy_micro` AND `high ≥ best_sell_micro` — force-closes at
   `low − half_spread`, records `SELL_WHIPSAW` trade, returns `n_whipsaw_exits`
   in stats dict.  Round-trip pairing uses an exhaustive FIFO ``collections.deque``
@@ -857,7 +860,7 @@ concrete file in `backtest/`.
   (both cached).  Report formatting (`print_report`) and CSV export
   (`save_csv`) are isolated in `backtest/reporting/formatters.py`.
   Prints a formatted console report: SESSION info, SIGNALS breakdown
-  (including ``HOLD (position open) : N ← BUY suppressed by position guard``),
+  (including ``HOLD (cash reserve) : N ← BUY suppressed by cash-reserve floor``),
   P&L SUMMARY, RISK METRICS, TRADE LOG PREVIEW.  `runner.py` loads
   ``fee_rate`` from ``best_params.json`` and passes it to ``simulate_pnl()``
   (falls back to ``BACKTEST_FEE_RATE``).  Optionally saves timestamped
@@ -934,7 +937,7 @@ concrete file in `backtest/`.
   PNG export requires ``pip install kaleido``; without it an interactive HTML
   file is saved instead.  *(Implemented.)*
 
-- ✅ **Step 8 — `backtest/sensitivity.py`** — Three modes: Bayesian (Optuna TPE, 40 trials default), OAT (`--oat`, 1 baseline + 7 variants), and deprecated full-grid.  Tunes `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, `VWAP_THRESHOLD_MULTIPLIER` on the 270-day IS window; `fee_rate` fixed at `0.001` (not a strategy knob).  Data pre-fetched once via `_make_objective` factory closure (`prefetched_macro` + `prefetched_micro`); Optuna study persisted to `backtest/results/optuna.db` (`load_if_exists=True`).  Three HTML charts (optimisation history, fANOVA parameter importance, `hmm_lookback_rows × vwap_window` contour) auto-saved to `backtest/reporting/`.  `_check_existing_best_params()` guard prompts `[y/N]` before overwriting.  Sensitivity CSVs → `backtest/reporting/`; `best_params.json` → `backtest/results/` (loaded by `strategy.param_loader`).  Console formatting via `print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison` in `backtest/reporting/formatters.py`.  Use Case B (OOS robustness) deferred — see **Step 8** above for full details.  *(Implemented.)*
+- ✅ **Step 8 — `backtest/sensitivity.py`** — Three modes: Bayesian (Optuna TPE, 40 trials default), OAT (`--oat`, 1 baseline + 6 variants), and deprecated full-grid.  Tunes `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `VWAP_THRESHOLD_MULTIPLIER` on the 270-day IS window (`HMM_MAX_REGIMES` is pinned at 3 — a 2-state ceiling cannot yield a `neutral` regime; `fee_rate` fixed at `0.001`, not a strategy knob).  Data pre-fetched once via `_make_objective` factory closure (`prefetched_macro` + `prefetched_micro`); Optuna study persisted to `backtest/results/optuna.db` (`load_if_exists=True`).  Three HTML charts (optimisation history, fANOVA parameter importance, `hmm_lookback_rows × vwap_window` contour) auto-saved to `backtest/reporting/`.  `_check_existing_best_params()` guard prompts `[y/N]` before overwriting.  Sensitivity CSVs → `backtest/reporting/`; `best_params.json` → `backtest/results/` (loaded by `strategy.param_loader`).  Console formatting via `print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison` in `backtest/reporting/formatters.py`.  Use Case B (OOS robustness) deferred — see **Step 8** above for full details.  *(Implemented.)*
 
 - ✅ **Step 9 — Multi-timeframe resolution decoupling + documentation** (2026-05-18)
 

@@ -15,7 +15,7 @@ Three execution modes
       Uses Optuna TPE sampler to intelligently search the parameter space.
       Default 40 trials (~5–8 h on a laptop, ~8–12 min per trial).
       Optuna TPE warm-up uses 10 random trials; exploitation begins at trial 11.
-      The equivalent exhaustive grid would be 3×2×12×9 = 648 combos (weeks of compute);
+      The equivalent exhaustive grid would be 3×1×12×9 = 324 combos (weeks of compute);
       Bayes explores that same space intelligently in 40 trials.
         ↳ klines fetched ONCE then shared across all trials.
       Run with:  python -m backtest.sensitivity
@@ -24,15 +24,15 @@ Three execution modes
 
   OAT sweep (Phase 1 — quick sanity check):
       Holds all parameters at their defaults and varies ONE parameter at a time.
-      8 runs total (1 baseline + 7 non-default).  Use this first to confirm the
+      7 runs total (1 baseline + 6 non-default).  Use this first to confirm the
       pipeline runs cleanly and to spot obviously sensitive parameters.
       Typical wall time: ~1–2 h on a laptop (90-day window, ~8–12 min per run).
-        ↳ klines fetched ONCE (~30–90 s) then shared across all 8 runs.
+        ↳ klines fetched ONCE (~30–90 s) then shared across all 7 runs.
       Run with:  python -m backtest.sensitivity --oat
 
   Full factorial grid (DEPRECATED — Phase 2 legacy):
       All combinations exhaustively.  Superseded by --bayes.
-      30 combinations (3×2×5). Typical wall time: ~4–6 h on a laptop.
+      15 combinations (3×1×5). Typical wall time: ~2–3 h on a laptop.
       Run with:  python -m backtest.sensitivity --full-grid
 
 Use Case A vs Use Case B
@@ -133,13 +133,15 @@ _BEST_PARAMS_PATH = _RESULTS_DIR / BEST_PARAMS_FILE
 #   fee_rate      — fixed at SENSITIVITY_FEE_RATE (0.001 = standard Binance taker).
 #                   Testing different fee tiers is meaningless: Binance charges
 #                   what it charges regardless of what value we use here.
-#   vwap_threshold — fixed at VWAP_THRESHOLD_MULTIPLIER (0.003) for OAT / full-grid.
+#   vwap_threshold — fixed at VWAP_THRESHOLD_MULTIPLIER (0.002) for OAT / full-grid.
 #                    Tuned by Bayesian search (_OPTUNA_SPACE); not varied in OAT/full-grid
 #                    because a single non-default value per sweep is already informative.
 
 _PARAM_GRID: dict[str, list[Any]] = {
     "hmm_lookback_rows": [120, 60, 30],  # default 120 (2 h)
-    "hmm_max_regimes": [3, 2],  # default=3; test 2
+    "hmm_max_regimes": [3],  # pinned to 3: a 2-state ceiling can never yield a
+    #                          neutral regime, which structurally blocks the
+    #                          mean-reversion buy gate (see 2026-07-09 no-trade run)
     "vwap_window": [
         20,
         5,
@@ -153,10 +155,12 @@ _OPTUNA_SPACE: dict[str, tuple] = {
     "hmm_lookback_rows": ("int", 30, 240, 10),
     "hmm_max_regimes": (
         "int",
-        2,
+        3,
         3,
         1,
-    ),  # matches HMM_MAX_REGIMES = len(features)-1 = 3
+    ),  # lower bound raised 2→3: a 2-state ceiling can never produce a neutral
+    #     regime, so the mean-reversion buy gate is permanently blocked. Pinned
+    #     at 3 = HMM_MAX_REGIMES = len(features)-1 (see 2026-07-09 no-trade run).
     "vwap_window": (
         "int",
         5,
@@ -263,9 +267,9 @@ def _build_oat_grid() -> list[dict[str, Any]]:
       - Runs 1–N: each non-default value for one parameter while all others
                   remain at their default.
 
-    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 1 + 4 = 7 non-default → 8 runs.
+    Total: 1 + sum(len(v) - 1 for v in grid) = 1 + 2 + 0 + 4 = 6 non-default → 7 runs.
       hmm_lookback_rows: 2 non-default  [60, 30]
-      hmm_max_regimes:   1 non-default  [2]
+      hmm_max_regimes:   0 non-default  (pinned to 3)
       vwap_window:       4 non-default  [5, 10, 40, 60]
     fee_rate and vwap_threshold are held fixed at SENSITIVITY_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
@@ -285,9 +289,9 @@ def _build_full_grid() -> list[dict[str, Any]]:
     """
     Build the full factorial grid (all combinations).
 
-    Total: 3 × 2 × 5 = 30 combinations.
+    Total: 3 × 1 × 5 = 15 combinations.
       hmm_lookback_rows: [120, 60, 30]           → 3
-      hmm_max_regimes:   [3, 2]                  → 2
+      hmm_max_regimes:   [3]                     → 1
       vwap_window:       [20, 5, 10, 40, 60]     → 5
     fee_rate and vwap_threshold are held fixed at SENSITIVITY_FEE_RATE / VWAP_THRESHOLD_MULTIPLIER.
     """
@@ -986,8 +990,8 @@ def run_sensitivity(
     Parameters
     ----------
     full_grid : bool
-        If ``True`` (default), run the full 30-combination factorial grid.
-        If ``False``, run the OAT sweep (8 combinations, ~15–35 min).
+        If ``True`` (default), run the full 15-combination factorial grid.
+        If ``False``, run the OAT sweep (7 combinations, ~15–35 min).
     lookback : str | None
         dateutil string overriding ``BACKTEST_LOOKBACK`` (IS start) for this
         run only.  ``None`` → use ``BACKTEST_LOOKBACK`` from
@@ -1162,11 +1166,11 @@ if __name__ == "__main__":
         description=(
             "Sensitivity analysis for the BTCUSDT backtesting pipeline.\n\n"
             "DEFAULT (no flags): Bayesian optimisation via Optuna — 40 trials by default (~5–8 h).\n"
-            "  Explores 3×2×12×9 = 648-combination-equivalent space intelligently.\n"
+            "  Explores 3×1×12×9 = 324-combination-equivalent space intelligently.\n"
             "  Use --n-trials 20 for a faster ~2.5–4 h run.\n"
             "  Optuna diagnostic charts are always saved to backtest/reporting/.\n\n"
-            "--oat        Phase 1 OAT sweep (8 combinations, ~1–2 h).\n"
-            "--full-grid  Deprecated full factorial grid (30 combinations, ~4–6 h).\n"
+            "--oat        Phase 1 OAT sweep (7 combinations, ~1–2 h).\n"
+            "--full-grid  Deprecated full factorial grid (15 combinations, ~2–3 h).\n"
             "--bayes      Explicit Bayesian search (same as default, accepts --n-trials).\n\n"
             "Data window (Option B — IS/OOS split at 5 m resolution):\n"
             "  IS  (optimisation): BACKTEST_LOOKBACK → BACKTEST_OOS_START\n"
@@ -1179,12 +1183,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--oat",
         action="store_true",
-        help="Run the OAT sweep (Phase 1, 8 combinations, ~1–2 h).",
+        help="Run the OAT sweep (Phase 1, 7 combinations, ~1–2 h).",
     )
     parser.add_argument(
         "--full-grid",
         action="store_true",
-        help="[DEPRECATED] Run the full factorial grid (30 combinations, ~4–6 h). Use --bayes instead.",
+        help="[DEPRECATED] Run the full factorial grid (15 combinations, ~2–3 h). Use --bayes instead.",
     )
     parser.add_argument(
         "--bayes",

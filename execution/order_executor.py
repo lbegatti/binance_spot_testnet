@@ -14,6 +14,7 @@ from config_parameters import (
     ORDER_REPORT_LIMIT,
     BACKTEST_FEE_RATE,
     MAX_POSITION_PCT,
+    MIN_CASH_RESERVE_PCT,
 )
 
 
@@ -106,6 +107,13 @@ class OrderExecutor:
         # cancel_stale_sell() resolves it after the timeout.
         self._pending_sell_placed_at: float | None = None
         self._pending_sell_id: int | None = None
+
+        # Size + price of the most recently dispatched BUY leg, exposed so the
+        # strategy layer (strategy/analysis.py) can accrue the pyramiding cost
+        # basis at dispatch.  Reset to 0.0 at the start of every
+        # BUY branch so a skipped BUY never leaves a stale non-zero value.
+        self.last_buy_qty: float = 0.0
+        self.last_buy_price: float = 0.0
 
         # Dispatch timestamp of the most recent in-flight WS order.
         # Set in execute() at WS dispatch; consumed by handle_order_response
@@ -717,11 +725,26 @@ class OrderExecutor:
         # Dynamically cap the quantity to what the available balance can afford,
         # so the algo still trades at a reduced size rather than skipping entirely.
         if strategy == "BUY":
+            # Reset the dispatched-leg markers so a skipped BUY (budget too low /
+            # reserve floor) never leaves a stale value for the strategy layer.
+            self.last_buy_qty = 0.0
+            self.last_buy_price = 0.0
             # Position cap — MAX_POSITION_PCT × available USDT is the per-signal
             # budget shared with backtest/pnl.py.  Prevents all-in BUY orders
             # (e.g. 313k USDT in one trade) and keeps live order sizing aligned
             # with the simulated sizing the strategy was tuned against.
             usdt_budget = usdt * MAX_POSITION_PCT
+            # Cash-reserve floor (mirrors backtest/pnl.py): clamp the budget so
+            # this BUY never spends the account below MIN_CASH_RESERVE_PCT of
+            # mark-to-market equity (free USDT + BTC valued at micro_price).  Live
+            # legs are serialized (a new leg is dispatched only when no BUY is in
+            # flight — see strategy/analysis.py), so `usdt` is the free balance
+            # after prior legs settled and equity ≈ usdt + btc × micro_price.
+            # Caps total invested exposure at (1 − reserve); shared with backtest
+            # so live and simulated sizing stay aligned.
+            equity = usdt + btc * micro_price
+            spendable = usdt - MIN_CASH_RESERVE_PCT * equity
+            usdt_budget = min(usdt_budget, max(0.0, spendable))
             # Divide by price × (1 + fee_rate) so the total debit
             # (notional + taker fee) never exceeds the budget.  Without the fee
             # factor Binance rejects the order with "insufficient balance"
@@ -759,6 +782,10 @@ class OrderExecutor:
                     CCY,
                     micro_price,
                 )
+            # Expose the dispatched leg size/price for the strategy layer's
+            # pyramiding cost-basis accrual (see analysis.py).
+            self.last_buy_qty = quantity
+            self.last_buy_price = micro_price
         else:  # SELL
             quantity = min(bq, btc)
             if quantity <= 0:
@@ -802,7 +829,7 @@ class OrderExecutor:
                 _best_bid = max((float(p) for p in _bids), default=0.0)
                 _best_ask = min((float(p) for p in _asks), default=0.0)
                 _book_id = self.state.local_book.get("lastUpdateId", 0)
-            if _best_ask > 0.0 and _best_bid >= _best_ask:
+            if 0.0 < _best_ask <= _best_bid:
                 logging.warning(
                     "Book-health: CROSSED/STALE local_book at SELL — "
                     "best_bid=%.2f >= best_ask=%.2f (lastUpdateId=%s).",

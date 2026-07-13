@@ -108,18 +108,21 @@ FILES
     _regime_lock          : Lock          — serialises regime_director.regime_label
                                              AND _trend_paused (same source frame,
                                              same write cadence)
-    _position_open        : bool          — single-open-position guard; mirrors
-                                             open_strategy_qty in backtest/pnl.py.
-                                             Pre-armed to True at session start when
+    _position_open        : bool          — True while any pyramiding BUY leg is
+                                             open; mirrors open_strategy_qty in
+                                             backtest/pnl.py. BUY legs stack via the
+                                             exposure gate (MAX_PYRAMID_LEGS +
+                                             MIN_CASH_RESERVE_PCT reserve floor); a full
+                                             SELL / stop-loss closes the position. Set
+                                             True at session start when
                                              balance_status[BTC] ≥ 0.0001 so inherited
-                                             BTC is treated as an open position and the
-                                             first SELL closes it naturally. Primary path
-                                             when FLATTEN_ON_START=False (carry inventory);
-                                             also a FALLBACK when FLATTEN_ON_START=True if
-                                             the step-2a MARKET flatten fails. When the
-                                             flatten succeeds the account is USDT-only here
-                                             (matching BACKTEST_INITIAL_BTC=0) and the
-                                             pre-arm does not fire.
+                                             BTC is carried as the session's STARTING
+                                             POSITION and traded around normally (BUY
+                                             more or SELL per signals). Fires when
+                                             FLATTEN_ON_START=False (carry inventory, the
+                                             default); with FLATTEN_ON_START=True the
+                                             account is flattened to USDT-only first and
+                                             this does not fire.
     _position_guard_skips : int           — BUY signals suppressed this session
     _pending_buy_placed_at: float | None  — wall-clock time the last GTC BUY was dispatched;
                                              used by cancel_stale_buy() to detect 10-second timeout
@@ -212,7 +215,7 @@ FILES
 
       After ~5 min the deque is full and becomes a true rolling window.
 
-  ▸ Thread timeline (default 10-min session):
+  ▸ Thread timeline (default 20-min session):
 
       t=0s      Both threads start
                 ├── low_latency: runs immediately, then every 1 s
@@ -228,8 +231,8 @@ FILES
       t=5min    low_latency iteration #300
                 historical iteration #5 → deque now full, true rolling window
       ...
-      t=10min   low_latency iteration #600
-                historical iteration #10 → refreshes VWAP one last time
+      t=20min   low_latency iteration #1200
+                historical iteration #20 → refreshes VWAP one last time
                 stop_event set → both threads exit
 
 ## 4b. REGIME DETECTION  (strategy/regime_director.py — RegimeDirector)
@@ -423,9 +426,16 @@ FILES
   - `execute()`: validates strategy, caps quantity, dispatches the order.
     Dynamic cap: BUY = `min(aq, usdt × MAX_POSITION_PCT / (price × (1 + fee)))`
     — at most `MAX_POSITION_PCT` (default 10 %) of available USDT per signal,
-    with the taker fee reserved.  SELL = `min(bq, btc)`.  `MAX_POSITION_PCT`
-    is the same constant used by `backtest/pnl.py`, keeping live and backtest
-    BUY sizing aligned.
+    with the taker fee reserved.  The budget is then clamped by the
+    **cash-reserve floor** so the leg never spends the account below
+    `MIN_CASH_RESERVE_PCT` (0.50) of mark-to-market equity, mirroring
+    `backtest/pnl.py`; the dispatched `last_buy_qty` / `last_buy_price` are
+    exposed for the strategy's pyramiding cost-basis accrual.  SELL =
+    `min(bq, btc)`.  `MAX_POSITION_PCT` and `MIN_CASH_RESERVE_PCT` are the same
+    constants used by `backtest/pnl.py`, keeping live and backtest BUY sizing
+    aligned.  Whether a new leg is dispatched at all (serialization,
+    `MAX_PYRAMID_LEGS`, reserve floor) is
+    decided upstream by the exposure gate in `strategy/analysis.py`.
   - `cancel_stale_buy(timeout_sec=10.0)`: cancels the outstanding GTC BUY via
     REST if it has been open ≥ 10 s.  Returns True (reset `_position_open`) on
     success; False if cancel fails (order likely filled — keep guard armed).

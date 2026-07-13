@@ -167,7 +167,7 @@ def print_report(
     print(f"  Executed SELL              :  {n_sell:>8,}")
     print(f"  HOLD (no signal)           :  {n_hold:>8,}")
     print(
-        f"  HOLD (position open)       :  {n_guard:>8,}  ← BUY suppressed by position guard"
+        f"  HOLD (cash reserve)        :  {n_guard:>8,}  ← BUY suppressed by cash-reserve floor"
     )
     print(
         f"  Whipsaw exits              :  {n_whipsaw:>8,}  ← forced SELL (same bar hit BUY+SELL zone)"

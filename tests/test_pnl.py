@@ -2,8 +2,9 @@
 round-trip pairing helper.
 
 All scenarios are hand-built so every number below is verifiable by hand.
-BUY sizing is capped at ``MAX_POSITION_PCT`` (0.10) of available USDT — with a
-1000-USDT start and a 100.0 entry price this yields exactly 1.0 BTC.
+BUY sizing is capped at ``MAX_POSITION_PCT`` (0.20) of available USDT — with a
+1000-USDT start and a 100.0 entry price this yields up to 2.0 BTC per leg (or
+less when the synthetic book quantity ``buy_qty`` is the binding constraint).
 """
 
 import numpy as np
@@ -63,21 +64,44 @@ def test_simulate_pnl_single_round_trip():
     assert stats["win_rate_pct"] == pytest.approx(100.0)
 
 
-def test_simulate_pnl_position_guard_blocks_second_buy():
-    """While already long, a second BUY signal is refused by the position
-    guard (counted as a skip) so the backtest can't pyramid — the live
-    pyramiding bug this suite guards against."""
+def test_simulate_pnl_pyramids_second_buy():
+    """Two consecutive BUY signals STACK (pyramid): each leg is sized at
+    MAX_POSITION_PCT (20%) of the *remaining* cash, so both execute and no
+    reserve-floor skip is recorded. A large book qty makes the budget bind:
+    leg 1 spends 20% of 1000 (= 2.0 BTC @ 100); leg 2 spends 20% of the
+    remaining 800 (= 160/101 BTC @ 101). The 50% reserve floor does not bind
+    (cash stays above 50% of equity for both legs)."""
     sig = make_signals(
         [
-            {"signal": 1, "close": 100.0, "buy_qty": 1.0, "best_buy_micro": 100.0},
-            {"signal": 1, "close": 101.0, "buy_qty": 1.0, "best_buy_micro": 101.0},
+            {"signal": 1, "close": 100.0, "buy_qty": 100.0, "best_buy_micro": 100.0},
+            {"signal": 1, "close": 101.0, "buy_qty": 100.0, "best_buy_micro": 101.0},
         ]
     )
     trades, _equity, stats = simulate_pnl(
         sig, initial_usdt=1000.0, initial_btc=0.0, fee_rate=0.0
     )
+    assert list(trades["side"]) == ["BUY", "BUY"]  # both legs pyramid
+    assert stats["n_position_guard_skips"] == 0
+    assert trades["quantity"].iloc[0] == pytest.approx(2.0)  # 200 / 100
+    assert trades["quantity"].iloc[1] == pytest.approx(160.0 / 101.0)  # 160 / 101
+
+
+def test_simulate_pnl_reserve_floor_blocks_buy():
+    """When cash is already at/below MIN_CASH_RESERVE_PCT (10%) of mark-to-market
+    equity, a BUY is suppressed (counted in n_position_guard_skips) so the book
+    never invests past 90%. Here 100 USDT cash + 10 BTC @ 100 → equity 1100, and
+    the 110 reserve floor already exceeds the 100 cash, so the BUY is refused and
+    no trade fires."""
+    sig = make_signals(
+        [
+            {"signal": 1, "close": 100.0, "buy_qty": 1.0, "best_buy_micro": 100.0},
+        ]
+    )
+    trades, _equity, stats = simulate_pnl(
+        sig, initial_usdt=100.0, initial_btc=10.0, fee_rate=0.0
+    )
     assert stats["n_position_guard_skips"] == 1
-    assert list(trades["side"]) == ["BUY"]  # only the first BUY executed
+    assert len(trades) == 0  # reserve floor blocked the only BUY
 
 
 def test_simulate_pnl_stop_loss_fires():

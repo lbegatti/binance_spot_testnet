@@ -17,6 +17,8 @@ from config_parameters import (
     VWAP_THRESHOLD_MULTIPLIER,
     TREND_CONSECUTIVE_BARS,
     TREND_COOLDOWN_BARS,
+    MIN_CASH_RESERVE_PCT,
+    MAX_PYRAMID_LEGS,
 )
 from execution.order_executor import OrderExecutor
 from strategy.indicators import (
@@ -151,22 +153,54 @@ class AnalysisEngine:
         # below is not overwritten by a later unconditional initialisation.
         self._avg_entry_price: float = 0.0
 
-        # Pre-arm position guard when the account already holds BTC at session
-        # start. Treats inherited BTC as an open BUY so the first valid SELL
-        # closes it naturally, after which the strategy runs in USDT-only mode
-        # matching the backtest's BACKTEST_INITIAL_BTC = 0 assumption.
-        # initial_avg_entry_price (btc_start_price from websocket_main.py) is
-        # used as the stop-loss anchor so the inherited position is protected
-        # even though we never placed the original BUY this session.
+        # ── Pyramiding position accounting (live parity with backtest/pnl.py) ─
+        # BUY legs may STACK up to the cash-reserve floor (MIN_CASH_RESERVE_PCT).
+        # The running position is tracked as a volume-weighted cost basis so the
+        # stop-loss anchor (_avg_entry_price) is the AVERAGE entry across all
+        # open legs, not just the last one.
+        #   _position_qty_btc   — total BTC held by strategy legs (inherited BTC
+        #                         is folded in via the pre-arm below).
+        #   _position_cost_usdt — Σ(leg_price × leg_qty) across open legs.
+        # How the basis is updated:
+        #   • When a BUY leg is PLACED, we add it to the basis straight away
+        #     (order price × order qty) — we do NOT wait for the fill to be
+        #     confirmed.
+        #   • If that order never fills and is cancelled later (see
+        #     cancel_stale_buy()), we subtract it back out.
+        # We use the order price, not the exact fill price, because this average
+        # entry only feeds the stop-loss trigger (not P&L accounting), so a tiny
+        # price difference is harmless.
+        self._position_qty_btc: float = 0.0
+        self._position_cost_usdt: float = 0.0
+        # Single-slot record of the CURRENT in-flight leg's optimistic accrual,
+        # so it can be reversed on an unfilled cancel.  Legs are serialized (a
+        # new one is dispatched only when no BUY is in flight), so one slot
+        # always suffices.
+        self._pending_leg_qty: float = 0.0
+        self._pending_leg_cost: float = 0.0
+        # Open-leg count — enforces MAX_PYRAMID_LEGS, the hard ceiling on how
+        # many BUY legs may stack (reset to 0 on a full close).
+        self._pyramid_legs: int = 0
+
+        # Startup position (FLATTEN_ON_START=False): the account may already
+        # hold BTC left over from a previous session.  Treat it as our STARTING
+        # POSITION — inventory we already hold, NOT a pending order — so the
+        # strategy simply trades around it: it can BUY more or SELL it as signals
+        # dictate, and the stop-loss protects it.  It is recorded as the current
+        # position (one held chunk) anchored at initial_avg_entry_price (the
+        # session-start price, since the true original entry price is unknown),
+        # which feeds the stop-loss and the reserve / exposure maths.
         with self.state.thread_balance_lock:
             _initial_btc = self.state.balance_status.get(CRYPTOCCY, 0.0)
         if _initial_btc >= 0.0001:
             self._position_open = True
             self._avg_entry_price = initial_avg_entry_price
+            self._position_qty_btc = _initial_btc
+            self._position_cost_usdt = _initial_btc * initial_avg_entry_price
+            self._pyramid_legs = 1
             logging.info(
-                "Position guard pre-armed: %.8f %s on account at startup — "
-                "treating as open position (first SELL will close it). "
-                "Stop-loss anchor: %.2f.",
+                "Startup position: %.8f %s already held — trading around it "
+                "(BUY or SELL per signals). Stop-loss anchor: %.2f.",
                 _initial_btc,
                 CRYPTOCCY,
                 initial_avg_entry_price,
@@ -211,6 +245,57 @@ class AnalysisEngine:
         # hft_thread.join() in websocket_main.py's finally block, so no lock
         # is needed.  For a 10-minute session this is ~600 entries (~50 KB).
         self._equity_snapshots: list[tuple] = []
+
+    # ── Pyramiding cost-basis helpers ─────────────────────────────────────
+    def _recompute_avg_entry(self) -> None:
+        """Refresh ``_avg_entry_price`` from the running cost basis (0.0 flat)."""
+        self._avg_entry_price = (
+            self._position_cost_usdt / self._position_qty_btc
+            if self._position_qty_btc > 1e-9
+            else 0.0
+        )
+
+    def _add_leg_to_basis(self, price: float, qty: float) -> None:
+        """Add a just-placed BUY leg to the running cost basis.
+
+        Also records this leg's size/cost in the single-slot ``_pending_leg_*``
+        so it can be removed again if the leg's LIMIT order never fills and is
+        cancelled (see ``_back_out_pending_leg``).
+        """
+        self._pending_leg_qty = qty
+        self._pending_leg_cost = price * qty
+        self._position_qty_btc += qty
+        self._position_cost_usdt += price * qty
+        self._pyramid_legs += 1
+        self._position_open = True
+        self._recompute_avg_entry()
+
+    def _back_out_pending_leg(self) -> None:
+        """Remove the last-added leg from the basis (its order was cancelled
+        without filling)."""
+        self._position_qty_btc = max(
+            0.0, self._position_qty_btc - self._pending_leg_qty
+        )
+        self._position_cost_usdt = max(
+            0.0, self._position_cost_usdt - self._pending_leg_cost
+        )
+        self._pyramid_legs = max(0, self._pyramid_legs - 1)
+        self._pending_leg_qty = 0.0
+        self._pending_leg_cost = 0.0
+        if self._pyramid_legs <= 0 or self._position_qty_btc <= 1e-9:
+            self._reset_position_flat()
+        else:
+            self._recompute_avg_entry()
+
+    def _reset_position_flat(self) -> None:
+        """Clear all pyramiding state after a full close (SELL / stop-loss)."""
+        self._position_open = False
+        self._position_qty_btc = 0.0
+        self._position_cost_usdt = 0.0
+        self._pyramid_legs = 0
+        self._pending_leg_qty = 0.0
+        self._pending_leg_cost = 0.0
+        self._avg_entry_price = 0.0
 
     @staticmethod
     def _build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
@@ -371,11 +456,24 @@ class AnalysisEngine:
             # cancel_stale_buy() returns True  → order cancelled (or no orderId);
             #                               False → order may have filled; keep guard.
             if self._position_open and self.order_executor.cancel_stale_buy():
-                self._position_open = False
-                self._avg_entry_price = 0.0
-                logging.info(
-                    "HFT #%d — stale BUY cancelled; position guard reset.", iteration
-                )
+                # A resting BUY leg was cancelled unfilled — reverse the
+                # optimistic cost basis accrued for THIS leg at dispatch.
+                # Earlier filled legs are untouched; we only go flat if this was
+                # the last open leg.
+                self._back_out_pending_leg()
+                if self._pyramid_legs <= 0:
+                    logging.info(
+                        "HFT #%d — stale BUY cancelled; now flat (no open legs).",
+                        iteration,
+                    )
+                else:
+                    logging.info(
+                        "HFT #%d — stale BUY leg cancelled; %d leg(s) still open "
+                        "(avg entry %.2f).",
+                        iteration,
+                        self._pyramid_legs,
+                        self._avg_entry_price,
+                    )
                 self.stop_event.wait(HFT_INTERVAL)
                 continue
 
@@ -389,8 +487,7 @@ class AnalysisEngine:
             if self._position_open:
                 _sell_outcome = self.order_executor.cancel_stale_sell()
                 if _sell_outcome == "closed":
-                    self._position_open = False
-                    self._avg_entry_price = 0.0
+                    self._reset_position_flat()  # full close clears all legs
                     logging.info(
                         "HFT #%d — LIMIT SELL filled; position closed, now flat.",
                         iteration,
@@ -484,8 +581,7 @@ class AnalysisEngine:
                         _sl_floor,
                     )
                     self._n_stop_loss_fires += 1
-                    self._position_open = False
-                    self._avg_entry_price = 0.0
+                    self._reset_position_flat()  # full close clears all legs
                     # Cancel any resting LIMIT exit first so the BTC it locked is
                     # freed for the urgent MARKET close, then force the exit.
                     self.order_executor.cancel_stale_sell(timeout_sec=0.0)
@@ -597,54 +693,94 @@ class AnalysisEngine:
                         bid_vwap,
                         VWAP_THRESHOLD_MULTIPLIER,
                     )
-                elif self._position_open:
-                    # Position guard: already holding a strategy-opened position.
-                    # Prevents stacking multiple overlapping BUY LIMIT orders
-                    # (grid behaviour) in both REST-fallback mode (balance never
-                    # updated) and the WS race window (balance update arrives late).
-                    # Mirrors the identical guard in backtest/pnl.py.
-                    #
-                    # Ghost-position check: if the guard is armed but BTC balance
-                    # is ~0, the limit BUY likely never filled (price moved away
-                    # before the order matched).  Reset so the strategy can
-                    # re-enter on the next signal.
-                    #
-                    # Three conditions must ALL hold before disarming:
-                    #   1. no resting LIMIT SELL — its locked BTC reads as free≈0
-                    #      (disarming would orphan the exit for the session);
-                    #   2. no unresolved BUY — a resting/just-filled LIMIT BUY is
-                    #      handled by cancel_stale_buy() after its 10 s window,
-                    #      NOT here (disarming early re-fires the same signal
-                    #      every tick: 8 duplicate BUYs in 14 s on 2026-07-08);
-                    #   3. a FRESH REST balance confirms the account is truly
-                    #      flat — never disarm on a snapshot up to 60 s old.
+                else:
+                    # ── Ghost-reset ────────────────────────────────────────
+                    # If we believe we hold legs but the account is truly flat
+                    # (a LIMIT BUY that never filled), clear the stale basis.
+                    # All must hold: no resting SELL (its locked BTC reads as
+                    # free≈0), no unresolved BUY (handled by cancel_stale_buy
+                    # after its 10 s window — disarming early re-fired the same
+                    # signal every tick: 8 duplicate BUYs in 14 s on 2026-07-08),
+                    # and a FRESH REST balance confirming flat (never on a ≤60 s
+                    # snapshot).
                     if (
-                        btc_balance < 0.0001
+                        self._pyramid_legs > 0
+                        and btc_balance < 0.0001
                         and not self.order_executor.has_pending_sell()
                         and not self.order_executor.has_pending_buy()
                         and self.order_executor.refresh_and_check_flat()
                     ):
-                        self._position_open = False
+                        self._reset_position_flat()
                         logging.info(
-                            "HFT #%d [buy] — position guard reset: armed but BTC "
-                            "balance %.8f ≈ 0 and no resting exit (LIMIT BUY likely "
-                            "unfilled).",
+                            "HFT #%d [buy] — position reset: armed but BTC balance "
+                            "%.8f ≈ 0 and no resting exit (LIMIT BUY unfilled).",
                             iteration,
                             btc_balance,
                         )
-                    else:
+
+                    # ── Exposure gate (pyramiding, live parity w/ pnl.py) ──
+                    # Replaces the old single-position guard.  A new BUY leg is
+                    # allowed only when ALL hold; otherwise the signal is a skip:
+                    #   • serialization — no BUY/SELL in flight (each leg fully
+                    #     resolves before the next; this alone bounds how fast
+                    #     legs stack and kills the stale-balance stampede that
+                    #     pyramided to ~91% equity);
+                    #   • leg cap — fewer than MAX_PYRAMID_LEGS legs open;
+                    #   • reserve floor — free USDT above MIN_CASH_RESERVE_PCT of
+                    #     mark-to-market equity (mirrors backtest/pnl.py; the
+                    #     executor clamps the size to the same budget as a
+                    #     second line of defence).
+                    _equity = usdt_balance + btc_balance * micro_price
+                    _spendable = usdt_balance - MIN_CASH_RESERVE_PCT * _equity
+                    if (
+                        self.order_executor.has_pending_buy()
+                        or self.order_executor.has_pending_sell()
+                    ):
                         self._position_guard_skips += 1
                         logging.info(
-                            "HFT #%d [buy] — skipped: position already open "
-                            "(guard skips so far this session: %d)",
+                            "HFT #%d [buy] — skipped: an order is still in flight "
+                            "(serialized legs).",
                             iteration,
-                            self._position_guard_skips,
                         )
-                else:
-                    self._position_open = True
-                    _buy_dispatched = True  # mirror signals.py exclusivity
-                    self._avg_entry_price = float(micro_price)  # stop-loss anchor
-                    self.order_executor.execute("BUY", best_buy)
+                    elif self._pyramid_legs >= MAX_PYRAMID_LEGS:
+                        self._position_guard_skips += 1
+                        logging.info(
+                            "HFT #%d [buy] — skipped: max pyramid legs reached "
+                            "(%d/%d).",
+                            iteration,
+                            self._pyramid_legs,
+                            MAX_PYRAMID_LEGS,
+                        )
+                    elif _spendable <= 0.0:
+                        self._position_guard_skips += 1
+                        logging.info(
+                            "HFT #%d [buy] — skipped: cash-reserve floor reached "
+                            "(free %.2f ≤ %.0f%% of equity %.2f).",
+                            iteration,
+                            usdt_balance,
+                            MIN_CASH_RESERVE_PCT * 100,
+                            _equity,
+                        )
+                    else:
+                        # Dispatch a new leg.  The executor sizes it (≤ 20 % of
+                        # free USDT, clamped by the same reserve floor) and
+                        # exposes the dispatched qty/price for the cost basis.
+                        _buy_dispatched = True  # mirror signals.py exclusivity
+                        self.order_executor.execute("BUY", best_buy)
+                        _leg_qty = self.order_executor.last_buy_qty
+                        if _leg_qty > 0.0:
+                            self._add_leg_to_basis(
+                                self.order_executor.last_buy_price, _leg_qty
+                            )
+                            logging.info(
+                                "HFT #%d [buy] — leg %d dispatched: qty=%.6f @ "
+                                "%.2f (avg entry %.2f).",
+                                iteration,
+                                self._pyramid_legs,
+                                _leg_qty,
+                                self.order_executor.last_buy_price,
+                                self._avg_entry_price,
+                            )
             if best_sell and not _buy_dispatched:
                 # _buy_dispatched guard mirrors backtest/signals.py's
                 # `signal == 0` exclusivity — at most one trade per tick.
