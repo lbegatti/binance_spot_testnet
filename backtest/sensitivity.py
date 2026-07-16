@@ -15,7 +15,7 @@ Three execution modes
       Uses Optuna TPE sampler to intelligently search the parameter space.
       Default 40 trials (~5–8 h on a laptop, ~8–12 min per trial).
       Optuna TPE warm-up uses 10 random trials; exploitation begins at trial 11.
-      The equivalent exhaustive grid would be 3×1×12×9 = 324 combos (weeks of compute);
+      The equivalent exhaustive grid would be 3×1×12×3 = 108 combos (weeks of compute);
       Bayes explores that same space intelligently in 40 trials.
         ↳ klines fetched ONCE then shared across all trials.
       Run with:  python -m backtest.sensitivity
@@ -167,7 +167,14 @@ _OPTUNA_SPACE: dict[str, tuple] = {
         60,
         5,
     ),  # 12 values: 5,10,15…60 min; step=5 keeps trials tractable
-    "vwap_threshold": ("float", 0.001, 0.005, 0.0005),
+    "vwap_threshold": ("float", 0.002, 0.003, 0.0005),
+    # Range restricted 2026-07-16 from (0.001, 0.005) → (0.002, 0.003):
+    #   • floor 0.002 = round-trip fee break-even (0.001 taker × 2); below it the
+    #     optimiser produced a fee-bleed degenerate (−54 % OOS at 0.001).
+    #   • cap 0.003 keeps the band tradeable; the old 0.005 max is untradeable in
+    #     a live session (price rarely deviates 0.5 % from a rolling VWAP intraday),
+    #     yet Optuna picked it on bear IS windows to minimise trade count.
+    #   Kept in the search space (NOT hardcoded) — 3 values: 0.0020/0.0025/0.0030.
     # trend_consecutive_bars and trend_cooldown_bars removed from Optuna search space
     # (2026-05-24): fixed at TREND_CONSECUTIVE_BARS=3 / TREND_COOLDOWN_BARS=4 in
     # config_parameters.py based on the best values found in the first Optuna run.
@@ -1166,7 +1173,7 @@ if __name__ == "__main__":
         description=(
             "Sensitivity analysis for the BTCUSDT backtesting pipeline.\n\n"
             "DEFAULT (no flags): Bayesian optimisation via Optuna — 40 trials by default (~5–8 h).\n"
-            "  Explores 3×1×12×9 = 324-combination-equivalent space intelligently.\n"
+            "  Explores 3×1×12×3 = 108-combination-equivalent space intelligently.\n"
             "  Use --n-trials 20 for a faster ~2.5–4 h run.\n"
             "  Optuna diagnostic charts are always saved to backtest/reporting/.\n\n"
             "--oat        Phase 1 OAT sweep (7 combinations, ~1–2 h).\n"

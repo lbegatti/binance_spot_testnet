@@ -30,7 +30,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 20  # default session length
+DEFAULT_SESSION_MINUTES = 60  # default session length
 # at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
@@ -125,6 +125,19 @@ HMM_N_INIT = 5
 # 0.60 = 1.8× random for 3 states (33 % baseline). Still requires clear model
 # conviction while opening the 50–69 % confidence band that 0.70 fully rejected.
 HMM_MIN_CONFIDENCE = 0.60
+# Minimum ABSOLUTE mean log-return (per 5 m candle) for a state to earn a
+# directional label.  The directional labels in assign_regime_labels() are
+# assigned by RELATIVE rank (lowest-ranked state → "trending_down", highest →
+# "trending_up"), so with the usual 2 BIC states there is ALWAYS a
+# "trending_down" bucket — even in a flat or rising market.  That spuriously
+# blocked the BUY side for a whole flat/+0.44 % session (2026-07-14): 38/50
+# HMM pulses read "trending_down" while price actually drifted UP.
+# A state whose mean return sits inside ±REGIME_DIRECTIONAL_RETURN_THRESHOLD is
+# treated as non-directional and falls through to high_volatility / neutral
+# (both BUY-eligible), so only a genuinely negative/positive state trips the
+# directional gate.  Units: log-return per 5 m bar (0.0005 ≈ 0.05 %/bar).
+# NOTE: default is a first cut — calibrate against a few live/backtest sessions.
+REGIME_DIRECTIONAL_RETURN_THRESHOLD = 0.0005
 # Cadence at which the full HMM re-fit (select_hmm_model()) is triggered
 # inside historical_analysis().  Between re-fits only a cheap Viterbi pass
 # (predict_current_regime()) runs.  Must be a multiple of HIST_INTERVAL.

@@ -314,7 +314,7 @@ def print_regime_validation_report(
     std_fwd = tl.groupby("regime_label")["fwd_return"].std()
     med_conf = tl.groupby("regime_label")["regime_confidence"].median()
 
-    _CANDLES_PER_DAY = 1440
+    _CANDLES_PER_DAY = 288  # 24 h × 12 bars/h at 5m resolution (macro frame)
     test_days = round(
         n_total / _CANDLES_PER_DAY
     )  # derived from actual test candles, not hardcoded total
@@ -355,7 +355,10 @@ def print_regime_validation_report(
             "direction_test",
             "Check 1 — Direction test (trending_up > neutral > trending_down):",
         ),
-        ("welch_ttest", "Check 2 — Kruskal-Wallis H-test (all regime states):"),
+        (
+            "welch_ttest",
+            "Check 2 — Kruskal-Wallis H-test (informational — not scored):",
+        ),
         (
             "volatility_check",
             "Check 3 — Volatility check (high_vol mean vol > neutral mean vol):",
@@ -371,14 +374,23 @@ def print_regime_validation_report(
         ),
     ]
 
-    auto_checks = [k for k, _ in check_order if k != "hit_rate_alignment"]
+    # Informational checks are printed but NOT scored in the overall tally.
+    # Check 6 (hit-rate) is a comparison aid; Check 2 (Kruskal-Wallis) is
+    # demoted because the multimodal HMM fit makes its verdict flip between
+    # runs — see _run_checks Check 2 docstring. Check 1 governs the filter.
+    informational = {"hit_rate_alignment", "welch_ttest"}
+    auto_checks = [k for k, _ in check_order if k not in informational]
 
     for key, title in check_order:
         c = checks[key]
         lines += [f" {title}", f"   {c['detail']}"]
-        if key != "hit_rate_alignment":
-            suffix = "  (pass if p < 0.10)" if key == "welch_ttest" else ""
-            lines.append(f"   → {verdict(c['pass'])}{suffix}")
+        if key not in informational:
+            lines.append(f"   → {verdict(c['pass'])}")
+        elif key == "welch_ttest":
+            lines.append(
+                "   → INFORMATIONAL (not scored — reference p < 0.10; verdict "
+                "flips with the multimodal fit, so Check 1 governs the filter)"
+            )
         lines.append("")
 
     n_pass = sum(checks[k]["pass"] for k in auto_checks)

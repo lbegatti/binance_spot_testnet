@@ -12,6 +12,7 @@ from config_parameters import (
     HMM_LOOKBACK,
     HMM_MIN_COVAR,
     HMM_N_INIT,
+    REGIME_DIRECTIONAL_RETURN_THRESHOLD,
     SYMBOL,
 )
 import logging
@@ -540,16 +541,36 @@ class RegimeDirector:
         for the current (latest) candle via ``self.regime_label``.
 
         **Directional labels** are assigned by ranking all states on a combined
-        score of ``return.rank() + obi_proxy.rank()``:
+        score of ``return.rank() + obi_proxy.rank()`` **and** confirming a
+        genuine absolute return:
 
         * ``trending_up``   — state with the **highest** combined rank
-          (highest mean return + strongest buy-side order flow).
+          (highest mean return + strongest buy-side order flow) **whose mean
+          log-return exceeds** ``+REGIME_DIRECTIONAL_RETURN_THRESHOLD``.
         * ``trending_down`` — state with the **lowest** combined rank
-          (lowest mean return + weakest / most negative order flow).
+          (lowest mean return + weakest / most negative order flow) **whose mean
+          log-return is below** ``−REGIME_DIRECTIONAL_RETURN_THRESHOLD``.
 
-        This guarantees **exactly one state per directional label** regardless
-        of ``n_components``, eliminating the duplicate-label problem that
-        arises when multiple states simultaneously exceed a threshold.
+        The comparison is made in **raw log-return-per-bar units**: the HMM is
+        fit on ``StandardScaler``-z-scored features, so ``model.means_`` are
+        z-scores and must be un-standardised (``raw = z × scale_ + mean_``)
+        before being compared against the raw threshold.  Skipping that step
+        compares a z-score (~±1–2 σ) against a raw threshold (~5e-4) — every
+        best/worst state trivially clears it and the guard becomes a no-op
+        (observed 2026-07-15: a flat −0.106 % session stayed "trending_down"
+        every pulse).
+
+        The ±threshold guard is essential: ``idxmax``/``idxmin`` always pick a
+        best/worst state, so **rank alone would tag the lowest-ranked state
+        "trending_down" even in a flat or rising market** (with the usual 2 BIC
+        states there is otherwise always a "trending_down" bucket).  On
+        2026-07-14 that blocked the BUY side for a whole +0.44 % session
+        (38/50 pulses read "trending_down" while price drifted up).  A state
+        that clears the rank but not the absolute return is **non-directional**
+        and falls through to the secondary labels below (both BUY-eligible).
+
+        At most one state per directional label is still guaranteed (rank picks
+        a single best/worst), so the duplicate-label problem does not return.
 
         **Secondary labels** are assigned to the remaining states:
 
@@ -589,7 +610,25 @@ class RegimeDirector:
         assert self.current_regime is not None, (
             "current_regime is None — call select_hmm_model() before assign_regime_labels()."
         )
+        assert self.scaler is not None, (
+            "scaler is None — select_hmm_model() must have been called first "
+            "(needed to un-standardise the state return means below)."
+        )
         means = pd.DataFrame(self.model.means_, columns=HMM_FEATURE_COLS)
+
+        # ``model.means_`` live in the StandardScaler's z-score space (features
+        # are scaled before the HMM fit — see select_hmm_model()).  The directional
+        # threshold below is expressed in RAW log-return per 5 m bar, so the state
+        # return means must be un-standardised back to raw units before the
+        # comparison.  Otherwise a z-score (~±1–2 σ) is compared against a raw
+        # threshold (~5e-4), the guard is satisfied by essentially ANY worst/best
+        # state, and the directional gate is a no-op — which is exactly why a flat
+        # market stayed "trending_down" for the whole 2026-07-15 session (net drift
+        # only −0.106 %).  Un-standardise: raw = z × scale_ + mean_.
+        _ret_idx = HMM_FEATURE_COLS.index("return")
+        means_return_raw = (
+            means["return"] * self.scaler.scale_[_ret_idx] + self.scaler.mean_[_ret_idx]
+        )
 
         # Thresholds for secondary labels
         mean_vol = means["volatility"].mean()
@@ -613,15 +652,23 @@ class RegimeDirector:
         for state in range(self.model.n_components):
             vol = means.loc[state, "volatility"]
             td = means.loc[state, "trade_density"]
+            r = means_return_raw[state]  # mean log-return of this state (RAW units)
 
             # large intra-bar swings → unpredictable fills
             high_vol = vol > mean_vol + std_vol
             # many small fragmented trades → no clear directional intent
             high_td = td > mean_td + 0.5 * std_td
 
-            if state == best_state:
+            # A directional label requires BOTH the relative rank AND a genuine
+            # absolute return of the right sign.  Rank alone is not enough:
+            # idxmax/idxmin always pick a best/worst state even in a flat market,
+            # so without the ±threshold guard the lowest-ranked state is labelled
+            # "trending_down" while price is flat or rising (observed 2026-07-14),
+            # needlessly blocking the BUY side.  When the guard fails the state
+            # is non-directional and falls through to high_volatility / neutral.
+            if state == best_state and r > REGIME_DIRECTIONAL_RETURN_THRESHOLD:
                 labels[state] = "trending_up"
-            elif state == worst_state:
+            elif state == worst_state and r < -REGIME_DIRECTIONAL_RETURN_THRESHOLD:
                 labels[state] = "trending_down"
             elif high_vol or high_td:
                 # Either large price swings OR heavy fragmentation makes the
@@ -630,12 +677,15 @@ class RegimeDirector:
             else:
                 labels[state] = "neutral"
 
+            # r_raw is un-standardised log-return per bar (drives the directional
+            # gate); vol/obi/td are shown in the z-score space the vol/td gates
+            # actually compare in, so the suffixes flag the differing units.
             logging.debug(
-                "RegimeDirector: state=%d label='%s' | r=%.5f vol=%.5f obi=%.4f td=%.6f"
-                " | direction_score=%.2f",
+                "RegimeDirector: state=%d label='%s' | r_raw=%.5f vol_z=%.5f "
+                "obi_z=%.4f td_z=%.6f | direction_score=%.2f",
                 state,
                 labels[state],
-                means.loc[state, "return"],
+                r,
                 vol,
                 means.loc[state, "obi_proxy"],
                 td,

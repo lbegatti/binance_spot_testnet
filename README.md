@@ -48,7 +48,7 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 | 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 20 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
 | 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
-| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test, cross-correlation, entropy, stationarity, persistence) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
+| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test [informational], volatility check, confidence floor, label frequency, hit-rate alignment [informational]) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
 
 **Detailed notes on `regime_validation.py`:**
 - Uses its own independent **2-year lookback** (`VALIDATION_LOOKBACK = "730 days ago UTC"`) — NOT affected by `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` used by `sensitivity.py` and `runner.py`.
@@ -915,9 +915,11 @@ python -c "from backtest.runner import run_backtest; run_backtest(export_csv=Tru
 > Whenever `RegimeDirector` logic is modified (feature columns, BIC search range,
 > label-assignment rules, confidence threshold, etc.) the validation tool **must**
 > be re-run to confirm that the frozen model still produces statistically meaningful
-> labels on out-of-sample data.  A failing check (especially Check 1 — direction
-> test, or Check 2 — Kruskal-Wallis H-test) is a strong signal that the change broke the
-> regime filter's discriminative power and should be reviewed before deploying live.
+> labels on out-of-sample data.  A failing **Check 1 (direction test)** is a strong
+> signal that the change broke the regime filter's discriminative power and should be
+> reviewed before deploying live.  **Check 2 (Kruskal-Wallis H-test) is informational
+> only** — its verdict flips between runs with the multimodal HMM fit, so it is printed
+> but not scored (see `BACKTESTING.md`).
 >
 > ```bash
 > python -m backtest.diagnostics.regime_validation

@@ -237,11 +237,15 @@ historical_analysis()                       low_latency_analysis()
 
 | `regime_label`                      | BUY | SELL | Typical market condition                                                |
 |-------------------------------------|-----|------|-------------------------------------------------------------------------|
-| `"trending_up"`                     | ✅   | ❌    | Highest combined return + OBI rank (most bullish state)                 |
-| `"trending_down"`                   | ❌   | ✅    | Lowest combined return + OBI rank (most bearish state)                  |
+| `"trending_up"`                     | ✅   | ❌    | Highest combined return + OBI rank **and** mean return > `+REGIME_DIRECTIONAL_RETURN_THRESHOLD` (genuinely bullish) |
+| `"trending_down"`                   | ❌   | ✅    | Lowest combined return + OBI rank **and** mean return < `−REGIME_DIRECTIONAL_RETURN_THRESHOLD` (genuinely bearish) |
 | `"high_volatility"`                 | ❌   | ❌    | Large intra-bar swings OR heavy trade fragmentation — unreliable market |
-| `"neutral"`                         | ✅   | ✅    | No dominant signal in any feature                                       |
+| `"neutral"`                         | ✅   | ✅    | No dominant signal — includes a rank-best/worst state whose return sits inside ±`REGIME_DIRECTIONAL_RETURN_THRESHOLD` (flat market, not a real trend) |
 | `None` *(impossible after step 4b)* | ✅   | ✅    | Transparent — all orders pass through                                   |
+
+> **Directional labels need an absolute return, not just a rank.** `idxmax`/`idxmin` always pick a best/worst state, so ranking alone would tag the lowest-ranked state `"trending_down"` even in a flat or rising market. The `±REGIME_DIRECTIONAL_RETURN_THRESHOLD` guard (default `0.0005` ≈ 0.05 %/5 m bar) demotes such a state to `"neutral"` (BUY-eligible). Without it, a flat **+0.44 %** session on 2026-07-14 read `"trending_down"` on 38/50 HMM pulses and blocked every BUY. The default threshold is a first cut — calibrate it against a few live/backtest sessions.
+>
+> **Units matter.** The HMM is fit on `StandardScaler`-z-scored features, so `model.means_` are z-scores. The state return means are therefore **un-standardised back to raw log-return per bar** (`raw = z × scale_ + mean_`) *before* the ±threshold comparison. Comparing the z-score directly against the raw `0.0005` threshold makes the guard a no-op (a z-score of ~1 σ dwarfs 5e-4), which is exactly why a flat **−0.106 %** session on 2026-07-15 still read `"trending_down"` on every pulse until the un-standardisation was added.
 
 ---
 

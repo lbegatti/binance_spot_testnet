@@ -25,6 +25,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `HMM_LOOKBACK` | "10 hours ago UTC" | Rolling window (~120 bars at 5 m); stable EM convergence |
 | `HMM_MAX_REGIMES` | 3 | Upper bound on hidden states (BIC search 2–3) |
 | `HMM_MIN_CONFIDENCE` | 0.60 | Gate: block orders if regime confidence < 60% posterior |
+| `REGIME_DIRECTIONAL_RETURN_THRESHOLD` | 0.0005 | Min abs. mean log-return (per 5 m bar) for a state to earn a directional label; inside ±this a state is `neutral`/`high_volatility` (BUY-eligible), so a flat market is not mis-tagged `trending_down` |
 | `HMM_N_ITERATIONS` | 1000 | Max EM iterations per model fit |
 | `HMM_RANDOM_STATE` | 46 | Random seed for reproducible state numbering |
 | `HMM_MIN_COVAR` | 1e-1 | Regularisation floor for covariance matrices |
@@ -106,7 +107,7 @@ Which modules import each constant from `config_parameters.py`:
 - `core/message_handler.py` — `CRYPTOCCY`, `CCY`, `QUOTE_EVERY_N_TICKS`
 - `strategy/analysis.py` — `HFT_INTERVAL`, `HIST_INTERVAL`, `MIN_SNAPSHOTS`, `N_LEVELS`, `CCY`, `CRYPTOCCY`, `HMM_REFIT_INTERVAL`, `HMM_MIN_CONFIDENCE`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS` (stop-loss constants read indirectly via the refresher closure injected by `websocket_main.py`)
 - `strategy/book_utils.py` — `N_LEVELS`
-- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`
+- `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`, `REGIME_DIRECTIONAL_RETURN_THRESHOLD`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`, `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`
 - `strategy/analysis.py` — `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `MAX_PYRAMID_LEGS` (+ VWAP / regime / stop-loss / trend-pause constants)
 - `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
