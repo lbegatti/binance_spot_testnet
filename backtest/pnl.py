@@ -449,7 +449,7 @@ def simulate_pnl(
             # Cash-reserve floor: pyramiding is allowed (successive BUY legs may
             # stack via open_strategy_qty), but the trade is clamped so at least
             # MIN_CASH_RESERVE_PCT of the portfolio's mark-to-market equity always
-            # stays in USDT.  This caps invested exposure at (1 − reserve) = 90 %
+            # stays in USDT.  This caps invested exposure at (1 − reserve) = 80 %
             # instead of the old single-position rule that left ~90 % idle in cash.
             # Shared with execution/order_executor.py so live and backtest size
             # BUYs identically.

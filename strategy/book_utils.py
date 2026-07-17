@@ -24,7 +24,31 @@ import logging
 
 import numpy as np
 
-from config_parameters import N_LEVELS
+from config_parameters import (
+    N_LEVELS,
+    CANDIDATE_MEDIAN_FRAC,
+    CANDIDATE_DEPTH_FRAC,
+    CANDIDATE_FILTER_DEBUG,
+    CANDIDATE_FILTER_DEBUG_EVERY,
+)
+
+log = logging.getLogger(__name__)
+
+# Cumulative per-filter reject counters for the collect_candidates() diagnostic
+# (enabled by CANDIDATE_FILTER_DEBUG).  Accumulated across calls within one process
+# so a live session's log shows which gate starves candidates most.  Never read or
+# mutated when the flag is off — zero overhead on the backtest hot path.
+_CAND_FILTER_STATS: dict[str, int] = {
+    "calls": 0,      # collect_candidates() invocations
+    "levels": 0,     # total candidate levels examined (level 0 excluded)
+    "rej_thin": 0,   # failed the thin-book filter (depth < FRAC × median_depth)
+    "rej_depth": 0,  # failed the relative-depth filter (depth < FRAC × level_0_depth)
+    "rej_both": 0,   # failed BOTH liquidity filters
+    "passed_liq": 0, # passed both liquidity filters
+    "rej_dir": 0,    # passed liquidity but had NO imbalance (micro_price == mid_price)
+    "buys": 0,       # emitted buy candidates
+    "sells": 0,      # emitted sell candidates
+}
 
 
 def build_levels(snaps_bids: dict, snaps_asks: dict, n: int = N_LEVELS) -> tuple:
@@ -124,10 +148,14 @@ def collect_candidates(
     Iterates over every level (skipping level 0, the best bid/ask) and applies
     two liquidity filters before classifying each level as a buy or sell signal:
 
-    - **Thin-book filter**: the level's total depth must be ≥ ``median_depth``
-      (i.e. the level is *not* thin).
-    - **Depth-at-level-0 filter**: total depth must be ≥ 50 % of
-      ``level_0_depth`` (sufficient liquidity relative to the best level).
+    - **Thin-book filter**: the level's total depth must be ≥
+      ``CANDIDATE_MEDIAN_FRAC × median_depth`` (i.e. the level is *not* thin).
+    - **Depth-at-level-0 filter**: total depth must be ≥
+      ``CANDIDATE_DEPTH_FRAC × level_0_depth`` (sufficient liquidity relative to
+      the best level).
+
+    Both fractions are configurable in ``config_parameters.py`` — lower values
+    make the filters more permissive (more candidates survive).
 
     A level passes as a **buy candidate** when ``micro_price < mid_price``
     (ask-side dominance — price dipping below mid, confirming a buy-the-dip
@@ -181,8 +209,8 @@ def collect_candidates(
     # obi > 0.0 → bid wall heavier than ask side → micro_price pushed ABOVE mid → SELL signal.
     # obi < 0.0 → ask wall heavier than bid side → micro_price pulled BELOW mid → BUY signal.
     # obi = 0   → balanced book → micro_price ≈ mid_price → no directional candidate.
-    not_thin = total_depths >= median_depth  # thin-book filter
-    depth_ok = total_depths >= 0.5 * level_0_depth  # relative depth filter
+    not_thin = total_depths >= CANDIDATE_MEDIAN_FRAC * median_depth  # thin-book filter
+    depth_ok = total_depths >= CANDIDATE_DEPTH_FRAC * level_0_depth  # relative depth filter
     valid = not_thin & depth_ok
 
     buy_mask = valid & (
@@ -210,6 +238,44 @@ def collect_candidates(
 
     buy_candidates = _mask_to_tuples(buy_mask, buy_deltas)
     sell_candidates = _mask_to_tuples(sell_mask, sell_deltas)
+
+    # --- diagnostic: per-filter reject accounting (read-only) -----------------
+    # Attributes each rejected level to the gate(s) it failed so a live session's
+    # log reveals whether the thin-book / relative-depth filters or the "no
+    # imbalance" condition (micro_price == mid_price) is what starves candidates.
+    # Guarded by the flag so the backtest hot path (~130k calls) is unaffected.
+    if CANDIDATE_FILTER_DEBUG:
+        n_levels = arr.shape[0]
+        # A level with no imbalance (micro == mid) passes liquidity but yields no
+        # directional candidate — attribute it to the "direction" gate.
+        no_dir = valid & (micro_prices == mid_prices)
+        s = _CAND_FILTER_STATS
+        s["calls"] += 1
+        s["levels"] += int(n_levels)
+        s["rej_thin"] += int((~not_thin).sum())
+        s["rej_depth"] += int((~depth_ok).sum())
+        s["rej_both"] += int((~not_thin & ~depth_ok).sum())
+        s["passed_liq"] += int(valid.sum())
+        s["rej_dir"] += int(no_dir.sum())
+        s["buys"] += len(buy_candidates)
+        s["sells"] += len(sell_candidates)
+
+        if s["calls"] % CANDIDATE_FILTER_DEBUG_EVERY == 0 and s["levels"] > 0:
+            lv = s["levels"]
+            log.info(
+                "[cand-filter] calls=%d levels=%d (cumulative) | rejected of all "
+                "levels: thin=%.1f%% depth=%.1f%% both=%.1f%% no-imbalance=%.1f%% | "
+                "passed-liquidity=%.1f%% | candidates: buy=%d sell=%d",
+                s["calls"],
+                lv,
+                100.0 * s["rej_thin"] / lv,
+                100.0 * s["rej_depth"] / lv,
+                100.0 * s["rej_both"] / lv,
+                100.0 * s["rej_dir"] / lv,
+                100.0 * s["passed_liq"] / lv,
+                s["buys"],
+                s["sells"],
+            )
 
     return buy_candidates, sell_candidates
 

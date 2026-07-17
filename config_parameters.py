@@ -20,6 +20,23 @@ HISTORY_MAXLEN = 3000  # max snapshots in history_order_book
 # at 100 ms update intervals this covers ~5 minutes
 N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 
+# collect_candidates() liquidity filters (strategy/book_utils.py) — lower = more
+# permissive = more candidates (live + backtest).  Loosened 2026-07-17 to reduce
+# the ~92 % "no opportunities" rate observed on the deep, balanced real book.
+CANDIDATE_MEDIAN_FRAC: float = 0.5   # thin-book filter: depth ≥ FRAC × median_depth  (was hardcoded 1.0)
+CANDIDATE_DEPTH_FRAC: float = 0.25   # relative-depth  : depth ≥ FRAC × level_0_depth (was hardcoded 0.5)
+
+# Diagnostic: when True, collect_candidates() accumulates per-filter reject counts
+# and logs a cumulative summary every CANDIDATE_FILTER_DEBUG_EVERY calls, so a live
+# session log reveals WHICH gate (thin-book / relative-depth / no-imbalance) starves
+# candidates most.  Read-only — does not change filtering.
+# Currently True for a live diagnostic session.  Set back to False before running the
+# backtest: collect_candidates runs ~130k times there, and runner.py (INFO level) would
+# print a summary line every 300 calls (~430 lines).  The sensitivity sweep is unaffected
+# (it suppresses logging to WARNING), but the accumulation overhead still runs.
+CANDIDATE_FILTER_DEBUG: bool = True
+CANDIDATE_FILTER_DEBUG_EVERY: int = 300  # emit summary every N calls (~5 min live at 1 s)
+
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
 # ---------------------------------------------------------------------------
@@ -291,20 +308,25 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # Cash-reserve floor (fraction of mark-to-market equity that must always remain
 # in USDT).  BUY legs may PYRAMID — each leg is still ≤ MAX_POSITION_PCT of the
 # available USDT, but successive legs stack until invested exposure reaches
-# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.10 → at most 90 % invested, always
-# ≥ 10 % cash held back.  Replaces the old single-position rule that left the
+# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.20 → at most 80 % invested, always
+# ≥ 20 % cash held back.  Replaces the old single-position rule that left the
 # book ~90 % idle in cash, without ever going fully all-in.  Applies to BOTH the
 # live system and the backtest so simulated and live sizing stay aligned.
 #
-# Set to 0.10 to give the strategy the most room to trade (up to 90 % invested).
-# Trade-off: exposure — and therefore drawdown — scales with the invested
-# fraction (~20 % IS tail drawdown at 90 % invested), so this is the aggressive
-# end of the dial.  Raise toward 0.50 to bound the tail if a live drawdown feels
-# too large.  Re-run the OOS backtest after changing.  NOTE: the live path also
-# needs MAX_PYRAMID_LEGS high enough to reach this floor (see below).
+# This is the primary drawdown dial: it sets the invested-exposure ceiling
+# (1 − MIN_CASH_RESERVE_PCT) identically in the live path and the backtest, and
+# tail drawdown scales with that ceiling.  MAX_POSITION_PCT below only sets the
+# per-leg step (ramp speed), NOT the ceiling — in the backtest (no leg cap) legs
+# stack to this floor regardless, so MAX_POSITION_PCT does not bound backtest DD.
+# Raised 2026-07-17 from 0.10 → 0.20 (90 % → 80 % invested) to cut the tail after
+# the pyramiding model lifted IS drawdown to ~-40 %.  Lower to 0.10 for the most
+# room to trade (up to 90 % invested, more aggressive); raise toward 0.30 (70 %
+# invested) to bound the tail further.  Re-run the OOS backtest after changing.
+# NOTE: the live path also needs MAX_PYRAMID_LEGS high enough to reach this floor
+# (see below).
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
-MIN_CASH_RESERVE_PCT: float = 0.10  # keep ≥ 10 % of equity as USDT (live + backtest)
+MIN_CASH_RESERVE_PCT: float = 0.20  # keep ≥ 20 % of equity as USDT (live + backtest)
 
 # -- Pyramiding control (live path — execution/order_executor.py +
 #    strategy/analysis.py) ------------------------------------------------
@@ -345,7 +367,7 @@ TREND_COOLDOWN_BARS: int = (
 # In normal BTC vol (~1–1.5 % daily std) this gives ~3–4.5 % stop distance.
 # DO NOT add these to the Optuna search space — the formula is self-calibrating.
 STOP_LOSS_ROLLING_DAYS: int = 90  # lookback window for rolling std of daily abs returns
-STOP_LOSS_STD_MULT: float = 3.0  # multiplier: threshold = rolling_std × mult
+STOP_LOSS_STD_MULT: float = 2.0  # multiplier: threshold = rolling_std × mult
 
 # ---------------------------------------------------------------------------
 # VWAP gate — applies to BOTH live system AND backtest

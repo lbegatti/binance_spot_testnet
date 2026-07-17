@@ -425,10 +425,10 @@ FILES
   **Key methods:**
   - `execute()`: validates strategy, caps quantity, dispatches the order.
     Dynamic cap: BUY = `min(aq, usdt × MAX_POSITION_PCT / (price × (1 + fee)))`
-    — at most `MAX_POSITION_PCT` (default 10 %) of available USDT per signal,
+    — at most `MAX_POSITION_PCT` (default 20 %) of available USDT per signal,
     with the taker fee reserved.  The budget is then clamped by the
     **cash-reserve floor** so the leg never spends the account below
-    `MIN_CASH_RESERVE_PCT` (0.50) of mark-to-market equity, mirroring
+    `MIN_CASH_RESERVE_PCT` (0.20) of mark-to-market equity, mirroring
     `backtest/pnl.py`; the dispatched `last_buy_qty` / `last_buy_price` are
     exposed for the strategy's pyramiding cost-basis accrual.  SELL =
     `min(bq, btc)`.  `MAX_POSITION_PCT` and `MIN_CASH_RESERVE_PCT` are the same
