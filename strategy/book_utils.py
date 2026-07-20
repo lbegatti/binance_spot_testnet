@@ -39,15 +39,15 @@ log = logging.getLogger(__name__)
 # so a live session's log shows which gate starves candidates most.  Never read or
 # mutated when the flag is off — zero overhead on the backtest hot path.
 _CAND_FILTER_STATS: dict[str, int] = {
-    "calls": 0,      # collect_candidates() invocations
-    "levels": 0,     # total candidate levels examined (level 0 excluded)
-    "rej_thin": 0,   # failed the thin-book filter (depth < FRAC × median_depth)
+    "calls": 0,  # collect_candidates() invocations
+    "levels": 0,  # total candidate levels examined (level 0 excluded)
+    "rej_thin": 0,  # failed the thin-book filter (depth < FRAC × median_depth)
     "rej_depth": 0,  # failed the relative-depth filter (depth < FRAC × level_0_depth)
-    "rej_both": 0,   # failed BOTH liquidity filters
-    "passed_liq": 0, # passed both liquidity filters
-    "rej_dir": 0,    # passed liquidity but had NO imbalance (micro_price == mid_price)
-    "buys": 0,       # emitted buy candidates
-    "sells": 0,      # emitted sell candidates
+    "rej_both": 0,  # failed BOTH liquidity filters
+    "passed_liq": 0,  # passed both liquidity filters
+    "rej_dir": 0,  # passed liquidity but had NO imbalance (micro_price == mid_price)
+    "buys": 0,  # emitted buy candidates
+    "sells": 0,  # emitted sell candidates
 }
 
 
@@ -210,7 +210,9 @@ def collect_candidates(
     # obi < 0.0 → ask wall heavier than bid side → micro_price pulled BELOW mid → BUY signal.
     # obi = 0   → balanced book → micro_price ≈ mid_price → no directional candidate.
     not_thin = total_depths >= CANDIDATE_MEDIAN_FRAC * median_depth  # thin-book filter
-    depth_ok = total_depths >= CANDIDATE_DEPTH_FRAC * level_0_depth  # relative depth filter
+    depth_ok = (
+        total_depths >= CANDIDATE_DEPTH_FRAC * level_0_depth
+    )  # relative depth filter
     valid = not_thin & depth_ok
 
     buy_mask = valid & (

@@ -22,9 +22,14 @@ N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 
 # collect_candidates() liquidity filters (strategy/book_utils.py) — lower = more
 # permissive = more candidates (live + backtest).  Loosened 2026-07-17 to reduce
-# the ~92 % "no opportunities" rate observed on the deep, balanced real book.
-CANDIDATE_MEDIAN_FRAC: float = 0.5   # thin-book filter: depth ≥ FRAC × median_depth  (was hardcoded 1.0)
-CANDIDATE_DEPTH_FRAC: float = 0.25   # relative-depth  : depth ≥ FRAC × level_0_depth (was hardcoded 0.5)
+# the ~92 % "no opportunities" rate on the deep, balanced real book; DEPTH_FRAC
+# loosened again 2026-07-18 (0.25→0.10) after live instrumentation showed the
+# relative-depth gate alone still rejected 98.2 % of levels (MEDIAN_FRAC is
+# redundant — every thin rejection is already a depth rejection).
+CANDIDATE_MEDIAN_FRAC: float = (
+    0.5  # thin-book filter: depth ≥ FRAC × median_depth  (was hardcoded 1.0)
+)
+CANDIDATE_DEPTH_FRAC: float = 0.10  # relative-depth  : depth ≥ FRAC × level_0_depth (0.5→0.25→0.10; live 2026-07-18: 0.25 rejected 98.2% of levels, left 83% of buy ticks with no candidates — sole binding liquidity gate)
 
 # Diagnostic: when True, collect_candidates() accumulates per-filter reject counts
 # and logs a cumulative summary every CANDIDATE_FILTER_DEBUG_EVERY calls, so a live
@@ -35,7 +40,9 @@ CANDIDATE_DEPTH_FRAC: float = 0.25   # relative-depth  : depth ≥ FRAC × level
 # print a summary line every 300 calls (~430 lines).  The sensitivity sweep is unaffected
 # (it suppresses logging to WARNING), but the accumulation overhead still runs.
 CANDIDATE_FILTER_DEBUG: bool = True
-CANDIDATE_FILTER_DEBUG_EVERY: int = 300  # emit summary every N calls (~5 min live at 1 s)
+CANDIDATE_FILTER_DEBUG_EVERY: int = (
+    300  # emit summary every N calls (~5 min live at 1 s)
+)
 
 # ---------------------------------------------------------------------------
 # Analysis engine cadence
@@ -319,14 +326,17 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # per-leg step (ramp speed), NOT the ceiling — in the backtest (no leg cap) legs
 # stack to this floor regardless, so MAX_POSITION_PCT does not bound backtest DD.
 # Raised 2026-07-17 from 0.10 → 0.20 (90 % → 80 % invested) to cut the tail after
-# the pyramiding model lifted IS drawdown to ~-40 %.  Lower to 0.10 for the most
-# room to trade (up to 90 % invested, more aggressive); raise toward 0.30 (70 %
-# invested) to bound the tail further.  Re-run the OOS backtest after changing.
-# NOTE: the live path also needs MAX_PYRAMID_LEGS high enough to reach this floor
-# (see below).
+# the pyramiding model lifted IS drawdown to ~-40 %.  Raised again 2026-07-18 to
+# 0.35 (65 % invested) after loosening CANDIDATE_DEPTH_FRAC (0.25→0.10) fed more
+# BUY signals into the leg-cap-free backtest, pinning the book near the invested
+# ceiling more of the time and re-inflating the IS tail.  Lower to 0.10 for the
+# most room to trade (up to 90 % invested, more aggressive); raise toward 0.50
+# (50 % invested) to bound the tail further.  Re-run the OOS backtest after
+# changing.  NOTE: the live path also needs MAX_PYRAMID_LEGS high enough to reach
+# this floor (see below).
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
-MIN_CASH_RESERVE_PCT: float = 0.20  # keep ≥ 20 % of equity as USDT (live + backtest)
+MIN_CASH_RESERVE_PCT: float = 0.35  # keep ≥ 35 % of equity as USDT (live + backtest)
 
 # -- Pyramiding control (live path — execution/order_executor.py +
 #    strategy/analysis.py) ------------------------------------------------

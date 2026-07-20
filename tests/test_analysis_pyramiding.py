@@ -205,8 +205,10 @@ def test_pyramid_leg_cap_is_high_enough_for_the_reserve_floor_to_bind():
       invested-after-n-legs / starting-cash  ≈  1 − (1 − MAX_POSITION_PCT)ⁿ
 
     At 20 % legs this reaches ~93 % after MAX_PYRAMID_LEGS = 12 legs — past the
-    (1 − MIN_CASH_RESERVE_PCT) = 90 % ceiling — so the reserve floor binds (a
-    lower cap like 7 would stop at ~79 %, leaving the floor inert).
+    (1 − MIN_CASH_RESERVE_PCT) ceiling — so the reserve floor binds.  Written
+    against the live config so it stays correct as the reserve moves: it derives
+    the minimum legs needed to cross the ceiling and confirms the leg cap clears
+    it while one leg fewer still falls short.
     """
     starting_cash = 100_000.0
     price = 60_000.0
@@ -227,5 +229,14 @@ def test_pyramid_leg_cap_is_high_enough_for_the_reserve_floor_to_bind():
     # Cap is high enough that the raw decay passes the invested ceiling, so the
     # reserve floor (not the leg cap) is the true constraint live.
     assert invested_frac >= (1.0 - MIN_CASH_RESERVE_PCT)
-    # A 7-leg cap would fall short of the 90 % ceiling, leaving the floor inert.
-    assert (1.0 - (1.0 - MAX_POSITION_PCT) ** 7) < (1.0 - MIN_CASH_RESERVE_PCT)
+    # Derive the minimum legs needed to cross the invested ceiling; confirm the
+    # leg cap clears it and that one leg fewer would fall short (floor inert).
+    import math
+
+    legs_to_reach = math.ceil(
+        math.log(MIN_CASH_RESERVE_PCT) / math.log(1.0 - MAX_POSITION_PCT)
+    )
+    assert MAX_PYRAMID_LEGS >= legs_to_reach
+    assert (1.0 - (1.0 - MAX_POSITION_PCT) ** (legs_to_reach - 1)) < (
+        1.0 - MIN_CASH_RESERVE_PCT
+    )
