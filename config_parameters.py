@@ -35,11 +35,11 @@ CANDIDATE_DEPTH_FRAC: float = 0.10  # relative-depth  : depth ≥ FRAC × level_
 # and logs a cumulative summary every CANDIDATE_FILTER_DEBUG_EVERY calls, so a live
 # session log reveals WHICH gate (thin-book / relative-depth / no-imbalance) starves
 # candidates most.  Read-only — does not change filtering.
-# Currently True for a live diagnostic session.  Set back to False before running the
+# Set True only for a live diagnostic session, then back to False before running the
 # backtest: collect_candidates runs ~130k times there, and runner.py (INFO level) would
 # print a summary line every 300 calls (~430 lines).  The sensitivity sweep is unaffected
 # (it suppresses logging to WARNING), but the accumulation overhead still runs.
-CANDIDATE_FILTER_DEBUG: bool = True
+CANDIDATE_FILTER_DEBUG: bool = False
 CANDIDATE_FILTER_DEBUG_EVERY: int = (
     300  # emit summary every N calls (~5 min live at 1 s)
 )
@@ -55,7 +55,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # WebSocket session
 # ---------------------------------------------------------------------------
 DEFAULT_SESSION_MINUTES = 60  # default session length
-# at 20 min: ~1200 low-latency iterations (every 1 s), ~20 historical runs (every 60 s)
+# at 60 min: ~3600 low-latency iterations (every 1 s), ~60 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 # Cadence of the REST balance-refresh daemon (driver-side, defense in depth).
@@ -383,7 +383,7 @@ STOP_LOSS_STD_MULT: float = 2.0  # multiplier: threshold = rolling_std × mult
 # VWAP gate — applies to BOTH live system AND backtest
 # ---------------------------------------------------------------------------
 # The bot executes a BUY only when micro_price < bid_vwap × (1 − threshold),
-# and a SELL only when micro_price ≥ bid_vwap × (1 + threshold).
+# and a SELL only when micro_price ≥ ask_vwap × (1 + threshold).
 # This creates a symmetric dead zone around the VWAP so microscopic noise
 # (1-penny vibrations) never triggers an order.
 #

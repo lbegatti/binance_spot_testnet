@@ -1,6 +1,6 @@
 # Configuration Reference (`config_parameters.py`)
 
-Complete reference for all tunable constants. Default values are as of 2026-06-04.
+Complete reference for all tunable constants. Default values are as of 2026-07-22.
 
 ## Live System Parameters
 
@@ -10,9 +10,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `HFT_INTERVAL` | 1 s | Low-latency analysis cadence |
 | `HIST_INTERVAL` | 60 s | Historical analysis + VWAP update cadence |
 | `N_LEVELS` | 50 | Order book depth (50 bids + 50 asks) |
-| `MAX_ORDERS_PER_ITER` | 1 | Max orders placed per low-latency iteration |
-| `MIN_VWAP_HISTORY_SIZE` | 5 | Minimum snapshots for VWAP calculation |
-| `DEFAULT_SESSION_MINUTES` | 20 | Session duration (live trading) |
+| `DEFAULT_SESSION_MINUTES` | 60 | Session duration (live trading) |
 | `BALANCE_REFRESH_INTERVAL` | 60 s | Cadence of the driver-side REST balance-refresh daemon. Active only in REST-only mode (WS user-data push down): polls `account()` so balances and the equity chart stay current during idle stretches. No-op when the WS push is healthy. |
 | `FLATTEN_ON_START` | `False` | Startup inventory policy. `True` = MARKET-sell inherited BTC so the session starts flat (matches `BACKTEST_INITIAL_BTC = 0`; per-session skill test, report component B ≡ 0). `False` = carry inherited BTC across restarts; the position guard pre-arms on it and report component B attributes its market drift. While `False`, a carried position's stop-loss is anchored at the session-start price until position persistence (Phase 2) is added. |
 | `DEPTH_RESYNC_MIN_INTERVAL_SEC` | 2.0 s | Minimum interval between local-book REST resyncs after a diff-depth gap/reconnect. When the diff stream drops an event, the next event's first update ID `U` exceeds `lastUpdateId + 1`; `MessageHandler` re-pulls a fresh `depth()` snapshot to rebuild `local_book`. The cooldown prevents a resync storm on a burst of gapped events (the book still recovers on the next event after the interval). |
@@ -31,7 +29,6 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `HMM_MIN_COVAR` | 1e-1 | Regularisation floor for covariance matrices |
 | `HMM_N_INIT` | 5 | Random restarts per candidate `n_components` |
 | `HMM_REFIT_INTERVAL` | 300 s | Full re-fit cadence (every 5 min at 5 m bars) |
-| `HMM_TRAIN_ROWS` | 80 | Legacy (no longer used); see code for adaptive split |
 | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Features fed to GaussianHMM |
 
 ## Strategy Filters
@@ -46,7 +43,7 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `TREND_CONSECUTIVE_BARS` | 3 | Consecutive same-direction bars to trigger trend-pause |
 | `TREND_COOLDOWN_BARS` | 4 | Bars to maintain paused state after trend ends |
 | `STOP_LOSS_ROLLING_DAYS` | 90 | Rolling window for stop-loss volatility calculation |
-| `STOP_LOSS_STD_MULT` | 3.0 | Volatility multiplier for stop-loss distance |
+| `STOP_LOSS_STD_MULT` | 2.0 | Volatility multiplier for stop-loss distance |
 
 ## Backtesting Parameters
 
@@ -64,13 +61,12 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
 | `MAX_PYRAMID_LEGS` | 12 | **Live-only** hard cap on concurrently-stacked BUY legs. With legs of 20 % of *remaining* cash, invested ≈ 1 − 0.8ⁿ, so reaching the current 65 % ceiling (35 % reserve) needs ~5 legs; 12 lets the floor bind with comfortable margin (the reserve clamp trims the final leg). Keeps live consistent with the backtest (no leg cap, reaches 65 % from the reserve alone). Guards the 2026-07-08 runaway-pyramiding path. Not in the Optuna search space. |
 | `BACKTEST_FILL_SPREAD_BPS` | 5 | Synthetic fill cost (basis points) |
 | `BACKTEST_MAX_ROWS` | None | Max kline rows (unlimited; use for testing) |
-| `CACHE_TTL_HOURS` | 24 | Parquet cache time-to-live |
 
 ## Output Paths
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `BEST_PARAMS_FILE` | `"backtest/results/best_params.json"` | Sensitivity sweep output (centralized) |
+| `BEST_PARAMS_FILE` | `"best_params.json"` | Sensitivity sweep output **filename only** — joined with `BACKTEST_RESULTS_DIR` to form the full path (centralized to keep producer and consumers in sync) |
 | `BACKTEST_RESULTS_DIR` | `"backtest/results"` | Machine artefacts (JSON, Optuna SQLite) |
 | `BACKTEST_REPORTING_DIR` | `"backtest/reporting"` | Human reports (CSVs, Plotly charts) |
 | `LIVE_POSITION_STATE_PATH` | `"state/live_position.json"` | Live carried-position state (cost basis). Written on shutdown; read at startup only when `FLATTEN_ON_START = False`. Git-ignored runtime artifact. |
@@ -99,8 +95,6 @@ Complete reference for all tunable constants. Default values are as of 2026-06-0
   "source_value": 1.42
 }
 ```
-
-**Note:** `schema_version` enables forward-compatible migrations if JSON structure changes in future updates.
 
 ## Imported By
 

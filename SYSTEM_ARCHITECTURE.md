@@ -215,7 +215,7 @@ FILES
 
       After ~5 min the deque is full and becomes a true rolling window.
 
-  ▸ Thread timeline (default 20-min session):
+  ▸ Thread timeline (default 60-min session):
 
       t=0s      Both threads start
                 ├── low_latency: runs immediately, then every 1 s

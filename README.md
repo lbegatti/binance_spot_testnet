@@ -45,7 +45,7 @@ The project is driven by **four standalone scripts**. Everything else (strategy,
 
 | # | Script | Purpose | Typical runtime | Command |
 |---|--------|---------|----------------|---------|
-| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 20 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
+| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 60 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
 | 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
 | 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
 | 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test [informational], volatility check, confidence floor, label frequency, hit-rate alignment [informational]) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
@@ -132,7 +132,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Analysis cadence** | `HFT_INTERVAL` | `1` s | Time between low-latency evaluations |
 | **Analysis cadence** | `HIST_INTERVAL` | `60` s | Time between historical analyses (1 min) |
 | **Analysis cadence** | `MIN_SNAPSHOTS` | `100` | Minimum snapshots required before historical analysis runs |
-| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `20` min | Default session length (fixed — no startup prompt) |
+| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `60` min | Default session length (fixed — no startup prompt) |
 | **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `low_latency_analysis` thread on shutdown |
 | **WebSocket session** | `HIST_JOIN_TIMEOUT` | `15` s | Max wait for `historical_analysis` thread on shutdown |
 | **Binance connection** | `RECV_WINDOW` | `5000` ms | Binance REST request validity window |
@@ -147,7 +147,7 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **HMM** | `HMM_LOOKBACK` | `"10 hours ago UTC"` | Kline history window (~120 rows at 5 m — provides stable EM convergence without being stale) |
 | **HMM** | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices — prevents positive-definite errors.  1e-1 is the recommended safe default for z-scored financial features |
 | **HMM** | `HMM_N_INIT` | `5` | Number of independent random-seed restarts per candidate `n_components` value inside `select_hmm_model()`.  The retry loop breaks on the first valid (non-degenerate) fit, so well-conditioned windows cost 1 seed; only pathological windows retry up to 5 |
-| **HMM** | `HMM_TRAIN_ROWS` | `80` | Legacy constant kept in `config_parameters.py` for reference.  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set |
+| **HMM** | `HMM_TRAIN_ROWS` | `80` | Legacy reference value — mentioned only in code comments (**not a defined constant** in `config_parameters.py`).  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set |
 | **HMM** | `HMM_MIN_CONFIDENCE` | `0.60` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
 | **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
 | **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
@@ -162,12 +162,12 @@ All tunable constants are centralised in `config_parameters.py`. Edit this file 
 | **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `315_000.0` | Starting USDT balance for the simulation (~250k USDT + 1 BTC @ ~65k, mirroring the live paper-trading account) |
 | **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0` | Starting BTC balance. Always `0.0` to avoid orphan SELL signals; the BTC equivalent is folded into `BACKTEST_INITIAL_CAPITAL`. |
 | **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
-| **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.0` | Annualised risk-free rate for Sharpe / Sortino denominator (0.0 = no adjustment; set to e.g. 0.04 for a 4 % T-bill proxy) |
+| **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.04` | Annualised risk-free rate for Sharpe / Sortino denominator (0.04 ≈ 4 % US T-bill proxy; set to `0.0` for no risk-free adjustment) |
 | **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `None` | Max replay candles in debug mode (`None` = full production run; set to e.g. `500` for a quick debug run) |
 | **Trend-pause filter** | `TREND_CONSECUTIVE_BARS` | `3` | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
 | **Trend-pause filter** | `TREND_COOLDOWN_BARS` | `4` | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
 | **Adaptive stop-loss** | `STOP_LOSS_ROLLING_DAYS` | `90` | Lookback window (calendar days) for the rolling standard deviation of daily absolute returns used to compute the dynamic stop-loss threshold.  `threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT` — calibrates automatically to BTC's current volatility regime.  Enforced in BOTH the backtest (`backtest/pnl.py`) and the live system (`strategy/analysis.py`); `websocket_main.py` fetches 95 days of **production** daily klines (keyless `market_data_client`, matching the backtest's data source) at startup and refreshes the threshold once per UTC day inside `historical_analysis()` |
-| **Adaptive stop-loss** | `STOP_LOSS_STD_MULT` | `3.0` | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~3–4.5 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` (backtest console report) and the "Stop-loss summary" line at session end (live) to calibrate |
+| **Adaptive stop-loss** | `STOP_LOSS_STD_MULT` | `2.0` | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~2–3 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` (backtest console report) and the "Stop-loss summary" line at session end (live) to calibrate |
 | **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise (~5× fewer Viterbi calls). `runner.py` always predicts every candle. (`SENSITIVITY_REFIT_EVERY` removed — refit cadence is now the shared `REFIT_EVERY = 480`.) |
 | **Sensitivity** | `SENSITIVITY_FEE_RATE` | `0.001` | Fee rate applied to **all** sensitivity runs (OAT, full-grid, Bayes). Fixed at the standard Binance Spot taker fee — not a strategy knob, never included in the search grid. |
 | **Sensitivity** | `SENSITIVITY_RANK_METRIC` | `"sharpe_ratio"` | Metric used to rank parameter combinations and select `best_params.json`. Change to `"sortino_ratio"` or `"total_return_pct"` to optimise for a different objective. |
@@ -355,17 +355,17 @@ Both analysis loops in `AnalysisEngine` are designed to run indefinitely:
 
 Rather than running forever, `websocket_main.py` uses a fixed session duration set by `DEFAULT_SESSION_MINUTES` (no startup prompt).
 
-The **default of 20 minutes** is chosen deliberately:
+The **default of 60 minutes** is chosen deliberately:
 
-| Metric | Value at 20 min |
+| Metric | Value at 60 min |
 |--------|----------------|
-| Low-latency iterations (`low_latency_analysis`) | $20 \times 60 / 1 = \mathbf{1{,}200}$ |
-| Historical iterations (`historical_analysis`) | $20 \times 60 / 60 = \mathbf{20}$ |
-| Order book snapshots in history | up to $20 \times 60 \times 10 = \mathbf{12{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
+| Low-latency iterations (`low_latency_analysis`) | $60 \times 60 / 1 = \mathbf{3{,}600}$ |
+| Historical iterations (`historical_analysis`) | $60 \times 60 / 60 = \mathbf{60}$ |
+| Order book snapshots in history | up to $60 \times 60 \times 10 = \mathbf{36{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
 
 When the session duration elapses, `websocket_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
-> **Thread Timeline** — For a step-by-step t=0s … t=20 min walkthrough of both threads, see [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
+> **Thread Timeline** — For a step-by-step t=0s … t=60 min walkthrough of both threads, see [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
 
 ### Deque Fill-Up (`history_order_book`)
 
@@ -402,7 +402,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 3. Consolidate non-BTC/USDT balances into USDT via market sell orders.
 4. Seed `state.balance_status` with the REST-fetched `usdt_balance` and `btc_balance` before any thread starts.
 5. Snapshot `btc_start_price` via `ticker_price(symbol)` and compute `start_total_usdt = usdt_balance + btc_balance × btc_start_price` — stored for the end-of-session P&L decomposition.
-6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (20 min) — no user prompt.
+6. Session duration fixed at `DEFAULT_SESSION_MINUTES` (60 min) — no user prompt.
 6. Fetch a depth snapshot for **BTCUSDT** (100 levels) via the keyless **production** `market_data_client` to seed `OrderBookState.local_book` — the seed (and every gap-recovery resync in `MessageHandler`) must come from the same exchange as the diff stream, or every stream frame fails the update-ID continuity check and is discarded.
 7. **Pre-session regime detection** — instantiate `RegimeDirector` and call `get_klines_data()` → `select_hmm_model()` → `assign_regime_labels()`.  This downloads ~120 rows of **5-minute klines** (last 10 hours) via `HMM_INTERVAL` / `HMM_LOOKBACK`, fits `GaussianHMM` models for 2–3 states (from `HMM_MAX_REGIMES`), selects the best by BIC, and assigns `regime_label` before any thread starts.
 8. Instantiate `OrderBookState`, `MessageHandler`, `OrderExecutor`, and `AnalysisEngine` (with `regime_director` injected), wiring the shared state.  `OrderExecutor` creates its own `SpotWebsocketAPIClient` internally (connected to `wss://ws-api.testnet.binance.vision/ws-api/v3`) with `on_open=self._on_ws_open` and `on_message=self.handle_order_response`.  On socket open it automatically sends `session.logon` → `userDataStream.subscribe` to enable real-time balance push events on the same connection.  Set `stop_event = threading.Event()`.

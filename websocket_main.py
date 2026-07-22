@@ -325,9 +325,9 @@ def refresh_stop_loss_pct() -> float | None:
 # ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
-# At the default of 20 min the engine runs:
-#   • low_latency_analysis → 20 × 60 / 1  = 1200 iterations  (every 1 s)
-#   • historical_analysis  → 20 × 60 / 60 =   20 iterations  (every 60 s / 1 min)
+# At the default of 60 min the engine runs:
+#   • low_latency_analysis → 60 × 60 / 1  = 3600 iterations  (every 1 s)
+#   • historical_analysis  → 60 × 60 / 60 =   60 iterations  (every 60 s / 1 min)
 
 session_minutes = DEFAULT_SESSION_MINUTES
 session_seconds = session_minutes * 60

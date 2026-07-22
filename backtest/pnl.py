@@ -974,11 +974,11 @@ def _compute_stats(
     # produces a comparable Sharpe regardless of bucket size.
     #
     # Risk-free rate (Rf):
-    # BACKTEST_RISK_FREE_RATE is annualised (default 0.0 for crypto).
+    # BACKTEST_RISK_FREE_RATE is annualised (default 0.04 ≈ US T-bill proxy).
     # Exact compounding: Rf_per_period = (1 + annual_rf)^(1/n) − 1
     # This is mathematically correct for all rate levels and degenerates
     # to the linear approximation (rate/n) only at very small rates.
-    # At the default of 0.0 both forms give exactly 0 — no behavioural change.
+    # At a rate of 0.0 both forms give exactly 0 — no behavioural change.
     n_candles = len(equity_df)
     if n_candles >= 2 * 1440:  # ≥ 2 full days
         resample_freq, periods_per_year = "1D", 365
