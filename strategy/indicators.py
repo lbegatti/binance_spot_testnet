@@ -190,3 +190,124 @@ def compute_live_stop_loss_pct(
         # 0.0 disables the stop-loss for this refresh cycle but keeps the
         # session alive.  Caller logs the failure separately.
         return 0.0
+
+
+def add_macro_trend_state(
+    df_macro_raw: pd.DataFrame,
+    sma_days: int,
+    slope_days: int,
+    band_pct: float,
+) -> pd.Series:
+    """
+    Classify each day into a macro-trend state ``{"down", "neutral", "up"}``
+    on the DAILY-resampled macro close.  Drives the symmetric macro-trend
+    overlay (see config_parameters.MACRO_TREND_* and backtest/signals.py):
+
+        down    → suppress BUYs + force-liquidate to cash
+        neutral → normal mean-reversion
+        up      → suppress mean-reversion SELLs (hold & ride)
+
+    Detector::
+
+        SMA   = daily_close.rolling(sma_days).mean()
+        slope = sign(SMA - SMA.shift(slope_days))
+        down    if daily_close < SMA × (1 - band_pct) AND slope < 0
+        up      if daily_close > SMA × (1 + band_pct) AND slope > 0
+        neutral otherwise
+
+    The band dead-zone + slope requirement provide hysteresis so the state
+    does not flip every time price grazes the SMA in chop.
+
+    NO look-ahead is applied inside this function — it returns the state on the
+    daily bar it was computed from.  The CALLER (backtest/signals.py) must
+    ``shift(1)`` the returned Series before merging onto the intraday frame so
+    that intraday bars only ever see COMPLETED prior days.  The live sibling
+    ``compute_live_macro_trend`` enforces the same rule by dropping Binance's
+    in-progress current-day bar.
+
+    Args:
+        df_macro_raw (pd.DataFrame): Datetime-indexed macro (5 m) frame with a
+            ``close`` column — the same frame the stop-loss resamples.
+        sma_days (int): Daily-close SMA window (= ``MACRO_TREND_SMA_DAYS``).
+        slope_days (int): SMA slope lookback (= ``MACRO_TREND_SLOPE_DAYS``).
+        band_pct (float): ±band dead-zone around the SMA (= ``MACRO_TREND_BAND_PCT``).
+
+    Returns:
+        pd.Series: Daily-indexed object Series named ``macro_trend`` with values
+            in ``{"down", "neutral", "up"}``.  Warm-up days (SMA/slope still NaN)
+            fall through to ``"neutral"`` — the fail-safe "keep trading normally"
+            state.
+    """
+    daily_close = df_macro_raw[["close"]].resample("1D").last().dropna()["close"]
+    sma = daily_close.rolling(sma_days, min_periods=sma_days).mean()
+    slope = np.sign(sma - sma.shift(slope_days))
+
+    down = (daily_close < sma * (1 - band_pct)) & (slope < 0)
+    up = (daily_close > sma * (1 + band_pct)) & (slope > 0)
+
+    # np.select resolves to "neutral" wherever neither condition holds, which
+    # includes the SMA/slope warm-up rows (NaN comparisons → False on both).
+    state = np.select([down, up], ["down", "up"], default="neutral")
+    return pd.Series(state, index=daily_close.index, name="macro_trend")
+
+
+def compute_live_macro_trend(
+    rest_client,
+    symbol: str,
+    sma_days: int,
+    slope_days: int,
+    band_pct: float,
+    fetch_extra_days: int = 5,
+) -> str:
+    """
+    Compute the latest COMPLETED-day macro-trend state from recent daily
+    Binance klines.  Mirrors ``add_macro_trend_state`` so the live system
+    gates entries and liquidates identically to the backtest.
+
+    Look-ahead / parity note: Binance returns the in-progress current day as the
+    last kline.  That bar is dropped before evaluating the state, so the live
+    system reads exactly the same "last completed day" the backtest sees after
+    its ``shift(1)`` — no partial-day leakage.
+
+    Args:
+        rest_client: A ``binance.spot.Spot`` client (only ``.klines`` is used).
+        symbol (str): Trading pair (e.g. ``"BTCUSDT"``).
+        sma_days (int): Daily-close SMA window (= ``MACRO_TREND_SMA_DAYS``).
+        slope_days (int): SMA slope lookback (= ``MACRO_TREND_SLOPE_DAYS``).
+        band_pct (float): ±band dead-zone (= ``MACRO_TREND_BAND_PCT``).
+        fetch_extra_days (int): Buffer added to ``sma_days + slope_days`` so the
+            rolling window is warm at the last completed bar.
+
+    Returns:
+        str: ``"down"``, ``"neutral"``, or ``"up"``.  Returns ``"neutral"`` on
+            any failure or insufficient data — the fail-safe "keep trading
+            normally" state, so a transient REST issue never crashes the session
+            or spuriously liquidates the book.
+    """
+    try:
+        # +2: one extra for the current (incomplete) day that gets dropped, one
+        # so pct/slope diffs are warm at the final completed bar.
+        limit = sma_days + slope_days + fetch_extra_days + 2
+        raw = rest_client.klines(symbol=symbol, interval="1d", limit=limit)
+        if not raw or len(raw) < sma_days + slope_days + 1:
+            return "neutral"
+        # Drop the last row — Binance's in-progress current day (live shift(1)).
+        closes = pd.Series([float(row[4]) for row in raw[:-1]])  # col 4 = close
+        sma = closes.rolling(sma_days, min_periods=sma_days).mean()
+        slope = np.sign(sma - sma.shift(slope_days))
+
+        last_close = closes.iloc[-1]
+        last_sma = sma.iloc[-1]
+        last_slope = slope.iloc[-1]
+        if last_sma != last_sma:  # NaN check → warm-up not complete
+            return "neutral"
+
+        if last_close < last_sma * (1 - band_pct) and last_slope < 0:
+            return "down"
+        if last_close > last_sma * (1 + band_pct) and last_slope > 0:
+            return "up"
+        return "neutral"
+    except Exception:
+        # Live system MUST NOT crash on a transient REST failure; "neutral"
+        # keeps mean-reversion running normally until the next refresh.
+        return "neutral"

@@ -12,6 +12,7 @@ from strategy.book_utils import (
     select_best_opportunity,
 )
 from strategy.indicators import (
+    add_macro_trend_state,
     add_trend_pause_flag,
     volume_weighted_average_price,
 )
@@ -31,6 +32,10 @@ from config_parameters import (
     TREND_COOLDOWN_BARS,
     STOP_LOSS_ROLLING_DAYS,
     STOP_LOSS_STD_MULT,
+    MACRO_TREND_ENABLED,
+    MACRO_TREND_SMA_DAYS,
+    MACRO_TREND_SLOPE_DAYS,
+    MACRO_TREND_BAND_PCT,
 )
 
 logging.basicConfig(
@@ -370,6 +375,41 @@ def run_signals(
         df_exec["stop_loss_pct"].median() * 100,
     )
 
+    # ── Macro-trend overlay state (daily SMA / slope / band classifier) ───────
+    # Classifies each day into down/neutral/up on the daily-resampled macro
+    # close, then shift(1)s it so intraday bars only ever see COMPLETED prior
+    # days (stricter than the stop-loss merge above — no partial-day leak), and
+    # merge_asof(backward)s it onto df_exec.  Consumed by the BUY/SELL gates
+    # below and the force-to-cash block in pnl.py.  When disabled, the column is
+    # filled entirely with "neutral" so the overlay is fully inert — the clean
+    # ablation baseline.
+    if MACRO_TREND_ENABLED:
+        _mt_daily = add_macro_trend_state(
+            df_macro_raw,
+            MACRO_TREND_SMA_DAYS,
+            MACRO_TREND_SLOPE_DAYS,
+            MACRO_TREND_BAND_PCT,
+        ).shift(1)  # only completed prior days are visible to intraday bars
+        df_exec = pd.merge_asof(
+            df_exec.sort_index(),
+            _mt_daily.to_frame(name="macro_trend").sort_index(),
+            left_index=True,
+            right_index=True,
+            direction="backward",
+        )
+        df_exec["macro_trend"] = df_exec["macro_trend"].fillna("neutral")
+        logging.info(
+            "Macro-trend overlay merged (SMA %dd, slope %dd, band %.1f%%); "
+            "state distribution: %s.",
+            MACRO_TREND_SMA_DAYS,
+            MACRO_TREND_SLOPE_DAYS,
+            MACRO_TREND_BAND_PCT * 100,
+            dict(df_exec["macro_trend"].value_counts()),
+        )
+    else:
+        df_exec["macro_trend"] = "neutral"
+        logging.info("Macro-trend overlay DISABLED (MACRO_TREND_ENABLED=False).")
+
     # ── Phase 3 — Execution loop on 1-minute bars ────────────────────────────
     # Pre-extract columns as numpy arrays to avoid ~390k pandas iloc() calls.
     close_arr = df_exec["close"].to_numpy()
@@ -381,6 +421,7 @@ def run_signals(
     confidence_arr = df_exec["regime_confidence"].to_numpy(dtype=object)
     trend_pause_arr = df_exec["trend_pause"].to_numpy(dtype=bool)
     stop_loss_pct_arr = df_exec["stop_loss_pct"].to_numpy(dtype=float)
+    macro_trend_arr = df_exec["macro_trend"].to_numpy(dtype=object)
     timestamps = df_exec.index
 
     vwap_deque: deque = deque(maxlen=_vwap_window)
@@ -418,6 +459,7 @@ def run_signals(
         # SELL (flat → gate applied) from a regime-bypassed exit (position open).
         _bar_position_open = _sim_position_open
         regime = regime_arr[i]
+        macro_trend = macro_trend_arr[i]
         # regime_confidence may be a float/NaN for the very first stitched bar;
         # treat that the same as None (transparent gate).
         raw_conf = confidence_arr[i]
@@ -499,11 +541,13 @@ def run_signals(
         if confidence_ok:
             if best_buy and best_buy_micro is not None:
                 regime_ok = regime not in ("trending_down", "high_volatility")
+                # Macro-trend overlay: never dip-buy into a persistent downtrend.
+                macro_ok = macro_trend != "down"
                 vwap_floor = (
                     bid_vwap * (1.0 - _vwap_threshold) if bid_vwap is not None else None
                 )
                 vwap_ok = vwap_floor is None or best_buy_micro < vwap_floor
-                if regime_ok and vwap_ok:
+                if regime_ok and vwap_ok and macro_ok:
                     signal = 1
                     _sim_position_open = True  # track simulated open position
 
@@ -515,11 +559,16 @@ def run_signals(
                     "trending_up",
                     "high_volatility",
                 )
+                # Macro-trend overlay: never take a mean-reversion SELL in a
+                # persistent uptrend — hold & ride.  Unlike the regime gate this
+                # is NOT bypassed when a position is open: in "up" the only
+                # permitted close is the stop-loss (enforced in pnl.py).
+                macro_ok = macro_trend != "up"
                 vwap_ceil = (
                     ask_vwap * (1.0 + _vwap_threshold) if ask_vwap is not None else None
                 )
                 vwap_ok = vwap_ceil is None or best_sell_micro >= vwap_ceil
-                if regime_ok and vwap_ok:
+                if regime_ok and vwap_ok and macro_ok:
                     signal = -1
                     _sim_position_open = False  # position closed
 
@@ -541,6 +590,7 @@ def run_signals(
                 "sell_qty": sell_qty,
                 "trend_pause": trend_pause_arr[i],
                 "stop_loss_pct": stop_loss_pct_arr[i],
+                "macro_trend": macro_trend,
                 "sim_position_open": _bar_position_open,
             }
         )

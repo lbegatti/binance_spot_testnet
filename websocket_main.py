@@ -12,7 +12,7 @@ from core.order_book_state import OrderBookState
 from execution.order_executor import OrderExecutor
 from strategy.regime_director import RegimeDirector
 from strategy.param_loader import load_best_params
-from strategy.indicators import compute_live_stop_loss_pct
+from strategy.indicators import compute_live_stop_loss_pct, compute_live_macro_trend
 from config_parameters import (
     DEFAULT_SESSION_MINUTES,
     HFT_INTERVAL,
@@ -28,6 +28,10 @@ from config_parameters import (
     CRYPTOCCY,
     STOP_LOSS_ROLLING_DAYS,
     STOP_LOSS_STD_MULT,
+    MACRO_TREND_ENABLED,
+    MACRO_TREND_SMA_DAYS,
+    MACRO_TREND_SLOPE_DAYS,
+    MACRO_TREND_BAND_PCT,
     FLATTEN_ON_START,
     LIVE_POSITION_STATE_PATH,
 )
@@ -323,6 +327,72 @@ def refresh_stop_loss_pct() -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Macro-trend overlay — SHARED MUTABLE CONTAINER (writer: this file; reader:
+# AnalysisEngine).  Mirrors the stop_loss_state pattern.  Computed once at
+# startup from production daily klines and refreshed once per UTC day inside
+# historical_analysis() via refresh_macro_trend() below.  When the overlay is
+# disabled (MACRO_TREND_ENABLED = False) the initial state is forced "neutral"
+# and NO refresher is injected, so the live path is fully inert — the clean
+# ablation baseline, matching backtest/signals.py.
+# ---------------------------------------------------------------------------
+if MACRO_TREND_ENABLED:
+    try:
+        _initial_macro_state = compute_live_macro_trend(
+            market_data_client,
+            SYMBOL,
+            MACRO_TREND_SMA_DAYS,
+            MACRO_TREND_SLOPE_DAYS,
+            MACRO_TREND_BAND_PCT,
+        )
+        logging.info(
+            "Macro-trend overlay state at session start: '%s' "
+            "(SMA %dd, slope %dd, band %.1f%%).",
+            _initial_macro_state,
+            MACRO_TREND_SMA_DAYS,
+            MACRO_TREND_SLOPE_DAYS,
+            MACRO_TREND_BAND_PCT * 100,
+        )
+    except Exception as _mt_exc:
+        _initial_macro_state = "neutral"
+        logging.warning(
+            "Could not compute initial macro-trend state (%s) — defaulting to "
+            "'neutral' (overlay inert until next daily refresh succeeds).",
+            _mt_exc,
+        )
+else:
+    _initial_macro_state = "neutral"
+    logging.info("Macro-trend overlay DISABLED (MACRO_TREND_ENABLED=False).")
+
+macro_trend_state: dict = {
+    "state": _initial_macro_state,  # "down" / "neutral" / "up"
+    "last_day_utc": int(time.time()) // 86400,  # int — UTC day of last refresh
+}
+
+
+def refresh_macro_trend() -> str | None:
+    """
+    Closure injected into AnalysisEngine so historical_analysis() can refresh
+    the macro-trend state once per UTC day without touching the Binance REST
+    client directly (same decoupling as refresh_stop_loss_pct).
+
+    Returns:
+        str | None: The new "down"/"neutral"/"up" state, or ``None`` on failure
+            (caller keeps the previous value).
+    """
+    try:
+        return compute_live_macro_trend(
+            market_data_client,
+            SYMBOL,
+            MACRO_TREND_SMA_DAYS,
+            MACRO_TREND_SLOPE_DAYS,
+            MACRO_TREND_BAND_PCT,
+        )
+    except Exception as exc:
+        logging.warning("Macro-trend daily refresh failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 3. Session duration
 # ---------------------------------------------------------------------------
 # At the default of 60 min the engine runs:
@@ -443,6 +513,9 @@ engine = AnalysisEngine(
     regime_director=regime_director,
     stop_loss_state=stop_loss_state,
     refresh_stop_loss_fn=refresh_stop_loss_pct,
+    macro_trend_state=macro_trend_state,
+    # Overlay disabled → no refresher, so the state stays "neutral" forever.
+    refresh_macro_trend_fn=(refresh_macro_trend if MACRO_TREND_ENABLED else None),
     initial_avg_entry_price=initial_avg_entry_price,
 )
 

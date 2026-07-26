@@ -44,6 +44,10 @@ Complete reference for all tunable constants. Default values are as of 2026-07-2
 | `TREND_COOLDOWN_BARS` | 4 | Bars to maintain paused state after trend ends |
 | `STOP_LOSS_ROLLING_DAYS` | 90 | Rolling window for stop-loss volatility calculation |
 | `STOP_LOSS_STD_MULT` | 2.0 | Volatility multiplier for stop-loss distance |
+| `MACRO_TREND_ENABLED` | `True` | Master switch for the symmetric macro-trend overlay (`down`→cash, `up`→hold & ride, `neutral`→trade). `False` = fully inert (ablation baseline) |
+| `MACRO_TREND_SMA_DAYS` | 20 | Daily-close SMA window (days) anchoring the macro-trend state |
+| `MACRO_TREND_SLOPE_DAYS` | 5 | SMA slope lookback (days): `sign(SMA − SMA.shift(N))` |
+| `MACRO_TREND_BAND_PCT` | 0.02 | ±band dead-zone around the SMA before a `down`/`up` trend fires |
 
 ## Backtesting Parameters
 
@@ -57,8 +61,8 @@ Complete reference for all tunable constants. Default values are as of 2026-07-2
 | `BACKTEST_INITIAL_CAPITAL` | 315,000 USDT | Starting USDT balance (~250k USDT + 1 BTC @ ~65k), mirroring the live paper-trading account. |
 | `BACKTEST_FEE_RATE` | 0.001 | Taker fee per side (0.10 %) |
 | `MAX_POSITION_PCT` | 0.20 | Per-BUY-leg cap: at most 20 % of *available* USDT spent per BUY signal. Legs may pyramid (stack) — see `MIN_CASH_RESERVE_PCT`. Shared live + backtest. |
-| `MIN_CASH_RESERVE_PCT` | 0.35 | Cash-reserve floor: stacked BUY legs invest until exposure reaches (1 − 0.35) = 65 % of mark-to-market equity, always keeping ≥ 35 % as USDT. **Primary drawdown dial** — sets the invested-exposure ceiling identically on BOTH paths (`backtest/pnl.py` + live `execution/order_executor.py` sizing clamp + `strategy/analysis.py` exposure gate). Raised 2026-07-17 from 0.10 (90 % invested) to 0.20 (80 %), then 2026-07-18 to 0.35 (65 %) after loosening `CANDIDATE_DEPTH_FRAC` (0.25→0.10) fed more BUY signals into the leg-cap-free backtest and re-inflated the IS tail DD; lower to 0.10 for the most room to trade, raise toward 0.50 (50 % invested) to bound the tail further. Risk-management — NOT in the Optuna search space. |
-| `MAX_PYRAMID_LEGS` | 12 | **Live-only** hard cap on concurrently-stacked BUY legs. With legs of 20 % of *remaining* cash, invested ≈ 1 − 0.8ⁿ, so reaching the current 65 % ceiling (35 % reserve) needs ~5 legs; 12 lets the floor bind with comfortable margin (the reserve clamp trims the final leg). Keeps live consistent with the backtest (no leg cap, reaches 65 % from the reserve alone). Guards the 2026-07-08 runaway-pyramiding path. Not in the Optuna search space. |
+| `MIN_CASH_RESERVE_PCT` | 0.30 | Cash-reserve floor: stacked BUY legs invest until exposure reaches (1 − 0.30) = 70 % of mark-to-market equity, always keeping ≥ 30 % as USDT. **Primary drawdown dial** — sets the invested-exposure ceiling identically on BOTH paths (`backtest/pnl.py` + live `execution/order_executor.py` sizing clamp + `strategy/analysis.py` exposure gate). Raised 2026-07-17 from 0.10 (90 % invested) to 0.20 (80 %), then 2026-07-18 to 0.35 (65 %) after loosening `CANDIDATE_DEPTH_FRAC` (0.25→0.10) fed more BUY signals into the leg-cap-free backtest and re-inflated the IS tail DD. **Lowered 2026-07-26 from 0.35 to 0.30 (65 %→70 % invested)** now that the macro-trend overlay handles downtrend tail risk directly (goes fully to cash in a persistent downtrend) — the always-on reserve no longer needs to be the primary DD brake, so exposure is loosened to recover return in neutral/up regimes. Lower to 0.10 for the most room to trade. Risk-management — NOT in the Optuna search space. |
+| `MAX_PYRAMID_LEGS` | 12 | **Live-only** hard cap on concurrently-stacked BUY legs. With legs of 20 % of *remaining* cash, invested ≈ 1 − 0.8ⁿ, so reaching the current 70 % ceiling (30 % reserve) needs ~6 legs; the 12-leg cap leaves comfortable margin (the reserve clamp trims the final leg exactly to the floor). Keeps live consistent with the backtest (no leg cap, reaches 70 % from the reserve alone). Guards the 2026-07-08 runaway-pyramiding path. Not in the Optuna search space. |
 | `BACKTEST_FILL_SPREAD_BPS` | 5 | Synthetic fill cost (basis points) |
 | `BACKTEST_MAX_ROWS` | None | Max kline rows (unlimited; use for testing) |
 
@@ -106,12 +110,12 @@ Which modules import each constant from `config_parameters.py`:
 - `strategy/book_utils.py` — `N_LEVELS`
 - `strategy/regime_director.py` — `HMM_FEATURE_COLS`, `HMM_N_ITERATIONS`, `HMM_RANDOM_STATE`, `HMM_MAX_REGIMES`, `HMM_INTERVAL`, `HMM_LOOKBACK`, `HMM_MIN_COVAR`, `HMM_N_INIT`, `REGIME_DIRECTIONAL_RETURN_THRESHOLD`
 - `execution/order_executor.py` — `SYMBOL`, `CRYPTOCCY`, `CCY`, `RECV_WINDOW`, `ORDER_REPORT_LIMIT`, `BACKTEST_FEE_RATE`, `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`
-- `strategy/analysis.py` — `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `MAX_PYRAMID_LEGS` (+ VWAP / regime / stop-loss / trend-pause constants)
-- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`
+- `strategy/analysis.py` — `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `MAX_PYRAMID_LEGS` (+ VWAP / regime / stop-loss / trend-pause constants; the stop-loss threshold and the macro-trend state are both read indirectly via refresher closures injected by `websocket_main.py`, not imported here)
+- `backtest/signals.py` — `HMM_LOOKBACK_ROWS`, `VWAP_WINDOW`, `REFIT_EVERY`, `BACKTEST_MAX_ROWS`, `BACKTEST_LOOKBACK`, `HMM_MIN_CONFIDENCE`, `BACKTEST_FILL_SPREAD_BPS`, `HMM_MAX_REGIMES`, `VWAP_THRESHOLD_MULTIPLIER`, `TREND_CONSECUTIVE_BARS`, `TREND_COOLDOWN_BARS`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`, `MACRO_TREND_ENABLED`, `MACRO_TREND_SMA_DAYS`, `MACRO_TREND_SLOPE_DAYS`, `MACRO_TREND_BAND_PCT`
 - `backtest/data.py` — `SYMBOL`, `BACKTEST_LOOKBACK`, `BACKTEST_MACRO_INTERVAL`, `BACKTEST_MICRO_INTERVAL`
 - `backtest/synthetic_book.py` — `N_LEVELS`, `VOLUME_DECAY_FACTOR`
 - `backtest/pnl.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `BACKTEST_RISK_FREE_RATE`, `MAX_POSITION_PCT`, `MIN_CASH_RESERVE_PCT`, `HMM_MIN_CONFIDENCE`
 - `backtest/runner.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`, `BACKTEST_OOS_START`
 - `backtest/reporting/formatters.py` — `BACKTEST_FEE_RATE`, `BACKTEST_INITIAL_BTC`, `BACKTEST_INITIAL_CAPITAL`, `SYMBOL`
 - `backtest/sensitivity.py` — `REFIT_EVERY`, `BACKTEST_LOOKBACK`, `BACKTEST_OOS_START`, `SENSITIVITY_PREDICT_EVERY`, `SENSITIVITY_FEE_RATE`, `SENSITIVITY_RANK_METRIC`, `SENSITIVITY_OAT_THRESHOLD`, `VWAP_THRESHOLD_MULTIPLIER`
-- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`, and all session / connection constants
+- `websocket_main.py` — `SYMBOL`, `CCY`, `CRYPTOCCY`, `STOP_LOSS_ROLLING_DAYS`, `STOP_LOSS_STD_MULT`, `MACRO_TREND_ENABLED`, `MACRO_TREND_SMA_DAYS`, `MACRO_TREND_SLOPE_DAYS`, `MACRO_TREND_BAND_PCT`, and all session / connection constants

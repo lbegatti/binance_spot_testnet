@@ -54,7 +54,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 60  # default session length
+DEFAULT_SESSION_MINUTES = 300  # default session length
 # at 60 min: ~3600 low-latency iterations (every 1 s), ~60 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
@@ -315,8 +315,8 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # Cash-reserve floor (fraction of mark-to-market equity that must always remain
 # in USDT).  BUY legs may PYRAMID — each leg is still ≤ MAX_POSITION_PCT of the
 # available USDT, but successive legs stack until invested exposure reaches
-# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.20 → at most 80 % invested, always
-# ≥ 20 % cash held back.  Replaces the old single-position rule that left the
+# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.30 → at most 70 % invested, always
+# ≥ 30 % cash held back.  Replaces the old single-position rule that left the
 # book ~90 % idle in cash, without ever going fully all-in.  Applies to BOTH the
 # live system and the backtest so simulated and live sizing stay aligned.
 #
@@ -334,9 +334,15 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # (50 % invested) to bound the tail further.  Re-run the OOS backtest after
 # changing.  NOTE: the live path also needs MAX_PYRAMID_LEGS high enough to reach
 # this floor (see below).
+# Lowered 2026-07-26 from 0.35 → 0.30 (65 % → 70 % invested) now that the
+# macro-trend overlay handles downtrend tail risk directly (goes fully to cash in
+# a persistent downtrend): the always-on reserve no longer needs to be the primary
+# DD brake, so exposure is loosened to recover return in the neutral/up regimes
+# where the strategy makes money.  Re-run IS+OOS to confirm the tail does not
+# re-inflate (the overlay should now catch it instead of the reserve).
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
-MIN_CASH_RESERVE_PCT: float = 0.35  # keep ≥ 35 % of equity as USDT (live + backtest)
+MIN_CASH_RESERVE_PCT: float = 0.30  # keep ≥ 30 % of equity as USDT (live + backtest)
 
 # -- Pyramiding control (live path — execution/order_executor.py +
 #    strategy/analysis.py) ------------------------------------------------
@@ -349,12 +355,14 @@ MIN_CASH_RESERVE_PCT: float = 0.35  # keep ≥ 35 % of equity as USDT (live + ba
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
 # Each leg spends MAX_POSITION_PCT (20 %) of REMAINING free cash, so invested
-# exposure after n legs ≈ 1 − 0.8ⁿ of cash: n=7 → ~79 %, n=11 → ~91 %.  To let
-# the 10 % MIN_CASH_RESERVE_PCT floor (→ 90 % invested) actually bind, the cap
-# must allow ~11 legs; 12 leaves one leg of margin (the reserve clamp trims the
-# final leg to land exactly at the floor).  Also keeps the live cap consistent
-# with the backtest, which has no leg cap and reaches 90 % from the reserve
+# exposure after n legs ≈ 1 − 0.8ⁿ of cash: n=3 → ~49 %, n=6 → ~74 %, n=12 → ~93 %.
+# The 30 % MIN_CASH_RESERVE_PCT floor (→ 70 % invested) binds at ~6 legs, so the
+# 12-leg cap leaves comfortable margin (the reserve clamp trims the final leg to
+# land exactly at the floor).  Also keeps the live cap consistent with the
+# backtest, which has no leg cap and reaches the 70 % ceiling from the reserve
 # alone.  Lower this to cap live exposure by leg count regardless of the floor.
+# NOTE: with a smaller per-leg step (e.g. MAX_POSITION_PCT 0.10) the same 70 %
+# floor needs ~12 legs to bind, so the cap would have to rise to keep margin.
 MAX_PYRAMID_LEGS: int = 12  # hard cap on concurrently-stacked live BUY legs
 
 # -- Trend-pause filter (macro frame, backtest/signals.py) ----------------
@@ -378,6 +386,36 @@ TREND_COOLDOWN_BARS: int = (
 # DO NOT add these to the Optuna search space — the formula is self-calibrating.
 STOP_LOSS_ROLLING_DAYS: int = 90  # lookback window for rolling std of daily abs returns
 STOP_LOSS_STD_MULT: float = 2.0  # multiplier: threshold = rolling_std × mult
+
+# -- Macro-trend filter (daily frame, backtest/signals.py + pnl.py) -------
+# A slow, symmetric overlay that stops the mean-reversion engine from bleeding
+# in persistent trends.  Computed on the DAILY-resampled macro close (same
+# series the stop-loss uses), it classifies the market into one of three states
+# and drives symmetric behaviour:
+#
+#   down    → suppress new BUYs AND force-liquidate the open book to cash
+#   neutral → normal mean-reversion (buy dips, sell rallies)
+#   up      → suppress mean-reversion SELLs ("don't sell into strength"); hold
+#
+# The adaptive stop-loss stays active in ALL states as the safety floor.
+#
+# Detector (see strategy/indicators.add_macro_trend_state):
+#   SMA   = daily_close.rolling(MACRO_TREND_SMA_DAYS).mean()
+#   slope = sign(SMA − SMA.shift(MACRO_TREND_SLOPE_DAYS))
+#   down    if daily_close < SMA × (1 − MACRO_TREND_BAND_PCT) AND slope < 0
+#   up      if daily_close > SMA × (1 + MACRO_TREND_BAND_PCT) AND slope > 0
+#   neutral otherwise
+#
+# The band dead-zone + slope requirement give hysteresis so the state does not
+# flip every time price grazes the SMA in chop (keeps ranging markets neutral).
+# The daily state is shift(1)-ed and merge_asof'd (direction="backward") onto
+# the micro frame so intraday bars only ever see COMPLETED prior days.
+# Set a priori — DO NOT add these to the Optuna search space (avoids overfitting
+# the fix to the current IS/OOS windows; validate via the ENABLED on/off ablation).
+MACRO_TREND_ENABLED: bool = True  # master switch (False = clean ablation baseline)
+MACRO_TREND_SMA_DAYS: int = 20  # daily-close SMA window (≈ last few weeks)
+MACRO_TREND_SLOPE_DAYS: int = 5  # SMA slope lookback (≈ one trading week)
+MACRO_TREND_BAND_PCT: float = 0.02  # ±2 % dead-zone around the SMA before a trend fires
 
 # ---------------------------------------------------------------------------
 # VWAP gate — applies to BOTH live system AND backtest

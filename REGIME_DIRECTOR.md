@@ -4,6 +4,15 @@
 > It traces `RegimeDirector` from its configuration constants all the way through
 > to its effect on individual order decisions, file by file.
 
+> **Not to be confused with the macro-trend overlay.**  `RegimeDirector` is the
+> *intraday* HMM classifier (5-minute bars, ~10-hour lookback) producing
+> `trending_up` / `trending_down` / `high_volatility` / `neutral` labels.  The
+> **macro-trend overlay** (`MACRO_TREND_*`; see `strategy/indicators.py`
+> `add_macro_trend_state`) is a separate, much slower **daily** filter (SMA +
+> slope + band over weeks) layered on top — `down` takes the book to cash, `up`
+> holds through strength.  They are independent gates from different frames; do
+> not conflate the HMM `trending_down` label with the macro `down` state.
+
 ---
 
 ## A.1 Configuration — `config_parameters.py`

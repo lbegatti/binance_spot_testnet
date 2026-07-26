@@ -96,6 +96,8 @@ class AnalysisEngine:
         regime_director: RegimeDirector,
         stop_loss_state: dict | None = None,
         refresh_stop_loss_fn=None,
+        macro_trend_state: dict | None = None,
+        refresh_macro_trend_fn=None,
         initial_avg_entry_price: float = 0.0,
     ):
         """
@@ -236,6 +238,25 @@ class AnalysisEngine:
 
         # Session counter — logged at session end.
         self._n_stop_loss_fires: int = 0
+
+        # Macro-trend overlay — mirrors backtest/signals.py + pnl.py.
+        # macro_trend_state is a SHARED MUTABLE CONTAINER built by
+        # websocket_main.py (a dict with keys "state" and "last_day_utc").  As
+        # with the stop-loss, this thread never touches Binance REST — the
+        # refresh_macro_trend_fn closure fetches daily klines and returns the
+        # new "down"/"neutral"/"up" state, which we read under a lock.  Defaults
+        # to a permanently-"neutral" container so unit tests and callers that
+        # don't pass these args behave exactly as before (overlay inert).
+        self._macro_trend_state: dict = (
+            macro_trend_state
+            if macro_trend_state is not None
+            else {"state": "neutral", "last_day_utc": -1}
+        )
+        self._refresh_macro_trend_fn = refresh_macro_trend_fn  # None ⇒ no refresh
+        self._macro_trend_lock = threading.Lock()
+
+        # Session counter — logged at session end.
+        self._n_macro_downtrend_liquidations: int = 0
 
         # ── Equity snapshot history (consumed by visualization/session_chart.py) ──
         # One entry per HFT tick: (utc_now, usdt_total, btc_total, mid_price),
@@ -589,6 +610,48 @@ class AnalysisEngine:
                     self.stop_event.wait(HFT_INTERVAL)
                     continue  # skip normal signal evaluation this tick
 
+            # ── Macro-trend force-to-cash (mirrors backtest/pnl.py) ────────
+            # Symmetric counterpart to the "up" hold-&-ride rule below: when the
+            # slow daily macro-trend overlay flags a persistent downtrend,
+            # liquidate the whole book to cash immediately with an urgent MARKET
+            # exit — exactly like the backtest's force-to-cash block.  Checked
+            # AFTER the stop-loss (so a stop-loss on the same tick already
+            # flattened → this no-ops) and BEFORE the regime / VWAP gates.  New
+            # BUYs are suppressed in the BUY gate below, so this only ever needs
+            # to handle the exit side.  Read here every tick so the value is in
+            # scope for the BUY/SELL gates further down.
+            with self._macro_trend_lock:
+                _macro_state = self._macro_trend_state.get("state", "neutral")
+            if self._position_open and _macro_state == "down" and levels:
+                _mid_price = float(levels[0][1])  # level[1] = mid_price
+                _sell_target = (
+                    best_sell
+                    if best_sell
+                    else (
+                        0,  # level_idx
+                        None,  # score
+                        0.0,  # delta
+                        level_0_depth,  # depth
+                        0.0,  # obi
+                        _mid_price,  # micro_price (reference / fill price)
+                        float(btc_balance),  # bq — used by SELL branch as qty
+                        0.0,  # aq — unused on SELL
+                    )
+                )
+                logging.warning(
+                    "HFT #%d — MACRO-DOWNTREND force-to-cash: state='down' → "
+                    "liquidating open position at mid=%.2f",
+                    iteration,
+                    _mid_price,
+                )
+                self._n_macro_downtrend_liquidations += 1
+                self._reset_position_flat()  # full close clears all legs
+                # Free any BTC locked in a resting LIMIT exit, then MARKET close.
+                self.order_executor.cancel_stale_sell(timeout_sec=0.0)
+                self.order_executor.execute("SELL", _sell_target, urgent=True)
+                self.stop_event.wait(HFT_INTERVAL)
+                continue  # skip normal signal evaluation this tick
+
             with self._vwap_lock:
                 bid_vwap = self._bid_vwap
                 ask_vwap = self._ask_vwap
@@ -674,7 +737,15 @@ class AnalysisEngine:
                     if bid_vwap is not None
                     else None
                 )
-                if (
+                if _macro_state == "down":
+                    # Macro-trend overlay: never dip-buy into a persistent
+                    # downtrend (mirrors backtest/signals.py BUY gate).
+                    logging.info(
+                        "HFT #%d [buy] — skipped: macro-trend is 'down' "
+                        "(persistent downtrend — no dip-buying).",
+                        iteration,
+                    )
+                elif (
                     current_regime == "trending_down"
                     or current_regime == "high_volatility"
                 ):
@@ -797,7 +868,18 @@ class AnalysisEngine:
                 # When _position_open is True the SELL closes an existing long,
                 # not a new short entry — blocking it would strand the position
                 # for the rest of the session.
-                if not self._position_open and (
+                if _macro_state == "up":
+                    # Macro-trend overlay: never take a mean-reversion SELL in a
+                    # persistent uptrend — hold & ride.  Unlike the regime gate
+                    # this is NOT bypassed when a position is open: in "up" the
+                    # only permitted close is the stop-loss (checked earlier).
+                    # Mirrors backtest/signals.py SELL gate.
+                    logging.info(
+                        "HFT #%d [sell] — skipped: macro-trend is 'up' "
+                        "(hold & ride — no mean-reversion selling).",
+                        iteration,
+                    )
+                elif not self._position_open and (
                     current_regime == "trending_up"
                     or current_regime == "high_volatility"
                 ):
@@ -839,11 +921,13 @@ class AnalysisEngine:
             "HFT analysis loop stopped after %d iteration(s) "
             "(%d BUY signal(s) suppressed by position guard, "
             "%d tick(s) suppressed by trend-pause gate, "
-            "%d emergency stop-loss exit(s)).",
+            "%d emergency stop-loss exit(s), "
+            "%d macro-downtrend liquidation(s)).",
             iteration,
             self._position_guard_skips,
             self._trend_pause_skips,
             self._n_stop_loss_fires,
+            self._n_macro_downtrend_liquidations,
         )
 
     def historical_analysis(self):
@@ -949,6 +1033,27 @@ class AnalysisEngine:
                             "Stop-loss threshold refreshed: %.4f%% (UTC day %d).",
                             new_pct * 100,
                             today_utc,
+                        )
+
+            # ── Daily refresh of the macro-trend overlay state ───────────────
+            # Fires once per UTC day via the refresher closure injected by
+            # websocket_main.py (same decoupling / cadence as the stop-loss).
+            # Keeps the previous state on failure (the refresher returns None and
+            # logs).  None closure ⇒ overlay disabled, state stays "neutral".
+            if self._refresh_macro_trend_fn is not None:
+                _today_utc_mt = int(time.time()) // 86400
+                with self._macro_trend_lock:
+                    _last_day_mt = self._macro_trend_state.get("last_day_utc", -1)
+                if _today_utc_mt != _last_day_mt:
+                    _new_state = self._refresh_macro_trend_fn()
+                    if _new_state is not None:
+                        with self._macro_trend_lock:
+                            self._macro_trend_state["state"] = _new_state
+                            self._macro_trend_state["last_day_utc"] = _today_utc_mt
+                        logging.info(
+                            "Macro-trend state refreshed: '%s' (UTC day %d).",
+                            _new_state,
+                            _today_utc_mt,
                         )
 
             with self.state.thread_lock:

@@ -292,6 +292,10 @@ def simulate_pnl(
     # sustained trend (trend_pause == True from signals.py).
     n_trend_pause_skips: int = 0
 
+    # Counter: how many times the macro-trend overlay force-liquidated the open
+    # book to cash because the daily macro-trend state was "down".
+    n_macro_downtrend_liquidations: int = 0
+
     # Whipsaw guard requires the ``high`` and ``low`` columns added to the
     # signals DataFrame by signals.py Step 3.  If absent (legacy frames or
     # unit tests that construct a minimal DataFrame) the guard is silently
@@ -357,6 +361,48 @@ def simulate_pnl(
                     _sl_fill,
                     _sl_pct * 100,
                     _sl_loss_pct,
+                )
+
+        # ── Macro-trend force-to-cash (fires when the daily state is "down") ───
+        # Symmetric counterpart to the "up" hold-&-ride rule in signals.py: when
+        # the slow macro-trend overlay flags a persistent downtrend, liquidate
+        # the ENTIRE open book to cash immediately rather than waiting for the
+        # stop-loss.  Checked AFTER the stop-loss (so if a stop-loss on the same
+        # bar already zeroed the position this no-ops) and BEFORE the whipsaw /
+        # trend-pause gates.  New BUYs are already suppressed upstream in
+        # signals.py, so this block only handles the exit side.
+        _macro_trend = getattr(row, "macro_trend", "neutral")
+        if _macro_trend == "down" and open_strategy_qty > _POSITION_DUST_BTC:
+            _mt_qty = min(open_strategy_qty, btc)
+            if _mt_qty > 0:
+                _mt_fill = close - _half_spread_ws  # pessimistic fill
+                _mt_gross = _mt_qty * _mt_fill
+                _mt_fee = abs(_mt_gross) * fee_rate
+                _mt_proceeds = _mt_gross - _mt_fee
+                usdt += _mt_proceeds
+                btc -= _mt_qty
+                open_strategy_qty = 0.0  # full close — flat after force-to-cash
+                avg_entry_price = 0.0
+                n_macro_downtrend_liquidations += 1
+                trade_rows.append(
+                    {
+                        "timestamp": ts,
+                        "side": "SELL_MACRO_DOWNTREND",
+                        "fill_price": _mt_fill,
+                        "quantity": _mt_qty,
+                        "gross": _mt_gross,
+                        "fee": _mt_fee,
+                        "net_cost": None,
+                        "net_proceeds": _mt_proceeds,
+                        "regime": getattr(row, "regime", None),
+                    }
+                )
+                log.warning(
+                    "MACRO-DOWNTREND │ FORCED EXIT TO CASH │ %s │ qty=%.6f BTC │ "
+                    "exit=%.2f",
+                    ts,
+                    _mt_qty,
+                    _mt_fill,
                 )
 
         # ── Intra-candle whipsaw guard ─────────────────────────────────────────
@@ -640,6 +686,7 @@ def simulate_pnl(
     # its signature — consistent with how n_position_guard_skips is handled).
     stats["n_stop_loss_fires"] = n_stop_loss_fires
     stats["n_trend_pause_skips"] = n_trend_pause_skips
+    stats["n_macro_downtrend_liquidations"] = n_macro_downtrend_liquidations
 
     log.info(
         "P&L: return=%.2f%%  trades=%d  win_rate=%.1f%%  max_dd=%.2f%%  sharpe=%.3f",
@@ -1081,13 +1128,63 @@ def _compute_stats(
             ).sum()
         )
 
-    # VWAP-blocked: residual after confidence and regime.
+    # Macro-trend-blocked: passed confidence AND regime but suppressed by the
+    # macro-trend overlay (BUY blocked in "down", SELL blocked in "up").  Slots
+    # into the sequential chain BEFORE the VWAP residual so vwap_blocked stays
+    # correctly attributed once the overlay is active.  Absent column (overlay
+    # disabled / legacy frames) → treated as all "neutral" → zero macro blocks.
+    if "macro_trend" in signals.columns:
+        _mt = signals["macro_trend"]
+    else:
+        _mt = pd.Series("neutral", index=signals.index)
+    macro_blocked_buy = int(
+        (
+            signals["best_buy_micro"].notna()
+            & _conf_passed
+            & ~signals["regime"].isin(_BUY_BLOCKED_REGIMES)
+            & (_mt == "down")
+        ).sum()
+    )
+    # SELL: macro "up" suppresses ALL sells (NOT bypassed by an open position),
+    # so count candidates that passed confidence and were NOT regime-blocked.
+    # The regime-pass mask mirrors the regime_blocked_sell exit-bypass logic.
+    if "sim_position_open" in signals.columns:
+        _sell_regime_passed = ~(
+            signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+            & ~signals["sim_position_open"]
+        )
+    else:
+        _sell_regime_passed = ~signals["regime"].isin(_SELL_BLOCKED_REGIMES)
+    macro_blocked_sell = int(
+        (
+            signals["best_sell_micro"].notna()
+            & _conf_passed
+            & _sell_regime_passed
+            & (_mt == "up")
+        ).sum()
+    )
+
+    # VWAP-blocked: residual after confidence, regime AND macro-trend.
     # max(0, …) guards against floating-point rounding edge cases.
     vwap_blocked_buy = max(
-        0, int(raw_buy - exec_buy - confidence_blocked_buy - regime_blocked_buy)
+        0,
+        int(
+            raw_buy
+            - exec_buy
+            - confidence_blocked_buy
+            - regime_blocked_buy
+            - macro_blocked_buy
+        ),
     )
     vwap_blocked_sell = max(
-        0, int(raw_sell - exec_sell - confidence_blocked_sell - regime_blocked_sell)
+        0,
+        int(
+            raw_sell
+            - exec_sell
+            - confidence_blocked_sell
+            - regime_blocked_sell
+            - macro_blocked_sell
+        ),
     )
 
     total_raw = raw_buy + raw_sell
@@ -1103,6 +1200,11 @@ def _compute_stats(
     )
     vwap_hit_rate = (
         (vwap_blocked_buy + vwap_blocked_sell) / total_raw * 100
+        if total_raw > 0
+        else float("nan")
+    )
+    macro_hit_rate = (
+        (macro_blocked_buy + macro_blocked_sell) / total_raw * 100
         if total_raw > 0
         else float("nan")
     )
@@ -1154,4 +1256,10 @@ def _compute_stats(
         "confidence_filter_hit_rate_pct": confidence_hit_rate,  # % blocked by confidence gate (first gate)
         "regime_filter_hit_rate_pct": regime_hit_rate,  # % blocked by regime direction gate (second gate)
         "vwap_filter_hit_rate_pct": vwap_hit_rate,  # % blocked by VWAP momentum gate (third gate)
+        # Macro-trend overlay — raw candidates suppressed by the daily down/up
+        # state (BUY blocked in "down", SELL blocked in "up"); attributed AFTER
+        # regime and BEFORE vwap in the sequential chain.
+        "macro_filter_hit_rate_pct": macro_hit_rate,
+        "n_macro_downtrend_buy_skips": macro_blocked_buy,
+        "n_macro_uptrend_sell_skips": macro_blocked_sell,
     }

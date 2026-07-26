@@ -154,9 +154,11 @@ def print_report(
     n_whipsaw = stats.get("n_whipsaw_exits", 0)
     n_stop_loss = stats.get("n_stop_loss_fires", 0)
     n_trend_pause = stats.get("n_trend_pause_skips", 0)
+    n_macro_liq = stats.get("n_macro_downtrend_liquidations", 0)
     conf_hit = stats.get("confidence_filter_hit_rate_pct", float("nan"))
     regime_hit = stats["regime_filter_hit_rate_pct"]
     vwap_hit = stats["vwap_filter_hit_rate_pct"]
+    macro_hit = stats.get("macro_filter_hit_rate_pct", float("nan"))
 
     print()
     print("  SIGNALS")
@@ -178,9 +180,15 @@ def print_report(
     print(
         f"  Stop-loss fires            :  {n_stop_loss:>8,}  ← positions force-closed by adaptive SL"
     )
+    print(
+        f"  Macro downtrend liq.       :  {n_macro_liq:>8,}  ← book force-closed to cash in macro downtrend"
+    )
     print(f"  Confidence filter blocked  :  {fmt(conf_hit, '.1f')} % of raw candidates")
     print(
         f"  Regime    filter blocked   :  {fmt(regime_hit, '.1f')} % of raw candidates"
+    )
+    print(
+        f"  Macro     filter blocked   :  {fmt(macro_hit, '.1f')} % of raw candidates"
     )
     print(f"  VWAP      filter blocked   :  {fmt(vwap_hit, '.1f')} % of raw candidates")
 

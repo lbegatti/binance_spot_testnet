@@ -16,7 +16,7 @@ FILES
     message_handler.py                — MessageHandler: one active callback (depth) + one superseded (balance)
 
   strategy/
-    analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter + trend-pause gate + adaptive stop-loss)
+    analysis.py                       — AnalysisEngine: low-latency loop + historical loop (VWAP + HMM regime filter + trend-pause gate + adaptive stop-loss + macro-trend overlay)
     book_utils.py                     — Shared order-book utilities (build_levels, collect_candidates, select_best_opportunity) — NumPy-vectorised; shape-mismatch guard
     regime_director.py                — RegimeDirector: GaussianHMM regime detection on 5-min klines (HMM_INTERVAL="5m", HMM_LOOKBACK="10 hours ago UTC", 120 bars)
     best_quote_calculator.py          — Live spread printer (best bid | best ask on every tick)
@@ -35,8 +35,8 @@ FILES
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
     data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
     synthetic_book.py                 — Synthetic 50-level order book builder (per kline row)
-    signals.py                        — Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m + trend_pause flag + adaptive stop_loss_pct; Phase 2 merge_asof stitch; Phase 3 1m execution loop + regime/VWAP gates
-    pnl.py                            — P&L simulation: adaptive stop-loss, trend-pause gate, balance guard, bps-based fill, intra-candle whipsaw guard, position cap, FIFO round-trip pairing, equity curve, Step 5 metrics
+    signals.py                        — Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m + trend_pause flag + adaptive stop_loss_pct + macro_trend state; Phase 2 merge_asof stitch; Phase 3 1m execution loop + regime/VWAP/macro-trend gates
+    pnl.py                            — P&L simulation: adaptive stop-loss, macro-trend force-to-cash, trend-pause gate, balance guard, bps-based fill, intra-candle whipsaw guard, position cap, FIFO round-trip pairing, equity curve, Step 5 metrics
     runner.py                         — Top-level backtest runner: chains all modules, delegates report/CSV to reporting/
     regime_validation.py              — Offline long-horizon regime diagnostic (Step 6b): 70/30 train-test split on 2 years (~210,000 rows at 5m), self-contained BIC search + label assignment, vectorised single Viterbi pass on ~63,000 test candles, six checks
     visualization.py                  — 7-panel Plotly chart: equity curve + B&H overlay, drawdown, price+signals, regime timeline, VWAP vs micro-price, signal funnel, signals-by-regime
@@ -151,6 +151,20 @@ FILES
                                              strategy position (0.0 when flat);
                                              stop-loss anchor
     _n_stop_loss_fires    : int           — emergency exits this session
+    _macro_trend_state    : dict          — shared mutable container owned by
+                                             websocket_main.py; keys "state"
+                                             ("down"/"neutral"/"up") and
+                                             "last_day_utc".  AnalysisEngine
+                                             reads it; the refresher closure
+                                             writes it — same REST decoupling as
+                                             _stop_loss_state.
+    _refresh_macro_trend_fn : Callable | None — closure injected by websocket_main.py
+                                             that re-computes the state from
+                                             PRODUCTION daily klines once per UTC
+                                             day (None ⇒ overlay disabled, state
+                                             stays "neutral" forever).
+    _macro_trend_lock     : Lock          — serialises _macro_trend_state
+    _n_macro_downtrend_liquidations : int — force-to-cash exits this session
 
   ▸ low_latency_analysis()  [every HFT_INTERVAL = 1 s]
       Reads balance, copies order book under thread_lock, builds the top
@@ -176,8 +190,16 @@ FILES
          against the free-only `start_total` and make the index jump.
       4. **Adaptive stop-loss check** (unconditional): if mid_price < avg_entry ×
          (1 − pct), fires an emergency SELL and skips the rest of the tick.
+      4b. **Macro-trend force-to-cash** (unconditional, mirrors backtest/pnl.py):
+         if the daily macro-trend state (read from _macro_trend_state under
+         _macro_trend_lock) is "down" and a position is open, fires an urgent
+         MARKET SELL to flatten the book to cash and skips the rest of the tick —
+         the symmetric counterpart to the "up" hold-&-ride rule in step 5.
       5. **HMM confidence gate** (≥ 0.60), **trend-pause gate** (skip BOTH sides
-         if _trend_paused is True), **VWAP gate** (mean-reversion dead zone,
+         if _trend_paused is True), **macro-trend gate** (skip new BUYs when the
+         state is "down"; skip ALL mean-reversion SELLs — even exits — when "up",
+         so a position held in an uptrend rides until the state leaves "up" or
+         the stop-loss fires), **VWAP gate** (mean-reversion dead zone,
          δ = 0.002), **HMM regime direction filter**, then delegates to
          OrderExecutor.execute().  The BUY-side ghost-position reset (guard armed
          but free BTC ≈ 0 ⇒ assume the LIMIT BUY never filled) fires ONLY when
@@ -194,8 +216,10 @@ FILES
   ▸ historical_analysis()  [every HIST_INTERVAL = 60 s]
       Always recomputes bid_vwap / ask_vwap from history_order_book and
       publishes under _vwap_lock.  Once per UTC day calls the injected
-      refresh_stop_loss_fn() closure and updates _stop_loss_state under
-      _stop_loss_lock — never touches Binance REST directly.  HMM block
+      refresh_stop_loss_fn() closure (updates _stop_loss_state under
+      _stop_loss_lock) AND the refresh_macro_trend_fn() closure (updates the
+      "down"/"neutral"/"up" _macro_trend_state under _macro_trend_lock) —
+      never touches Binance REST directly.  HMM block
       fires only when a new 5-minute UTC clock boundary is crossed: fetches
       fresh 5m klines, runs either a full BIC re-fit (select_hmm_model) or a
       cheap Viterbi pass (predict_current_regime), then computes the
@@ -428,7 +452,7 @@ FILES
     — at most `MAX_POSITION_PCT` (default 20 %) of available USDT per signal,
     with the taker fee reserved.  The budget is then clamped by the
     **cash-reserve floor** so the leg never spends the account below
-    `MIN_CASH_RESERVE_PCT` (0.35) of mark-to-market equity, mirroring
+    `MIN_CASH_RESERVE_PCT` (0.30) of mark-to-market equity, mirroring
     `backtest/pnl.py`; the dispatched `last_buy_qty` / `last_buy_price` are
     exposed for the strategy's pyramiding cost-basis accrual.  SELL =
     `min(bq, btc)`.  `MAX_POSITION_PCT` and `MIN_CASH_RESERVE_PCT` are the same
