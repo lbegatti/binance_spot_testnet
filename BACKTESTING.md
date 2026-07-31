@@ -58,9 +58,9 @@ prices or queue position.
 The backtest now fetches **two separate OHLCV frames** through the typed wrappers in
 `backtest/data.py`:
 
-| Frame | Constant | Interval | Purpose |
-|---|---|---|---|
-| **Macro** | `BACKTEST_MACRO_INTERVAL = "5m"` | 5-minute | `GaussianHMM` regime classification |
+| Frame     | Constant                         | Interval | Purpose                                         |
+|-----------|----------------------------------|----------|-------------------------------------------------|
+| **Macro** | `BACKTEST_MACRO_INTERVAL = "5m"` | 5-minute | `GaussianHMM` regime classification             |
 | **Micro** | `BACKTEST_MICRO_INTERVAL = "1m"` | 1-minute | Rolling VWAP, signal generation, PnL simulation |
 
 Decoupling the HMM cadence from the execution cadence yields two improvements:
@@ -69,12 +69,12 @@ Decoupling the HMM cadence from the execution cadence yields two improvements:
 
 ### Window sizes
 
-| Window | Frame | Rows |
-|---|---|---|
-| IS (360 → 90 days ago, 270 d) | 5 m | ~77,760 |
-| IS | 1 m | ~388,800 |
-| OOS (90 days ago → today, 90 d) | 5 m | ~25,920 |
-| OOS | 1 m | ~129,600 |
+| Window                          | Frame | Rows     |
+|---------------------------------|-------|----------|
+| IS (360 → 90 days ago, 270 d)   | 5 m   | ~77,760  |
+| IS                              | 1 m   | ~388,800 |
+| OOS (90 days ago → today, 90 d) | 5 m   | ~25,920  |
+| OOS                             | 1 m   | ~129,600 |
 
 `sensitivity.py` fetches the IS window (`end_str=BACKTEST_OOS_START`); `runner.py`
 fetches the OOS window (`lookback=BACKTEST_OOS_START`).
@@ -93,14 +93,14 @@ taker_buy_base_vol, taker_buy_quote_vol, ignore
 Both `fetch_macro_klines()` and `fetch_micro_klines()` route through a parquet cache
 before touching the Binance API:
 
-| Attribute | Value |
-|---|---|
-| Cache directory | `cache/klines/` |
-| Filename | `<SYMBOL>_<interval>_<MD5-12>.parquet` (deterministic from symbol + interval + start + end) |
-| TTL | **24 hours** — IS data only changes when `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START` change; OOS data refreshes automatically each day |
-| Cache hit | Load from parquet (no API call) |
-| Cache miss | Fetch from Binance → save to parquet → return |
-| Explicit invalidation | `--flush-cache` flag on `sensitivity.py` and `runner.py` CLIs, or call `backtest.data.flush_kline_cache()` |
+| Attribute             | Value                                                                                                                                 |
+|-----------------------|---------------------------------------------------------------------------------------------------------------------------------------|
+| Cache directory       | `cache/klines/`                                                                                                                       |
+| Filename              | `<SYMBOL>_<interval>_<MD5-12>.parquet` (deterministic from symbol + interval + start + end)                                           |
+| TTL                   | **24 hours** — IS data only changes when `BACKTEST_LOOKBACK` / `BACKTEST_OOS_START` change; OOS data refreshes automatically each day |
+| Cache hit             | Load from parquet (no API call)                                                                                                       |
+| Cache miss            | Fetch from Binance → save to parquet → return                                                                                         |
+| Explicit invalidation | `--flush-cache` flag on `sensitivity.py` and `runner.py` CLIs, or call `backtest.data.flush_kline_cache()`                            |
 
 > Run `python -m backtest.sensitivity --flush-cache` or `python -m backtest.runner --flush-cache`
 > whenever `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` change to force a fresh download.
@@ -117,12 +117,12 @@ These four columns are identical to the ones `RegimeDirector` uses in
 production.  They are computed **directly from kline data** and do **not**
 require a reconstructed order book:
 
-| Feature | Formula | Used by |
-|---|---|---|
-| `return` | `close.pct_change()` | `RegimeDirector` |
-| `volatility` | `(high − low) / close` | `RegimeDirector` |
-| `obi_proxy` | `(taker_buy_base_vol / volume) × 2 − 1` ∈ `[-1, +1]` | `RegimeDirector` |
-| `trade_density` | `num_trades / volume` | `RegimeDirector` |
+| Feature         | Formula                                              | Used by          |
+|-----------------|------------------------------------------------------|------------------|
+| `return`        | `close.pct_change()`                                 | `RegimeDirector` |
+| `volatility`    | `(high − low) / close`                               | `RegimeDirector` |
+| `obi_proxy`     | `(taker_buy_base_vol / volume) × 2 − 1` ∈ `[-1, +1]` | `RegimeDirector` |
+| `trade_density` | `num_trades / volume`                                | `RegimeDirector` |
 
 Running `RegimeDirector` on these features produces the same regime labels
 (`trending_up`, `trending_down`, `high_volatility`, `neutral`) that gate
@@ -291,11 +291,11 @@ step — every trade in `trades_df` is already executed; the pairing cursor
 The pairing algorithm uses an **exhaustive FIFO `collections.deque`** to
 support three real-world multi-leg entry strategies:
 
-| Strategy | Behaviour |
-|---|---|
-| **Scaling in** | Multiple BUYs at descending prices → one SELL closes the oldest leg first |
-| **Layering** | BUYs placed at regular intervals (grid-style) → each SELL pops the front of the queue |
-| **Pyramiding** | Adding to a winning position → FIFO ensures the cheapest entry is closed first |
+| Strategy       | Behaviour                                                                             |
+|----------------|---------------------------------------------------------------------------------------|
+| **Scaling in** | Multiple BUYs at descending prices → one SELL closes the oldest leg first             |
+| **Layering**   | BUYs placed at regular intervals (grid-style) → each SELL pops the front of the queue |
+| **Pyramiding** | Adding to a winning position → FIFO ensures the cheapest entry is closed first        |
 
 Two sub-cases are handled within each SELL iteration:
 
@@ -345,28 +345,28 @@ matches the live paper-trading account (~250k USDT + 1 BTC ≈ 315k).
 
 ### Metric table
 
-| Metric                         | Key in `stats` dict              | Formula / Description                                                                                                                                                                                                                                                                                                                                                                                              |
-|--------------------------------|----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Total return**               | `total_return_pct`               | `(final_equity − initial_equity) / initial_equity × 100`                                                                                                                                                                                                                                                                                                                                                           |
-| **Buy-and-Hold return**        | `bnh_total_return_pct`           | Passive benchmark: buy at the first close, hold for the full window.  Computed by `compute_buy_and_hold()` on the same initial portfolio so the two percentages share the same denominator and are directly comparable.  Shown as a dashed orange line in the equity panel and in the figure title                                                                                                                 |
-| **Win rate**                   | `win_rate_pct`                   | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0`                                                                                                                                                                                                                                                                                                                                   |
-| **Average trade PnL**          | `avg_trade_pnl_usdt`             | `mean(pnl_usdt)` over all round trips                                                                                                                                                                                                                                                                                                                                                                              |
-| **Max drawdown**               | `max_drawdown_pct`               | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline                                                                                                                                                                                                        |
-| **Sharpe ratio**               | `sharpe_ratio`                   | `mean(Rp − Rf) / std(Rp − Rf) × √N` where `Rp` = period portfolio return, `Rf = (1 + BACKTEST_RISK_FREE_RATE)^(1/N) − 1` (exact per-period compounding; default 0.04 ≈ 4 % T-bill), and `N` = periods per year.  Bucket size is chosen **adaptively**: ≥ 2 days → daily (N = 365), ≥ 2 h → hourly (N = 8 760), otherwise 5-min (N = 105 120).  Crypto trades 24/7 so √365 (not √252) is the correct annualiser for daily buckets |
-| **Sortino ratio**              | `sortino_ratio`                  | Same as Sharpe but `std` is computed on **downside excess returns only** (`excess_ret[excess_ret < 0]`).  Penalises only negative volatility                                                                                                                                                                                                                                                                       |
-| **Profit factor**              | `profit_factor`                  | Σ(pnl > 0) / Σ(pnl < 0) ratio of gross winning P&L to gross losing P&L.  INF when there are no losing round trips                                                                                                                                                                                                                                                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **Avg holding period**         | `avg_holding_minutes`            | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period)                                                                                                                                                                                                                                                                                                      |
-| **Confidence filter hit rate** | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain)                                                                                                                                                                                                                             |
-| **Regime filter hit rate**     | `regime_filter_hit_rate_pct`     | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate                                                                                                                                                                                                                                             |
-| **VWAP filter hit rate**       | `vwap_filter_hit_rate_pct`       | Residual: `raw − executed − confidence_blocked − regime_blocked − macro_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (now the fourth and final gate, after the macro-trend gate)                                                                                                                                                                                                                                         |
-| **Position guard skips**       | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the **cash-reserve floor** was already reached (no spendable USDT above `MIN_CASH_RESERVE_PCT × equity`, i.e. the book is at its ~70 % invested cap). Stat key retained for backward-compat.                                                                                                                                          |
-| **Whipsaw exits**              | `n_whipsaw_exits`                | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread`                                                                                                                                                                                      |
-| **Stop-loss fires**            | `n_stop_loss_fires`              | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance                                                                                                                                                                                                   |
-| **Trend-pause skips**          | `n_trend_pause_skips`            | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars                                                                                                                                                            |
-| **Macro downtrend liquidations** | `n_macro_downtrend_liquidations` | Count of times the macro-trend overlay force-closed the whole open book to cash because the daily state was `down`.  Each event records a `SELL_MACRO_DOWNTREND` trade at `close − half_spread`.  Fires only on the transition into `down` while holding (buys are already suppressed in `down`), so it is 0 when the book is flat at every `down`-onset                                                          |
-| **Macro downtrend BUY skips**  | `n_macro_downtrend_buy_skips`    | Count of raw BUY candidates suppressed by the macro-trend overlay because the daily state was `down` (attributed after confidence + regime, before VWAP)                                                                                                                                                                                                                                                          |
-| **Macro uptrend SELL skips**   | `n_macro_uptrend_sell_skips`     | Count of raw SELL candidates suppressed by the macro-trend overlay because the daily state was `up` (hold & ride)                                                                                                                                                                                                                                                                                                 |
-| **Macro filter hit rate**      | `macro_filter_hit_rate_pct`      | `(macro_blocked_buy + macro_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked by the macro-trend gate (fourth in the sequential chain: confidence → regime → **macro** → VWAP)                                                                                                                                                                                                            |
+| Metric                           | Key in `stats` dict              | Formula / Description                                                                                                                                                                                                                                                                                                                                                                                                            |
+|----------------------------------|----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Total return**                 | `total_return_pct`               | `(final_equity − initial_equity) / initial_equity × 100`                                                                                                                                                                                                                                                                                                                                                                         |
+| **Buy-and-Hold return**          | `bnh_total_return_pct`           | Passive benchmark: buy at the first close, hold for the full window.  Computed by `compute_buy_and_hold()` on the same initial portfolio so the two percentages share the same denominator and are directly comparable.  Shown as a dashed orange line in the equity panel and in the figure title                                                                                                                               |
+| **Win rate**                     | `win_rate_pct`                   | `n_wins / n_round_trips × 100`  where `n_wins` = round trips with `pnl_usdt > 0`                                                                                                                                                                                                                                                                                                                                                 |
+| **Average trade PnL**            | `avg_trade_pnl_usdt`             | `mean(pnl_usdt)` over all round trips                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Max drawdown**                 | `max_drawdown_pct`               | `min( (equity − peak) / peak × 100 )`  where `peak = equity.cummax()` — the running all-time high of the equity curve.  Drawdown is always ≤ 0; the most negative value is the worst peak-to-trough decline                                                                                                                                                                                                                      |
+| **Sharpe ratio**                 | `sharpe_ratio`                   | `mean(Rp − Rf) / std(Rp − Rf) × √N` where `Rp` = period portfolio return, `Rf = (1 + BACKTEST_RISK_FREE_RATE)^(1/N) − 1` (exact per-period compounding; default 0.04 ≈ 4 % T-bill), and `N` = periods per year.  Bucket size is chosen **adaptively**: ≥ 2 days → daily (N = 365), ≥ 2 h → hourly (N = 8 760), otherwise 5-min (N = 105 120).  Crypto trades 24/7 so √365 (not √252) is the correct annualiser for daily buckets |
+| **Sortino ratio**                | `sortino_ratio`                  | Same as Sharpe but `std` is computed on **downside excess returns only** (`excess_ret[excess_ret < 0]`).  Penalises only negative volatility                                                                                                                                                                                                                                                                                     |
+| **Profit factor**                | `profit_factor`                  | Σ(pnl > 0) / Σ(pnl < 0) ratio of gross winning P&L to gross losing P&L.  INF when there are no losing round trips                                                                                                                                                                                                                                                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Avg holding period**           | `avg_holding_minutes`            | `mean(holding_minutes)` excluding NaN entries (session-end mark-to-market closes have no real holding period)                                                                                                                                                                                                                                                                                                                    |
+| **Confidence filter hit rate**   | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain)                                                                                                                                                                                                                                           |
+| **Regime filter hit rate**       | `regime_filter_hit_rate_pct`     | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate                                                                                                                                                                                                                                                           |
+| **VWAP filter hit rate**         | `vwap_filter_hit_rate_pct`       | Residual: `raw − executed − confidence_blocked − regime_blocked − macro_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (now the fourth and final gate, after the macro-trend gate)                                                                                                                                                                                                  |
+| **Position guard skips**         | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the **cash-reserve floor** was already reached (no spendable USDT above `MIN_CASH_RESERVE_PCT × equity`, i.e. the book is at its ~70 % invested cap). Stat key retained for backward-compat.                                                                                                                                                        |
+| **Whipsaw exits**                | `n_whipsaw_exits`                | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread`                                                                                                                                                                                                    |
+| **Stop-loss fires**              | `n_stop_loss_fires`              | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance                                                                                                                                                                                                                 |
+| **Trend-pause skips**            | `n_trend_pause_skips`            | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars                                                                                                                                                                          |
+| **Macro downtrend liquidations** | `n_macro_downtrend_liquidations` | Count of times the macro-trend overlay force-closed the whole open book to cash because the daily state was `down`.  Each event records a `SELL_MACRO_DOWNTREND` trade at `close − half_spread`.  Fires only on the transition into `down` while holding (buys are already suppressed in `down`), so it is 0 when the book is flat at every `down`-onset                                                                         |
+| **Macro downtrend BUY skips**    | `n_macro_downtrend_buy_skips`    | Count of raw BUY candidates suppressed by the macro-trend overlay because the daily state was `down` (attributed after confidence + regime, before VWAP)                                                                                                                                                                                                                                                                         |
+| **Macro uptrend SELL skips**     | `n_macro_uptrend_sell_skips`     | Count of raw SELL candidates suppressed by the macro-trend overlay because the daily state was `up` (hold & ride)                                                                                                                                                                                                                                                                                                                |
+| **Macro filter hit rate**        | `macro_filter_hit_rate_pct`      | `(macro_blocked_buy + macro_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked by the macro-trend gate (fourth in the sequential chain: confidence → regime → **macro** → VWAP)                                                                                                                                                                                                                           |
 
 ---
 
@@ -473,10 +473,10 @@ The entire test set is scored in **four bulk operations** (no per-candle loop):
 4. `label_array[states]` — maps state indices to labels with a NumPy lookup
    array (no Python loop).
 
-| Approach | Viterbi calls | Estimated Phase 2 time |
-|---|---|---|
-| Per-candle loop | ~63,000 | hours |
-| Vectorised (current) | **1** | **seconds** |
+| Approach             | Viterbi calls | Estimated Phase 2 time |
+|----------------------|---------------|------------------------|
+| Per-candle loop      | ~63,000       | hours                  |
+| Vectorised (current) | **1**         | **seconds**            |
 
 Total runtime is dominated by the **Binance paginated fetch** (~3–5 min for
 2 years at 5m resolution).
@@ -617,14 +617,14 @@ Results are printed by
 
 #### Key Design Decisions
 
-| Decision | Rationale |
-|---|---|
-| Single 7/3 split, not rolling | Rolling refits on the test set would re-use test candles for fitting; a single split is the cleanest long-horizon OOS test |
-| Only `predict_current_regime()` on test set | No refit → model never touches test candles during training |
-| `BACKTEST_MAX_ROWS` must be bypassed | 500 rows collapses the split to a few hours of train data — statistically worthless |
-| Kruskal-Wallis H-test (not Welch's t-test) | BTC returns are fat-tailed (leptokurtic); HMM states have unequal emission variances by construction; K-W handles any k ≥ 2 states without multiple-comparison inflation |
-| Forward return = 1 candle | Consistent with the 1 m resolution; matches the minimum observable effect of a regime signal |
-| Standalone script, not in `runner.py` | This is a one-off diagnostic, not part of the core P&L pipeline |
+| Decision                                    | Rationale                                                                                                                                                                |
+|---------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Single 7/3 split, not rolling               | Rolling refits on the test set would re-use test candles for fitting; a single split is the cleanest long-horizon OOS test                                               |
+| Only `predict_current_regime()` on test set | No refit → model never touches test candles during training                                                                                                              |
+| `BACKTEST_MAX_ROWS` must be bypassed        | 500 rows collapses the split to a few hours of train data — statistically worthless                                                                                      |
+| Kruskal-Wallis H-test (not Welch's t-test)  | BTC returns are fat-tailed (leptokurtic); HMM states have unequal emission variances by construction; K-W handles any k ≥ 2 states without multiple-comparison inflation |
+| Forward return = 1 candle                   | Consistent with the 1 m resolution; matches the minimum observable effect of a regime signal                                                                             |
+| Standalone script, not in `runner.py`       | This is a one-off diagnostic, not part of the core P&L pipeline                                                                                                          |
 
 > Run with: `python -m backtest.regime_validation`
 > Re-run this script whenever `strategy/regime_director.py` is modified to
@@ -654,27 +654,27 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 
 #### Use Case A — Live parameter tuning ✅ *Implemented*
 
-| Attribute | Value |
-|---|---|
-| IS window | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m) |
-| OOS window | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py` |
-| Rationale | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`. |
-| Refit cadence | `REFIT_EVERY = 480` (40 h at 5 m) — shared by `sensitivity.py` (~162 refits over 270-day IS window) and `runner.py` (~54 refits over 90-day OOS window).  Full-BIC refits use identical cadence in IS and OOS. |
-| Viterbi cadence | `SENSITIVITY_PREDICT_EVERY = 5` — IS sweep re-predicts the regime every 25 min (5 macro candles, last known label reused between calls); `runner.py` re-predicts every 5 min (every macro candle).  **IS / OOS Sharpe are NOT pure equivalents because of this gap** — see caveat below. |
+| Attribute                     | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| IS window                     | `BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"` (270 days, ~77,760 rows at 5 m)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| OOS window                    | `BACKTEST_OOS_START = "90 days ago UTC"` → today (90 days, ~25,920 rows at 5 m) — used by `runner.py`; never fetched by `sensitivity.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Rationale                     | Tuning on 270 days of **recent IS data** at 5 m resolution gives broad regime coverage (~3 market cycles) while ensuring `runner.py` validation is genuinely out-of-sample. `SENSITIVITY_LOOKBACK` has been removed — the IS window is now fully defined by `BACKTEST_LOOKBACK` + `BACKTEST_OOS_START`.                                                                                                                                                                                                                                                                                                                                                                                                |
+| Refit cadence                 | `REFIT_EVERY = 480` (40 h at 5 m) — shared by `sensitivity.py` (~162 refits over 270-day IS window) and `runner.py` (~54 refits over 90-day OOS window).  Full-BIC refits use identical cadence in IS and OOS.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Viterbi cadence               | `SENSITIVITY_PREDICT_EVERY = 5` — IS sweep re-predicts the regime every 25 min (5 macro candles, last known label reused between calls); `runner.py` re-predicts every 5 min (every macro candle).  **IS / OOS Sharpe are NOT pure equivalents because of this gap** — see caveat below.                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ⚠ IS↔OOS Sharpe comparability | The full-BIC refit cadence matches in IS and OOS, but the Viterbi cadence does not (`SENSITIVITY_PREDICT_EVERY = 5` vs `runner.py`'s implicit `1`).  This means the IS sweep responds to intra-refit regime transitions 20 minutes later than the OOS run, producing a slightly different signal mix on identical data.  A non-zero IS-vs-OOS Sharpe gap is therefore NOT a pure overfitting signal — part of it is the cadence gap.  Treat the IS Sharpe as a **parameter ranking score**, not as an absolute predictor of OOS performance.  Lowering `SENSITIVITY_PREDICT_EVERY` to 1 would close the gap but slow the IS sweep ~5× without any guarantee the cadence component is the dominant one. |
-| Runtime (Bayes, 40 trials) | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials) |
-| Runtime (OAT, 8 runs) | ~1–2 h on a laptop |
-| Output | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `runner.py`) |
-| Run (Bayes, default) | `python -m backtest.sensitivity` or `python -m backtest.sensitivity --bayes` |
-| Run (OAT) | `python -m backtest.sensitivity --oat` |
+| Runtime (Bayes, 40 trials)    | ~3–6 h on a laptop (~5–8 min/trial; klines pre-fetched once, shared across all trials)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Runtime (OAT, 8 runs)         | ~1–2 h on a laptop                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Output                        | `backtest/results/best_params.json` — loaded by `strategy.param_loader` (shared by `websocket_main.py` and `runner.py`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Run (Bayes, default)          | `python -m backtest.sensitivity` or `python -m backtest.sensitivity --bayes`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Run (OAT)                     | `python -m backtest.sensitivity --oat`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 #### Use Case B — Backtest robustness validation ⬜ *Deferred*
 
-| Attribute | Value |
-|---|---|
-| Window | Must match the OOS validation window used by `runner.py` (`BACKTEST_OOS_START → today`) to avoid window-mismatch bias. |
-| Runtime (OAT, 6 runs) | ~4–12 hours on a laptop — impractical without dedicated compute |
-| Status | Revisit if compute resources allow |
+| Attribute             | Value                                                                                                                  |
+|-----------------------|------------------------------------------------------------------------------------------------------------------------|
+| Window                | Must match the OOS validation window used by `runner.py` (`BACKTEST_OOS_START → today`) to avoid window-mismatch bias. |
+| Runtime (OAT, 6 runs) | ~4–12 hours on a laptop — impractical without dedicated compute                                                        |
+| Status                | Revisit if compute resources allow                                                                                     |
 
 ---
 
@@ -683,12 +683,12 @@ over-fitted to the historical sample rather than capturing a genuine edge.
 All four parameters live in `config_parameters.py`.  The first value in each
 range is the **default** used by the baseline run.
 
-| # | Parameter | Constant | Default | Values tested |
-|---|---|---|---|---|
-| 1 | HMM lookback window | `HMM_LOOKBACK_ROWS` | 120 (2 h) | 60, **120**, 240 |
-| 2 | Max HMM regimes (BIC upper bound) | `HMM_MAX_REGIMES` | 3 | **3**, 2  *(4+ risks under-populated states with 4 features)* |
-| 3 | VWAP dip/strength window | `VWAP_WINDOW` | 5 (5 min) | **5**, 2, 3  *(10 min excluded — too slow for 1 s cadence)* |
-| 4 | Taker fee rate | `BACKTEST_FEE_RATE` | 0.0005 (0.05 %) | **0.0005**, 0.00025  *(0.025 % achievable at VIP 4+; note: Bayesian mode always uses `0.001`)* |
+| # | Parameter                         | Constant            | Default         | Values tested                                                                                  |
+|---|-----------------------------------|---------------------|-----------------|------------------------------------------------------------------------------------------------|
+| 1 | HMM lookback window               | `HMM_LOOKBACK_ROWS` | 120 (2 h)       | 60, **120**, 240                                                                               |
+| 2 | Max HMM regimes (BIC upper bound) | `HMM_MAX_REGIMES`   | 3               | **3**, 2  *(4+ risks under-populated states with 4 features)*                                  |
+| 3 | VWAP dip/strength window          | `VWAP_WINDOW`       | 5 (5 min)       | **5**, 2, 3  *(10 min excluded — too slow for 1 s cadence)*                                    |
+| 4 | Taker fee rate                    | `BACKTEST_FEE_RATE` | 0.0005 (0.05 %) | **0.0005**, 0.00025  *(0.025 % achievable at VIP 4+; note: Bayesian mode always uses `0.001`)* |
 
 **Excluded from scope:**
 - Depth:delta score weights (0.70 / 0.30) — not a config constant.
@@ -731,10 +731,10 @@ Both consumers delegate to **`strategy/param_loader.py`** — the single module
 that owns all loading logic, keeping `websocket_main.py` and `runner.py`
 free of JSON / file-handling code.
 
-| Consumer | Function called | When | What is overridden | Mechanism |
-|---|---|---|---|---|
-| `websocket_main.py` | `param_loader.load_best_params()` | At startup, before `RegimeDirector()` is instantiated | `HMM_MAX_REGIMES`, `HMM_LOOKBACK` | Patches `strategy.regime_director` module namespace directly (not `config_parameters`) — necessary because `regime_director.py` binds constants at import time via `from config_parameters import`. |
-| `runner.py` | `param_loader.load_best_params_for_backtest()` | At the top of `run_backtest()`, before `run_signals()` | `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, `vwap_threshold`, `fee_rate` | Returns a plain `dict`; values passed as keyword arguments to `run_signals()` and `simulate_pnl()`. Keys absent from `best_params.json` are simply omitted — both functions fall back to `config_parameters.py` defaults automatically. |
+| Consumer            | Function called                                | When                                                   | What is overridden                                                                  | Mechanism                                                                                                                                                                                                                               |
+|---------------------|------------------------------------------------|--------------------------------------------------------|-------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `websocket_main.py` | `param_loader.load_best_params()`              | At startup, before `RegimeDirector()` is instantiated  | `HMM_MAX_REGIMES`, `HMM_LOOKBACK`                                                   | Patches `strategy.regime_director` module namespace directly (not `config_parameters`) — necessary because `regime_director.py` binds constants at import time via `from config_parameters import`.                                     |
+| `runner.py`         | `param_loader.load_best_params_for_backtest()` | At the top of `run_backtest()`, before `run_signals()` | `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, `vwap_threshold`, `fee_rate` | Returns a plain `dict`; values passed as keyword arguments to `run_signals()` and `simulate_pnl()`. Keys absent from `best_params.json` are simply omitted — both functions fall back to `config_parameters.py` defaults automatically. |
 
 #### Parameter Flow
 
@@ -771,8 +771,6 @@ in `strategy/param_loader.py`:
 - Exact multiples of 60 → `"H hour(s) ago UTC"` (e.g. 120 rows → 600 min → `"10 hours ago UTC"`)
 - All other values → `"N minutes ago UTC"` (handles any Optuna-discovered value like 40 rows → `"200 minutes ago UTC"`)
 
-This replaces the previous static lookup table, which broke whenever Optuna
-discovered a value outside the hand-coded set (e.g. 40 rows → `"40 minutes ago UTC"`).
 If `hmm_lookback_rows` is absent from `best_params.json`, `HMM_LOOKBACK` is
 left at the `config_parameters.py` default.
 
@@ -785,11 +783,11 @@ left at the `config_parameters.py` default.
 
 ### Robustness Criteria
 
-| Verdict | Condition |
-|---|---|
-| **Robust** ✅ | `total_return_pct` positive across all tested values; Sharpe degradation < 0.5 units; max drawdown worsens < 5 pp vs baseline |
-| **Borderline** ⚠️ | Return flips sign for one extreme value — acceptable if the flip is at the edges (e.g. very long lookback) |
-| **Fragile** ❌ | Return positive only at the exact current default and negative for all others — likely over-fitted |
+| Verdict           | Condition                                                                                                                     |
+|-------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| **Robust** ✅      | `total_return_pct` positive across all tested values; Sharpe degradation < 0.5 units; max drawdown worsens < 5 pp vs baseline |
+| **Borderline** ⚠️ | Return flips sign for one extreme value — acceptable if the flip is at the edges (e.g. very long lookback)                    |
+| **Fragile** ❌     | Return positive only at the exact current default and negative for all others — likely over-fitted                            |
 
 ---
 
@@ -943,9 +941,9 @@ concrete file in `backtest/`.
       confidence overlay scaled ×3 to fill the [0, 3] range (hover shows the
       real 0–1 value) with a dashed ``HMM_MIN_CONFIDENCE × 3`` threshold line.
       Y-axis tick labels show regime names, not raw integers.
-      *Bug fixed 2026-04-25: previously only ``regime_confidence`` (0–1) was
-      plotted, which appeared as a nearly flat line — the regime step-line
-      and ×3 scaling were added to make the timeline readable.*
+      *Plotting only ``regime_confidence`` (0–1) appears as a nearly flat
+      line, so the regime step-line and ×3 scaling were added to make the
+      timeline readable.*
   5. **VWAP vs micro-price** — four series with grey dot (●) near-miss markers
      where the VWAP gate specifically blocked a candidate.
   6a. **Signal funnel** (stacked horizontal bar) — per-side breakdown:

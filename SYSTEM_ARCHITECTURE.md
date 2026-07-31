@@ -30,7 +30,7 @@ FILES
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
-    session_chart.py                  — End-of-session P&L chart (Plotly HTML): Strategy vs B&H equity index + filled/unfilled BUY/SELL markers (solid = traded, hollow grey = cancelled / never matched) + USDT/BTC component panel; written to backtest/reporting/session_pnl_<ts>.html by websocket_main.py
+    session_chart.py                  — End-of-session P&L chart (Plotly HTML): Strategy vs B&H equity index + filled/unfilled BUY/SELL markers (solid = traded, hollow green ▲ / red ▼ = cancelled / never matched) + USDT/BTC component panel; written to backtest/reporting/session_pnl_<ts>.html by websocket_main.py
 
   backtest/                           — Offline backtesting framework (see BACKTESTING.md)
     data.py                           — Historical kline downloader: fetch_macro_klines() (5m, HMM) + fetch_micro_klines() (1m, PnL); Parquet cache (cache/klines/, 24h TTL); --flush-cache flag
@@ -86,8 +86,8 @@ FILES
   re-pulls a fresh `depth(limit=SNAPSHOT_DEPTH)` snapshot via the injected REST
   client — the keyless PRODUCTION `market_data_client`, which MUST come from
   the same exchange as the diff stream: update IDs form one continuous
-  sequence only within a single exchange, and a mismatched pair (prod stream +
-  testnet snapshots, as wired before 2026-07-09) silently discards every
+  sequence only within a single exchange, and a mismatched pair (e.g. prod stream +
+  testnet snapshots) silently discards every
   stream frame, degrades the book to a 2 s REST poll, and starves the VWAP
   deque so the VWAP gate never activates —
   and rebuilds `bids/asks/lastUpdateId` under `thread_lock`, dropping the
@@ -208,7 +208,7 @@ FILES
          (cancel_stale_sell is gated on the guard); (2) no BUY is unresolved — a
          resting or just-filled LIMIT BUY is resolved by cancel_stale_buy after
          its 10 s window, NOT here (disarming earlier re-fired the same signal
-         every tick and stacked 8 duplicate BUYs in 14 s on 2026-07-08); and
+         every tick and stacked duplicate BUYs); and
          (3) a FRESH REST balance read (OrderExecutor.refresh_and_check_flat)
          confirms the account is truly flat — the guard is never disarmed on a
          balance snapshot up to 60 s old.
@@ -305,8 +305,8 @@ FILES
   **Shutdown order cancel (`OrderExecutor.cancel_session_open_orders`):** after
   the threads join, every order THIS session placed that is still open on the
   book is cancelled via REST, so no funds stay locked (and no unattended fills
-  happen) once the session ends — on 2026-07-08, 38 resting BUYs held ~305k
-  USDT locked at shutdown and 13 of them filled unattended afterwards.  Only
+  happen) once the session ends — otherwise resting BUYs can stay locked at
+  shutdown and fill unattended afterwards.  Only
   the session's own orderIds are touched; foreign open orders on the shared
   testnet account are left alone.  The order report that follows shows these
   orders as CANCELED rather than OPEN.
@@ -366,8 +366,7 @@ FILES
   free + locked, minus the foreign locked captured at session start (the same
   `locked_*_at_start` correction the equity chart applies), so funds resting in
   the strategy's own open LIMIT orders still count.  Free-only valuation
-  counted them as gone — the 2026-07-08 session printed -98.97% when the true
-  result was +0.025%.
+  counts them as gone, badly understating the true result.
 
   **End-of-session report — Buy & Hold benchmark:** alongside the `A + B = Total`
   P&L decomposition, the balance report prints a **Buy & Hold** line —
@@ -383,7 +382,8 @@ FILES
   that was placed then cancelled (or never matched) would look identical to one
   that actually moved the position. To remove that ambiguity the chart draws
   **filled** orders as solid markers and **unfilled** ones (final
-  `executedQty == 0`) as hollow grey markers. The final outcome is read from
+  `executedQty == 0`) as hollow markers colour-coded by side (green ▲ BUY /
+  red ▼ SELL). The final outcome is read from
   `exec_qty`, which `OrderExecutor.order_status_report()` enriches onto each
   `placed_orders` record (from Binance `GET /api/v3/order`) before the chart is
   built; an order with no `exec_qty` is assumed filled so a genuine fill is
@@ -401,8 +401,7 @@ FILES
   silently swallowed (its `if ws_api_client is None: return` guard trips);
   `__init__` therefore re-sends the logon after construction when `_logon_id`
   is still `None`.  Without this retry the user-data stream never activates
-  and balances degrade to 60 s REST polls for the whole session (observed
-  2026-07-08).
+  and balances degrade to 60 s REST polls for the whole session.
 
   **Order types per side:**
   - **BUY**: LIMIT GTC — dip-buy sits on the book until filled or cancelled.

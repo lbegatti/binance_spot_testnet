@@ -173,7 +173,7 @@ def collect_candidates(
         median_depth (float): Median total depth across all levels, used as
             the thin-book threshold.
         level_0_depth (float): Total depth at the best bid/ask level (level 0),
-            used as the reference for the 50 % depth filter.
+            used as the reference for the ``CANDIDATE_DEPTH_FRAC`` depth filter.
 
     Returns:
         tuple:

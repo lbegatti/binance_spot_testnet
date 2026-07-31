@@ -29,10 +29,10 @@
 A Python toolkit for order book analysis on the **Binance Spot Testnet**.  
 Two execution modes are available:
 
-| Mode | Entry point | Data source | Symbol |
-|------|-------------|-------------|--------|
-| **REST** (polling) | `restapi_main.py` | `client.get_order_book()` snapshots | BTCUSDT |
-| **WebSocket** (real-time) | `websocket_main.py` | `diff_book_depth` stream (100 ms) | BTCUSDT |
+| Mode                      | Entry point         | Data source                         | Symbol  |
+|---------------------------|---------------------|-------------------------------------|---------|
+| **REST** (polling)        | `restapi_main.py`   | `client.get_order_book()` snapshots | BTCUSDT |
+| **WebSocket** (real-time) | `websocket_main.py` | `diff_book_depth` stream (100 ms)   | BTCUSDT |
 
 The REST path is fully wired — metrics → indicators → scores → best quote.  
 The WebSocket path runs the full strategy pipeline (metrics → indicators → scores) in near real-time via the `AnalysisEngine`.
@@ -41,20 +41,20 @@ The WebSocket path runs the full strategy pipeline (metrics → indicators → s
 
 ## 🚀 Four Entry Points — Start Here
 
-The project is driven by **four standalone scripts**. Everything else (strategy, core, execution, backtest modules) is support code called by one of these.
+The project is driven by **four standalone scripts**. Everything else (strategy, core, execution, backtest modules) is support code called by one or more of these.
 
-| # | Script | Purpose | Typical runtime | Command |
-|---|--------|---------|----------------|---------|
-| 1 | `websocket_main.py` | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass. | 60 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`) | `python websocket_main.py` |
-| 2 | `backtest/runner.py` | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3. | ~15–25 min on a laptop (90-day OOS window at 1 m resolution) | `python -m backtest.runner` |
-| 3 | `backtest/sensitivity.py` | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity` |
-| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test [informational], volatility check, confidence floor, label frequency, hit-rate alignment [informational]) to confirm the regime labels are statistically meaningful before trusting them in live trading. | ~20–30 min on a laptop (730-day window fetch + fit) | `python -m backtest.diagnostics.regime_validation` |
+| # | Script                                      | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                              | Typical runtime                                                                 | Command                                            |
+|---|---------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|----------------------------------------------------|
+| 1 | `websocket_main.py`                         | **Live trading session** — connects to the Binance Testnet WebSocket, maintains a real-time order book, detects market regimes via HMM on **5-minute klines** (`HMM_INTERVAL="5m"`, `HMM_LOOKBACK="10 hours ago UTC"`), and places LIMIT orders when the VWAP gate and regime filter both pass.                                                                                                                                                      | 60 min (default session length; configurable via `DEFAULT_SESSION_MINUTES`)     | `python websocket_main.py`                         |
+| 2 | `backtest/runner.py`                        | **Offline backtest (OOS validation)** — replays 90 days of data through the **two-resolution pipeline**: 5-minute klines (`BACKTEST_MACRO_INTERVAL`) for the HMM (~25,920 rows) and 1-minute klines (`BACKTEST_MICRO_INTERVAL`) for signals and PnL (~129,600 rows).  Prints P&L, Sharpe ratio, max drawdown, and filter hit-rates.  Uses parameters from `best_params.json` produced by script 3.                                                   | ~15–25 min on a laptop (90-day OOS window at 1 m resolution)                    | `python -m backtest.runner`                        |
+| 3 | `backtest/sensitivity.py`                   | **Parameter optimisation (IS tuning)** — runs an Optuna Bayesian search (40 trials by default) over `hmm_lookback_rows`, `hmm_max_regimes`, `vwap_window`, and `vwap_threshold` on the **in-sample** window (`BACKTEST_LOOKBACK = "360 days ago UTC"` → `BACKTEST_OOS_START = "90 days ago UTC"`, 270 days, ~77,760 macro rows / ~388,800 micro rows). Saves `best_params.json`, which is automatically loaded by scripts 1 and 2 on their next run. | ~3–6 h on a laptop (~5–8 min per trial; use `--n-trials 20` for a ~1.5–3 h run) | `python -m backtest.sensitivity`                   |
+| 4 | `backtest/diagnostics/regime_validation.py` | **Regime sanity check** — fits the HMM on 730 days of data and runs six statistical tests (direction test, Kruskal-Wallis H-test [informational], volatility check, confidence floor, label frequency, hit-rate alignment [informational]) to confirm the regime labels are statistically meaningful before trusting them in live trading.                                                                                                           | ~5-10 min on a laptop (730-day window fetch + fit)                              | `python -m backtest.diagnostics.regime_validation` |
 
 **Detailed notes on `regime_validation.py`:**
 - Uses its own independent **2-year lookback** (`VALIDATION_LOOKBACK = "730 days ago UTC"`) — NOT affected by `BACKTEST_LOOKBACK` or `BACKTEST_OOS_START` used by `sensitivity.py` and `runner.py`.
 - Splits the 2-year window into 70% train (~511 days) and 30% test (~219 days).
 - Fits a fresh HMM model on the train set, predicts regime labels on the test set, and runs 6 statistical checks.
-- Runtime: ~20–30 minutes (dominated by Binance API paginated fetches for ~1,050k rows).
+- Runtime: ~5–10 minutes (dominated by Binance API paginated fetches for ~1,050k rows).
 
 > **Recommended order for a new setup:**
 > `regime_validation` → `sensitivity` → `runner` → `websocket_main`
@@ -113,7 +113,7 @@ binance_spot_testnet/
 └── visualization/                     # Plotting utilities
     ├── __init__.py
     ├── plot_helpers.py                # Plotly visualisations (depth, OHLC)
-    └── session_chart.py               # End-of-session P&L chart (live): Strategy vs B&H index + filled/unfilled BUY/SELL markers (solid = traded, hollow grey = cancelled) + USDT/BTC panel — writes backtest/reporting/session_pnl_<ts>.html
+    └── session_chart.py               # End-of-session P&L chart (live): Strategy vs B&H index + filled/unfilled BUY/SELL markers (solid = traded, hollow green ▲ / red ▼ = cancelled) + USDT/BTC panel — writes backtest/reporting/session_pnl_<ts>.html
 ```
 
 ---
@@ -122,60 +122,60 @@ binance_spot_testnet/
 
 All tunable constants are centralised in `config_parameters.py`. Edit this file to change behaviour across the entire project without touching any logic files.
 
-| Group | Constant | Default | Description |
-|---|---|---|---|
-| **Symbol** | `SYMBOL` | `"BTCUSDT"` | Trading pair used across all REST and WebSocket calls |
-| **Symbol** | `CCY` | `"USDT"` | Quote currency |
-| **Symbol** | `CRYPTOCCY` | `"BTC"` | Base / crypto currency |
-| **Order book state** | `HISTORY_MAXLEN` | `3000` | Max snapshots in `history_order_book` — at 100 ms intervals this covers ~5 min.  Each entry: `{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}` (all numeric) |
-| **Order book state** | `N_LEVELS` | `50` | Number of order book levels used in `low_latency_analysis` |
-| **Analysis cadence** | `HFT_INTERVAL` | `1` s | Time between low-latency evaluations |
-| **Analysis cadence** | `HIST_INTERVAL` | `60` s | Time between historical analyses (1 min) |
-| **Analysis cadence** | `MIN_SNAPSHOTS` | `100` | Minimum snapshots required before historical analysis runs |
-| **WebSocket session** | `DEFAULT_SESSION_MINUTES` | `60` min | Default session length (fixed — no startup prompt) |
-| **WebSocket session** | `HTF_JOIN_TIMEOUT` | `10` s | Max wait for `low_latency_analysis` thread on shutdown |
-| **WebSocket session** | `HIST_JOIN_TIMEOUT` | `15` s | Max wait for `historical_analysis` thread on shutdown |
-| **Binance connection** | `RECV_WINDOW` | `5000` ms | Binance REST request validity window |
-| **Binance connection** | `SNAPSHOT_DEPTH` | `100` | Order book levels in the seed snapshot |
-| **Binance connection** | `WS_SPEED` | `100` ms | WebSocket diff-depth update interval |
-| **Quote throttle** | `QUOTE_EVERY_N_TICKS` | `10` | Ticks between `calculate_best_quote()` calls.  At `WS_SPEED=100 ms`, 10 ticks ≈ 1 s |
-| **HMM** | `HMM_FEATURE_COLS` | `["return", "volatility", "obi_proxy", "trade_density"]` | Feature columns fed to the `GaussianHMM` |
-| **HMM** | `HMM_N_ITERATIONS` | `1000` | Max EM iterations per model fit |
-| **HMM** | `HMM_MAX_REGIMES` | `3` | Upper bound on hidden states evaluated during BIC search (2 … 3, = `len(HMM_FEATURE_COLS) − 1`).  Capped at 3 to avoid under-populated states when training on 4 features |
-| **HMM** | `HMM_RANDOM_STATE` | `46` | Random seed for reproducible HMM initialisation |
-| **HMM** | `HMM_INTERVAL` | `Client.KLINE_INTERVAL_5MINUTE` | Kline granularity for regime detection (5 m — reduces noise vs 1 m without losing intraday granularity) |
-| **HMM** | `HMM_LOOKBACK` | `"10 hours ago UTC"` | Kline history window (~120 rows at 5 m — provides stable EM convergence without being stale) |
-| **HMM** | `HMM_MIN_COVAR` | `1e-1` | Regularisation floor for covariance matrices — prevents positive-definite errors.  1e-1 is the recommended safe default for z-scored financial features |
-| **HMM** | `HMM_N_INIT` | `5` | Number of independent random-seed restarts per candidate `n_components` value inside `select_hmm_model()`.  The retry loop breaks on the first valid (non-degenerate) fit, so well-conditioned windows cost 1 seed; only pathological windows retry up to 5 |
-| **HMM** | `HMM_TRAIN_ROWS` | `80` | Legacy reference value — mentioned only in code comments (**not a defined constant** in `config_parameters.py`).  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set |
-| **HMM** | `HMM_MIN_CONFIDENCE` | `0.60` | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped |
-| **HMM** | `HMM_REFIT_INTERVAL` | `300` s | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL` |
-| **Order report** | `ORDER_REPORT_LIMIT` | `100` | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit |
-| **Backtesting** | `BACKTEST_MACRO_INTERVAL` | `"5m"` | Kline resolution for the HMM regime frame.  5-minute bars reduce noise vs 1-minute without losing intraday regime granularity.  At 5 m: 270 IS days → ~77,760 rows; 90 OOS days → ~25,920 rows. |
-| **Backtesting** | `BACKTEST_MICRO_INTERVAL` | `"1m"` | Kline resolution for the execution/PnL frame (VWAP, signal gates, PnL simulation).  At 1 m: 270 IS days → ~388,800 rows; 90 OOS days → ~129,600 rows. |
-| **Backtesting** | `BACKTEST_LOOKBACK` | `"360 days ago UTC"` | **In-sample (IS) start** — how far back `sensitivity.py` fetches klines for parameter tuning.  A 360-day window captures ~3 full market cycles, reducing over-fit risk. |
-| **Backtesting** | `BACKTEST_OOS_START` | `"90 days ago UTC"` | **Out-of-sample (OOS) start / IS end cutoff**.  `sensitivity.py` stops fetching here (`end_str`); `runner.py` starts here.  Enforces a clean IS/OOS boundary. |
-| **Backtesting** | `VOLUME_DECAY_FACTOR` | `0.80` | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume |
-| **Backtesting** | `HMM_LOOKBACK_ROWS` | `120` | Number of macro (5 m) kline rows used as the HMM warm-up window in the backtest (**10 h at 5 m** — 120 × 5 min; matches `HMM_LOOKBACK` in the live system) |
-| **Backtesting** | `VWAP_WINDOW` | `5` | Rolling window size (in 1-minute micro bars) for the backtest VWAP computation (**5 min** — 5 × 1 min) |
-| **Backtesting** | `REFIT_EVERY` | `480` | Macro-bar iterations between full HMM BIC re-fits. Shared by `sensitivity.py` (IS sweep, ~162 refits over 270 days) and `runner.py` (OOS backtest, ~54 refits over 90 days) so IS↔OOS Sharpe figures use the same HMM cadence and are directly comparable. At 5 m: one re-fit every **40 hours**. |
-| **Backtesting P&L** | `BACKTEST_INITIAL_CAPITAL` | `315_000.0` | Starting USDT balance for the simulation (~250k USDT + 1 BTC @ ~65k, mirroring the live paper-trading account) |
-| **Backtesting P&L** | `BACKTEST_INITIAL_BTC` | `0.0` | Starting BTC balance. Always `0.0` to avoid orphan SELL signals; the BTC equivalent is folded into `BACKTEST_INITIAL_CAPITAL`. |
-| **Backtesting P&L** | `BACKTEST_FEE_RATE` | `0.001` | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance |
-| **Backtesting P&L** | `BACKTEST_RISK_FREE_RATE` | `0.04` | Annualised risk-free rate for Sharpe / Sortino denominator (0.04 ≈ 4 % US T-bill proxy; set to `0.0` for no risk-free adjustment) |
-| **Backtesting P&L** | `BACKTEST_MAX_ROWS` | `None` | Max replay candles in debug mode (`None` = full production run; set to e.g. `500` for a quick debug run) |
-| **Trend-pause filter** | `TREND_CONSECUTIVE_BARS` | `3` | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
-| **Trend-pause filter** | `TREND_COOLDOWN_BARS` | `4` | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space** |
-| **Adaptive stop-loss** | `STOP_LOSS_ROLLING_DAYS` | `90` | Lookback window (calendar days) for the rolling standard deviation of daily absolute returns used to compute the dynamic stop-loss threshold.  `threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT` — calibrates automatically to BTC's current volatility regime.  Enforced in BOTH the backtest (`backtest/pnl.py`) and the live system (`strategy/analysis.py`); `websocket_main.py` fetches 95 days of **production** daily klines (keyless `market_data_client`, matching the backtest's data source) at startup and refreshes the threshold once per UTC day inside `historical_analysis()` |
-| **Adaptive stop-loss** | `STOP_LOSS_STD_MULT` | `2.0` | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~2–3 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` (backtest console report) and the "Stop-loss summary" line at session end (live) to calibrate |
-| **Macro-trend filter** | `MACRO_TREND_ENABLED` | `True` | Master switch for the symmetric macro-trend overlay. `True` = active: `down` → suppress BUYs **and** force-liquidate the book to cash; `up` → suppress mean-reversion SELLs (hold & ride); `neutral` → normal mean-reversion.  `False` = fully inert on **both** the backtest and live paths (the clean ablation baseline).  Set a priori — **not in the Optuna search space** |
-| **Macro-trend filter** | `MACRO_TREND_SMA_DAYS` | `20` | Window (calendar days) of the daily-close simple moving average that anchors the macro-trend state.  Longer = smoother / slower to flag a trend; shorter = twitchier.  **Not in the Optuna search space** |
-| **Macro-trend filter** | `MACRO_TREND_SLOPE_DAYS` | `5` | Lookback (days) for the SMA slope confirmation: `slope = sign(SMA − SMA.shift(MACRO_TREND_SLOPE_DAYS))`.  A trend fires only when price is past the band **and** the SMA itself is moving the confirming way.  **Not in the Optuna search space** |
-| **Macro-trend filter** | `MACRO_TREND_BAND_PCT` | `0.02` | ±band dead-zone around the SMA before a trend is declared: `down` if `close < SMA×(1−band) AND slope<0`; `up` if `close > SMA×(1+band) AND slope>0`; else `neutral`.  Wider = more skeptical (stays `neutral` longer, fewer whipsaws).  Enforced in the backtest (`backtest/signals.py` gate + `backtest/pnl.py` force-to-cash) and the live system (`strategy/analysis.py`); `websocket_main.py` computes the state from **production** daily klines at startup and refreshes once per UTC day inside `historical_analysis()`.  **Not in the Optuna search space** |
-| **Sensitivity** | `SENSITIVITY_PREDICT_EVERY` | `5` | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise (~5× fewer Viterbi calls). `runner.py` always predicts every candle. (`SENSITIVITY_REFIT_EVERY` removed — refit cadence is now the shared `REFIT_EVERY = 480`.) |
-| **Sensitivity** | `SENSITIVITY_FEE_RATE` | `0.001` | Fee rate applied to **all** sensitivity runs (OAT, full-grid, Bayes). Fixed at the standard Binance Spot taker fee — not a strategy knob, never included in the search grid. |
-| **Sensitivity** | `SENSITIVITY_RANK_METRIC` | `"sharpe_ratio"` | Metric used to rank parameter combinations and select `best_params.json`. Change to `"sortino_ratio"` or `"total_return_pct"` to optimise for a different objective. |
-| **Sensitivity** | `SENSITIVITY_OAT_THRESHOLD` | `0.5` | $|\Delta \text{Sharpe}|$ threshold in the OAT sensitivity report. If any parameter change moves the rank metric by more than this, the report recommends running `--bayes` for a wider search. |
+| Group                  | Constant                    | Default                                                  | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+|------------------------|-----------------------------|----------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Symbol**             | `SYMBOL`                    | `"BTCUSDT"`                                              | Trading pair used across all REST and WebSocket calls                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Symbol**             | `CCY`                       | `"USDT"`                                                 | Quote currency                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Symbol**             | `CRYPTOCCY`                 | `"BTC"`                                                  | Base / crypto currency                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Order book state**   | `HISTORY_MAXLEN`            | `3000`                                                   | Max snapshots in `history_order_book` — at 100 ms intervals this covers ~5 min.  Each entry: `{timestamp, lastUpdateId, best_bid, best_ask, volume_best_bid, volume_best_ask}` (all numeric)                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Order book state**   | `N_LEVELS`                  | `50`                                                     | Number of order book levels used in `low_latency_analysis`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Analysis cadence**   | `HFT_INTERVAL`              | `1` s                                                    | Time between low-latency evaluations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Analysis cadence**   | `HIST_INTERVAL`             | `60` s                                                   | Time between historical analyses (1 min)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Analysis cadence**   | `MIN_SNAPSHOTS`             | `100`                                                    | Minimum snapshots required before historical analysis runs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **WebSocket session**  | `DEFAULT_SESSION_MINUTES`   | `60` min                                                 | Default session length (fixed — no startup prompt)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **WebSocket session**  | `HTF_JOIN_TIMEOUT`          | `10` s                                                   | Max wait for `low_latency_analysis` thread on shutdown                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **WebSocket session**  | `HIST_JOIN_TIMEOUT`         | `15` s                                                   | Max wait for `historical_analysis` thread on shutdown                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Binance connection** | `RECV_WINDOW`               | `5000` ms                                                | Binance REST request validity window                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Binance connection** | `SNAPSHOT_DEPTH`            | `100`                                                    | Order book levels in the seed snapshot                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Binance connection** | `WS_SPEED`                  | `100` ms                                                 | WebSocket diff-depth update interval                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Quote throttle**     | `QUOTE_EVERY_N_TICKS`       | `10`                                                     | Ticks between `calculate_best_quote()` calls.  At `WS_SPEED=100 ms`, 10 ticks ≈ 1 s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **HMM**                | `HMM_FEATURE_COLS`          | `["return", "volatility", "obi_proxy", "trade_density"]` | Feature columns fed to the `GaussianHMM`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **HMM**                | `HMM_N_ITERATIONS`          | `1000`                                                   | Max EM iterations per model fit                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **HMM**                | `HMM_MAX_REGIMES`           | `3`                                                      | Upper bound on hidden states evaluated during BIC search (2 … 3, = `len(HMM_FEATURE_COLS) − 1`).  Capped at 3 to avoid under-populated states when training on 4 features                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **HMM**                | `HMM_RANDOM_STATE`          | `46`                                                     | Random seed for reproducible HMM initialisation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **HMM**                | `HMM_INTERVAL`              | `Client.KLINE_INTERVAL_5MINUTE`                          | Kline granularity for regime detection (5 m — reduces noise vs 1 m without losing intraday granularity)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **HMM**                | `HMM_LOOKBACK`              | `"10 hours ago UTC"`                                     | Kline history window (~120 rows at 5 m — provides stable EM convergence without being stale)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **HMM**                | `HMM_MIN_COVAR`             | `1e-1`                                                   | Regularisation floor for covariance matrices — prevents positive-definite errors.  1e-1 is the recommended safe default for z-scored financial features                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **HMM**                | `HMM_N_INIT`                | `5`                                                      | Number of independent random-seed restarts per candidate `n_components` value inside `select_hmm_model()`.  The retry loop breaks on the first valid (non-degenerate) fit, so well-conditioned windows cost 1 seed; only pathological windows retry up to 5                                                                                                                                                                                                                                                                                                                                                           |
+| **HMM**                | `HMM_TRAIN_ROWS`            | `80`                                                     | Legacy reference value — mentioned only in code comments (**not a defined constant** in `config_parameters.py`).  **No longer used** to cap the live split — `regime_director.py` now computes `train_end = max(2, int(n_rows × 2/3))` adaptively per window.  At the default 120-row window this equals 80 (identical result), but shorter windows (e.g. 60 rows → 40 train) are now handled correctly instead of collapsing to a 1-row test set                                                                                                                                                                     |
+| **HMM**                | `HMM_MIN_CONFIDENCE`        | `0.60`                                                   | Minimum posterior probability (`predict_proba()[-1][current_regime]`) required to allow an order.  Below this threshold the regime signal is treated as ambiguous and both BUY and SELL are skipped                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **HMM**                | `HMM_REFIT_INTERVAL`        | `300` s                                                  | Cadence of **full** HMM re-fit inside `historical_analysis()`.  Between re-fits only a cheap Viterbi prediction runs.  Must be a multiple of `HIST_INTERVAL`                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Order report**       | `ORDER_REPORT_LIMIT`        | `100`                                                    | Max orders shown at head *and* tail of the end-of-session report.  Middle block collapsed when total > 2 × limit                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Backtesting**        | `BACKTEST_MACRO_INTERVAL`   | `"5m"`                                                   | Kline resolution for the HMM regime frame.  5-minute bars reduce noise vs 1-minute without losing intraday regime granularity.  At 5 m: 270 IS days → ~77,760 rows; 90 OOS days → ~25,920 rows.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Backtesting**        | `BACKTEST_MICRO_INTERVAL`   | `"1m"`                                                   | Kline resolution for the execution/PnL frame (VWAP, signal gates, PnL simulation).  At 1 m: 270 IS days → ~388,800 rows; 90 OOS days → ~129,600 rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Backtesting**        | `BACKTEST_LOOKBACK`         | `"360 days ago UTC"`                                     | **In-sample (IS) start** — how far back `sensitivity.py` fetches klines for parameter tuning.  A 360-day window captures ~3 full market cycles, reducing over-fit risk.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Backtesting**        | `BACKTEST_OOS_START`        | `"90 days ago UTC"`                                      | **Out-of-sample (OOS) start / IS end cutoff**.  `sensitivity.py` stops fetching here (`end_str`); `runner.py` starts here.  Enforces a clean IS/OOS boundary.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Backtesting**        | `VOLUME_DECAY_FACTOR`       | `0.80`                                                   | Exponential decay factor for synthetic order-book depth — each level retains 80 % of the previous level's volume                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Backtesting**        | `HMM_LOOKBACK_ROWS`         | `120`                                                    | Number of macro (5 m) kline rows used as the HMM warm-up window in the backtest (**10 h at 5 m** — 120 × 5 min; matches `HMM_LOOKBACK` in the live system)                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Backtesting**        | `VWAP_WINDOW`               | `5`                                                      | Rolling window size (in 1-minute micro bars) for the backtest VWAP computation (**5 min** — 5 × 1 min)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Backtesting**        | `REFIT_EVERY`               | `480`                                                    | Macro-bar iterations between full HMM BIC re-fits. Shared by `sensitivity.py` (IS sweep, ~162 refits over 270 days) and `runner.py` (OOS backtest, ~54 refits over 90 days) so IS↔OOS Sharpe figures use the same HMM cadence and are directly comparable. At 5 m: one re-fit every **40 hours**.                                                                                                                                                                                                                                                                                                                     |
+| **Backtesting P&L**    | `BACKTEST_INITIAL_CAPITAL`  | `315_000.0`                                              | Starting USDT balance for the simulation (~250k USDT + 1 BTC @ ~65k, mirroring the live paper-trading account)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Backtesting P&L**    | `BACKTEST_INITIAL_BTC`      | `0.0`                                                    | Starting BTC balance. Always `0.0` to avoid orphan SELL signals; the BTC equivalent is folded into `BACKTEST_INITIAL_CAPITAL`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Backtesting P&L**    | `BACKTEST_FEE_RATE`         | `0.001`                                                  | Taker fee fraction per side (0.10 %).  Also used by `OrderExecutor.execute()` to compute the fee-adjusted BUY quantity cap: `usdt / (micro_price × (1 + BACKTEST_FEE_RATE))` — prevents Binance from rejecting orders with `insufficient balance` when the taker fee pushes the total debit over the available balance                                                                                                                                                                                                                                                                                                |
+| **Backtesting P&L**    | `BACKTEST_RISK_FREE_RATE`   | `0.04`                                                   | Annualised risk-free rate for Sharpe / Sortino denominator (0.04 ≈ 4 % US T-bill proxy; set to `0.0` for no risk-free adjustment)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| **Backtesting P&L**    | `BACKTEST_MAX_ROWS`         | `None`                                                   | Max replay candles in debug mode (`None` = full production run; set to e.g. `500` for a quick debug run)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Trend-pause filter** | `TREND_CONSECUTIVE_BARS`    | `3`                                                      | Number of consecutive same-direction 5-minute closes required to trigger a trend-pause flag.  When the flag is set, new BUY/SELL entries are suppressed (mean-reversion should not trade into a trending market).  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space**                                                                                                                                                                                                                                                                                                                            |
+| **Trend-pause filter** | `TREND_COOLDOWN_BARS`       | `4`                                                      | Extra macro bars to remain paused after the last trending bar.  Prevents whipsaw re-entry the instant a streak breaks.  Fixed from Optuna study 2026-05-24 — **not in the Optuna search space**                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Adaptive stop-loss** | `STOP_LOSS_ROLLING_DAYS`    | `90`                                                     | Lookback window (calendar days) for the rolling standard deviation of daily absolute returns used to compute the dynamic stop-loss threshold.  `threshold(t) = rolling_std(abs_daily_return, 90d) × STOP_LOSS_STD_MULT` — calibrates automatically to BTC's current volatility regime.  Enforced in BOTH the backtest (`backtest/pnl.py`) and the live system (`strategy/analysis.py`); `websocket_main.py` fetches 95 days of **production** daily klines (keyless `market_data_client`, matching the backtest's data source) at startup and refreshes the threshold once per UTC day inside `historical_analysis()` |
+| **Adaptive stop-loss** | `STOP_LOSS_STD_MULT`        | `2.0`                                                    | Multiplier applied to the rolling daily-return std to set the stop-loss distance.  At typical BTC volatility (~1–1.5 % daily std) this gives a ~2–3 % stop distance.  Increase to loosen (fewer fires, more tail risk); decrease to tighten (more fires, more missed rebounds).  Monitor `n_stop_loss_fires` (backtest console report) and the "Stop-loss summary" line at session end (live) to calibrate                                                                                                                                                                                                            |
+| **Macro-trend filter** | `MACRO_TREND_ENABLED`       | `True`                                                   | Master switch for the symmetric macro-trend overlay. `True` = active: `down` → suppress BUYs **and** force-liquidate the book to cash; `up` → suppress mean-reversion SELLs (hold & ride); `neutral` → normal mean-reversion.  `False` = fully inert on **both** the backtest and live paths (the clean ablation baseline).  Set a priori — **not in the Optuna search space**                                                                                                                                                                                                                                        |
+| **Macro-trend filter** | `MACRO_TREND_SMA_DAYS`      | `20`                                                     | Window (calendar days) of the daily-close simple moving average that anchors the macro-trend state.  Longer = smoother / slower to flag a trend; shorter = twitchier.  **Not in the Optuna search space**                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **Macro-trend filter** | `MACRO_TREND_SLOPE_DAYS`    | `5`                                                      | Lookback (days) for the SMA slope confirmation: `slope = sign(SMA − SMA.shift(MACRO_TREND_SLOPE_DAYS))`.  A trend fires only when price is past the band **and** the SMA itself is moving the confirming way.  **Not in the Optuna search space**                                                                                                                                                                                                                                                                                                                                                                     |
+| **Macro-trend filter** | `MACRO_TREND_BAND_PCT`      | `0.02`                                                   | ±band dead-zone around the SMA before a trend is declared: `down` if `close < SMA×(1−band) AND slope<0`; `up` if `close > SMA×(1+band) AND slope>0`; else `neutral`.  Wider = more skeptical (stays `neutral` longer, fewer whipsaws).  Enforced in the backtest (`backtest/signals.py` gate + `backtest/pnl.py` force-to-cash) and the live system (`strategy/analysis.py`); `websocket_main.py` computes the state from **production** daily klines at startup and refreshes once per UTC day inside `historical_analysis()`.  **Not in the Optuna search space**                                                   |
+| **Sensitivity**        | `SENSITIVITY_PREDICT_EVERY` | `5`                                                      | Viterbi predict cadence used **only** by `sensitivity.py`. Between refit calls, `predict_current_regime()` is called only every 5 candles; the last known regime label is reused otherwise (~5× fewer Viterbi calls). `runner.py` always predicts every candle. (`SENSITIVITY_REFIT_EVERY` removed — refit cadence is now the shared `REFIT_EVERY = 480`.)                                                                                                                                                                                                                                                            |
+| **Sensitivity**        | `SENSITIVITY_FEE_RATE`      | `0.001`                                                  | Fee rate applied to **all** sensitivity runs (OAT, full-grid, Bayes). Fixed at the standard Binance Spot taker fee — not a strategy knob, never included in the search grid.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Sensitivity**        | `SENSITIVITY_RANK_METRIC`   | `"sharpe_ratio"`                                         | Metric used to rank parameter combinations and select `best_params.json`. Change to `"sortino_ratio"` or `"total_return_pct"` to optimise for a different objective.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Sensitivity**        | `SENSITIVITY_OAT_THRESHOLD` | `0.5`                                                    | $\Delta \text{Sharpe}$ threshold in the OAT sensitivity report. If any parameter change moves the rank metric by more than this, the report recommends running `--bayes` for a wider search.                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 For a compact per-category summary and the full per-module import list, see **[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)**.
 
@@ -240,15 +240,15 @@ write nothing outside pytest's `tmp_path`.
 
 **Coverage (51 tests):**
 
-| Test file | Module under test | Tests |
-|---|---|---|
-| `tests/test_book_utils.py` | `strategy/book_utils.py` | 12 |
-| `tests/test_indicators.py` | `strategy/indicators.py` | 9 |
-| `tests/test_param_loader.py` | `strategy/param_loader.py` | 8 |
-| `tests/test_pnl.py` | `backtest/pnl.py` | 7 |
-| `tests/test_message_handler.py` | `core/message_handler.py` | 7 |
-| `tests/test_order_book_state.py` | `core/order_book_state.py` | 5 |
-| `tests/test_signals.py` | `backtest/signals.py` (`_add_hmm_features`) | 3 |
+| Test file                        | Module under test                           | Tests |
+|----------------------------------|---------------------------------------------|-------|
+| `tests/test_book_utils.py`       | `strategy/book_utils.py`                    | 12    |
+| `tests/test_indicators.py`       | `strategy/indicators.py`                    | 9     |
+| `tests/test_param_loader.py`     | `strategy/param_loader.py`                  | 8     |
+| `tests/test_pnl.py`              | `backtest/pnl.py`                           | 7     |
+| `tests/test_message_handler.py`  | `core/message_handler.py`                   | 7     |
+| `tests/test_order_book_state.py` | `core/order_book_state.py`                  | 5     |
+| `tests/test_signals.py`          | `backtest/signals.py` (`_add_hmm_features`) | 3     |
 
 Tests pin **current** behaviour — a test that would need a source change to pass
 is treated as a finding, not a silent edit. Out of scope for Tier B (deferred to
@@ -320,14 +320,14 @@ Binance REST API (production,      Binance WebSocket (production)
 
 **Component responsibilities:**
 
-| Class / Module | Role |
-|---|---|
-| `OrderBookState` | Shared order book (`local_book`, `history_order_book`) and balance data (`balance_status`); serialised via `thread_lock` and `thread_balance_lock` |
-| `MessageHandler` | Merges diff-depth WebSocket ticks into `local_book`; appends snapshots to history; triggers throttled quote calculation every 10 ticks |
-| `RegimeDirector` | Detects market regime via HMM on 5-minute bars (2/3-1/3 train/test split, adaptive per window). Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability) protected by `_regime_lock` |
+| Class / Module   | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `OrderBookState` | Shared order book (`local_book`, `history_order_book`) and balance data (`balance_status`); serialised via `thread_lock` and `thread_balance_lock`                                                                                                                                                                                                                                                                                                                                                                                             |
+| `MessageHandler` | Merges diff-depth WebSocket ticks into `local_book`; appends snapshots to history; triggers throttled quote calculation every 10 ticks                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `RegimeDirector` | Detects market regime via HMM on 5-minute bars (2/3-1/3 train/test split, adaptive per window). Exposes `regime_label` (`"trending_up"`, `"trending_down"`, `"high_volatility"`, `"neutral"`) and `regime_confidence` (posterior probability) protected by `_regime_lock`                                                                                                                                                                                                                                                                      |
 | `AnalysisEngine` | Runs `low_latency_analysis` (1 s cadence, scores order-book candidates) and `historical_analysis` (60 s cadence, updates HMM + VWAPs). BUY legs stack via the pyramiding exposure gate (`MAX_PYRAMID_LEGS` + `MIN_CASH_RESERVE_PCT` reserve floor); a full SELL or stop-loss closes the position. With `FLATTEN_ON_START = False` (default), inherited BTC (balance ≥ 0.0001) is carried as the session's starting position and traded around normally; with `FLATTEN_ON_START = True` it is MARKET-sold at startup so the session begins flat |
-| `OrderExecutor` | Places orders via Binance WebSocket API: LIMIT GTC for BUY; SELL is MARKET when urgent (stop-loss) else a resting LIMIT GTC. Maintains real-time balance via `outboundAccountPosition` push events; cancels stale resting BUY/SELL orders after 10 s (`cancel_stale_buy` / `cancel_stale_sell`); refreshes balance from REST after every order. Falls back to REST for order placement if WS is unavailable |
-| `websocket_main` | Session orchestrator — creates state, injects into handlers, runs pre-session regime fit, opens WebSocket streams, starts threads |
+| `OrderExecutor`  | Places orders via Binance WebSocket API: LIMIT GTC for BUY; SELL is MARKET when urgent (stop-loss) else a resting LIMIT GTC. Maintains real-time balance via `outboundAccountPosition` push events; cancels stale resting BUY/SELL orders after 10 s (`cancel_stale_buy` / `cancel_stale_sell`); refreshes balance from REST after every order. Falls back to REST for order placement if WS is unavailable                                                                                                                                    |
+| `websocket_main` | Session orchestrator — creates state, injects into handlers, runs pre-session regime fit, opens WebSocket streams, starts threads                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 **How they interact (essentials):**
 
@@ -352,20 +352,20 @@ Binance REST API (production,      Binance WebSocket (production)
 
 Both analysis loops in `AnalysisEngine` are designed to run indefinitely:
 
-| Loop | Cadence | Purpose |
-|------|---------|---------|
-| `low_latency_analysis` | every **1 s** | Near-real-time best bid/ask evaluation |
-| `historical_analysis` | every **1 min** | VWAP computation over the rolling snapshot window |
+| Loop                   | Cadence         | Purpose                                           |
+|------------------------|-----------------|---------------------------------------------------|
+| `low_latency_analysis` | every **1 s**   | Near-real-time best bid/ask evaluation            |
+| `historical_analysis`  | every **1 min** | VWAP computation over the rolling snapshot window |
 
 Rather than running forever, `websocket_main.py` uses a fixed session duration set by `DEFAULT_SESSION_MINUTES` (no startup prompt).
 
 The **default of 60 minutes** is chosen deliberately:
 
-| Metric | Value at 60 min |
-|--------|----------------|
-| Low-latency iterations (`low_latency_analysis`) | $60 \times 60 / 1 = \mathbf{3{,}600}$ |
-| Historical iterations (`historical_analysis`) | $60 \times 60 / 60 = \mathbf{60}$ |
-| Order book snapshots in history | up to $60 \times 60 \times 10 = \mathbf{36{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
+| Metric                                          | Value at 60 min                                                                                 |
+|-------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| Low-latency iterations (`low_latency_analysis`) | $60 \times 60 / 1 = \mathbf{3{,}600}$                                                           |
+| Historical iterations (`historical_analysis`)   | $60 \times 60 / 60 = \mathbf{60}$                                                               |
+| Order book snapshots in history                 | up to $60 \times 60 \times 10 = \mathbf{36{,}000}$ ticks (capped at `maxlen=3000` ≈ last 5 min) |
 
 When the session duration elapses, `websocket_main.py` sets `stop_event`, calls `ws_client.stop()` to close the stream cleanly, and joins both analysis threads (with timeouts of 10 s and 15 s respectively). A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.
 
@@ -375,13 +375,13 @@ When the session duration elapses, `websocket_main.py` sets `stop_event`, calls 
 
 The deque size is driven by the **WebSocket tick rate** (~10 entries/sec at 100 ms), not by the historical analysis interval.  `historical_analysis` only *reads* the deque — it never clears it.
 
-| Time elapsed | WebSocket ticks | Deque size | Historical iterations |
-|---|---|---|---|
-| 1 min | ~600 | 600 | 1st runs (reads 600 entries) |
-| 3 min | ~1 800 | 1 800 | 3rd runs (reads 1 800 entries) |
-| 5 min | ~3 000 | **3 000 (full)** | 5th runs (reads 3 000 entries) |
-| 10 min | ~6 000 sent | **3 000 (capped — oldest evicted)** | 10th runs (reads 3 000 entries) |
-| 20 min | ~12 000 sent | **3 000 (capped)** | 20th runs (reads 3 000 entries) |
+| Time elapsed | WebSocket ticks | Deque size                          | Historical iterations           |
+|--------------|-----------------|-------------------------------------|---------------------------------|
+| 1 min        | ~600            | 600                                 | 1st runs (reads 600 entries)    |
+| 3 min        | ~1 800          | 1 800                               | 3rd runs (reads 1 800 entries)  |
+| 5 min        | ~3 000          | **3 000 (full)**                    | 5th runs (reads 3 000 entries)  |
+| 10 min       | ~6 000 sent     | **3 000 (capped — oldest evicted)** | 10th runs (reads 3 000 entries) |
+| 20 min       | ~12 000 sent    | **3 000 (capped)**                  | 20th runs (reads 3 000 entries) |
 
 After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling window** of the last ~5 minutes. Each `historical_analysis` iteration operates on whatever is currently in the window — not a fixed block.
 
@@ -424,7 +424,7 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
     - Under `state.thread_balance_lock`, update `state.balance_status` for each tracked asset (`CRYPTOCCY`, `CCY`) using the `"f"` (free) field.
 14. After `session_seconds`, set `stop_event`, stop `ws_client`, stop `executor` (closes the WS API + user-data connection), and join both analysis threads (10 s low-latency, 15 s historical).  A `KeyboardInterrupt` (Ctrl-C) triggers the same shutdown path early.  After threads exit, `executor.cancel_session_open_orders()` cancels every order this session placed that is still resting on the book (frees locked funds and prevents unattended fills after shutdown; foreign open orders on the shared testnet account are untouched), then two reports are printed:
     - **Order status report** — queries every placed order via REST (`GET /api/v3/order`) and logs fill status.
-    - **Balance report** — fetches final balances (free + locked, minus the foreign locked captured at session start — mirroring the equity chart's `locked_*_at_start` correction; free-only under-reported the 2026-07-08 session by the full locked amount, showing -98.97% instead of +0.025%) and `btc_end_price`, then prints a P&L decomposition:
+    - **Balance report** — fetches final balances (free + locked, minus the foreign locked captured at session start — mirroring the equity chart's `locked_*_at_start` correction; free-only under-reports by the full locked amount) and `btc_end_price`, then prints a P&L decomposition:
       - **Trading alpha (A)** = `Δusdt + Δbtc × end_price` — the strategy's contribution, independent of BTC price movement.
       - **Price move (B)** = `btc_start × (end_price − start_price)` — gain/loss from the starting BTC position due to market movement.
       - **Total P&L** = A + B (with percentage return on starting portfolio value).
@@ -432,21 +432,21 @@ After ~5 minutes the deque hits `maxlen=3000` and becomes a true **rolling windo
 
 ## Notation
 
-| Symbol | Column name | Description |
-|--------|-------------|-------------|
-| $P_b$, $Q_b$ | `bid_price`, `bid_quantity` | Best bid price and quantity at a level |
-| $P_a$, $Q_a$ | `ask_price`, `ask_quantity` | Best ask price and quantity at a level |
-| $bq$ | `bq` | Individual bid quantity at a level (carried through the opportunity pipeline for order sizing — SELL uses this) |
-| $aq$ | `aq` | Individual ask quantity at a level (carried through the opportunity pipeline for order sizing — BUY uses this) |
-| $D$ | `total_depth` | Sum of bid and ask quantities |
-| $P_{\text{mid}}$ | `mid_price` | Arithmetic mid-price |
-| $P_{\mu}$ | `micro_price` | Volume-weighted micro-price |
-| $\text{OBI}$ | `obi` | Order book imbalance |
-| $S$ | `bid_ask_spread` | Relative bid-ask spread |
-| $\mathbb{1}_{\mu > \text{mid}}$ | `micro_vs_mid` | True when micro-price exceeds mid |
-| $\Delta_{\mu}$ | `micro_mid_delta` | Directional micro–mid delta |
-| $\mathbb{1}_{\text{thin}}$ | `is_thin_micro_effect` | True when depth is below median |
-| $\mathbb{1}_{D \geq 50\%}$ | `is_total_depth_50pct_l0` | True when depth ≥ 50 % of level-0 |
+| Symbol                          | Column name                 | Description                                                                                                     |
+|---------------------------------|-----------------------------|-----------------------------------------------------------------------------------------------------------------|
+| $P_b$, $Q_b$                    | `bid_price`, `bid_quantity` | Best bid price and quantity at a level                                                                          |
+| $P_a$, $Q_a$                    | `ask_price`, `ask_quantity` | Best ask price and quantity at a level                                                                          |
+| $bq$                            | `bq`                        | Individual bid quantity at a level (carried through the opportunity pipeline for order sizing — SELL uses this) |
+| $aq$                            | `aq`                        | Individual ask quantity at a level (carried through the opportunity pipeline for order sizing — BUY uses this)  |
+| $D$                             | `total_depth`               | Sum of bid and ask quantities                                                                                   |
+| $P_{\text{mid}}$                | `mid_price`                 | Arithmetic mid-price                                                                                            |
+| $P_{\mu}$                       | `micro_price`               | Volume-weighted micro-price                                                                                     |
+| $\text{OBI}$                    | `obi`                       | Order book imbalance                                                                                            |
+| $S$                             | `bid_ask_spread`            | Relative bid-ask spread                                                                                         |
+| $\mathbb{1}_{\mu > \text{mid}}$ | `micro_vs_mid`              | True when micro-price exceeds mid                                                                               |
+| $\Delta_{\mu}$                  | `micro_mid_delta`           | Directional micro–mid delta                                                                                     |
+| $\mathbb{1}_{\text{thin}}$      | `is_thin_micro_effect`      | True when depth is below median                                                                                 |
+| $\mathbb{1}_{D \geq 50\%}$      | `is_total_depth_50pct_l0`   | True when depth ≥ 50 % of level-0                                                                               |
 
 ---
 
@@ -489,10 +489,10 @@ $$S = \frac{P_a - P_b}{P_{\text{mid}}}$$
 
 ### Spread Flags
 
-| Flag | Condition | Decimal threshold |
-|------|-----------|-------------------|
-| `is_large_spread` | $S > 0.10\%$ | $S > 0.001$ |
-| `is_small_spread` | $S \leq 0.02\%$ | $S \leq 0.0002$ |
+| Flag              | Condition       | Decimal threshold |
+|-------------------|-----------------|-------------------|
+| `is_large_spread` | $S > 0.10\%$    | $S > 0.001$       |
+| `is_small_spread` | $S \leq 0.02\%$ | $S \leq 0.0002$   |
 
 ---
 
@@ -528,10 +528,10 @@ Ensures the level carries at least 50 % of the top-of-book liquidity.
 
 $$\text{Score} = 0.7 \cdot \frac{D}{D_{\max}} + 0.3 \cdot \frac{\Delta_{\mu}}{\Delta_{\mu,\max}}$$
 
-| Component | Weight | Rationale |
-|-----------|--------|-----------|
-| Normalised depth $\frac{D}{D_{\max}}$ | 70 % | **Safety** — prefer levels with substantial liquidity |
-| Normalised delta $\frac{\Delta_{\mu}}{\Delta_{\mu,\max}}$ | 30 % | **Aggression** — prefer levels where the micro-price divergence is largest |
+| Component                                                 | Weight | Rationale                                                                  |
+|-----------------------------------------------------------|--------|----------------------------------------------------------------------------|
+| Normalised depth $\frac{D}{D_{\max}}$                     | 70 %   | **Safety** — prefer levels with substantial liquidity                      |
+| Normalised delta $\frac{\Delta_{\mu}}{\Delta_{\mu,\max}}$ | 30 %   | **Aggression** — prefer levels where the micro-price divergence is largest |
 
 ---
 
@@ -559,9 +559,9 @@ Both VWAPs are published under `_vwap_lock` so the low-latency thread can read t
 
 After the first `historical_analysis` iteration (≈ 1 min into the session), `_bid_vwap` and `_ask_vwap` are populated.  `low_latency_analysis` reads both on every iteration and applies a **dip/strength confirmation gate** with a symmetric dead zone (`VWAP_THRESHOLD_MULTIPLIER` δ, default 0.002) before sending an order:
 
-| Side | Anchor | Condition to execute | Interpretation |
-|------|--------|---------------------|----------------|
-| **BUY** | `bid_vwap` | `_bid_vwap is None` **or** `micro_price < bid_vwap × (1 − δ)` | Dip deep enough below volume-weighted bid pressure to cover fees and leave profit |
+| Side     | Anchor     | Condition to execute                                          | Interpretation                                                                        |
+|----------|------------|---------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| **BUY**  | `bid_vwap` | `_bid_vwap is None` **or** `micro_price < bid_vwap × (1 − δ)` | Dip deep enough below volume-weighted bid pressure to cover fees and leave profit     |
 | **SELL** | `ask_vwap` | `_ask_vwap is None` **or** `micro_price ≥ ask_vwap × (1 + δ)` | Rally strong enough above volume-weighted ask pressure to cover fees and leave profit |
 
 $$\text{VWAP gate (BUY):} \quad P_{\mu} < \text{VWAP}_{\text{bid}} \times (1 - \delta)$$
@@ -633,22 +633,22 @@ The probability of starting in each regime at $t = 1$.  In practice the model le
 
 #### Learning and Inference
 
-| Step | Algorithm | hmmlearn call | What it does |
-|---|---|---|---|
-| **Training** | Baum-Welch (Expectation-Maximisation) | `model.fit(features)` | Learns $A$, $B$ ($\mu_i$, $\Sigma_i$), $\pi$ from the kline feature matrix |
-| **Inference** | Viterbi | `model.predict(features)` | Finds the most likely hidden state sequence $q_1, q_2, \ldots, q_T$ given the observed features |
-| **Model selection** | BIC | `model.bic(features)` | Penalises model complexity; used to choose the best $n$ (number of regimes) |
+| Step                | Algorithm                             | hmmlearn call             | What it does                                                                                    |
+|---------------------|---------------------------------------|---------------------------|-------------------------------------------------------------------------------------------------|
+| **Training**        | Baum-Welch (Expectation-Maximisation) | `model.fit(features)`     | Learns $A$, $B$ ($\mu_i$, $\Sigma_i$), $\pi$ from the kline feature matrix                      |
+| **Inference**       | Viterbi                               | `model.predict(features)` | Finds the most likely hidden state sequence $q_1, q_2, \ldots, q_T$ given the observed features |
+| **Model selection** | BIC                                   | `model.bic(features)`     | Penalises model complexity; used to choose the best $n$ (number of regimes)                     |
 
 The last element of the predicted sequence, `regimes[-1]`, corresponds to the **most recent candle** — this becomes `current_regime` and is what `assign_regime_labels()` uses to set `regime_label`.
 
 ### Features
 
-| Feature | Formula | Interpretation |
-|---|---|---|
-| `return` | `close.pct_change()` | Per-candle price momentum |
-| `volatility` | `(high - low) / close` | Normalised intra-bar price swing |
-| `obi_proxy` | `(taker_buy_base_vol / volume) × 2 − 1` | Taker-flow imbalance proxy ∈ `[-1, +1]`; approximates live OBI from kline data |
-| `trade_density` | `num_trades / volume` | Trade fragmentation: high → many small trades (retail/HFT); low → large blocks (institutional) |
+| Feature         | Formula                                 | Interpretation                                                                                 |
+|-----------------|-----------------------------------------|------------------------------------------------------------------------------------------------|
+| `return`        | `close.pct_change()`                    | Per-candle price momentum                                                                      |
+| `volatility`    | `(high - low) / close`                  | Normalised intra-bar price swing                                                               |
+| `obi_proxy`     | `(taker_buy_base_vol / volume) × 2 − 1` | Taker-flow imbalance proxy ∈ `[-1, +1]`; approximates live OBI from kline data                 |
+| `trade_density` | `num_trades / volume`                   | Trade fragmentation: high → many small trades (retail/HFT); low → large blocks (institutional) |
 
 ### Feature Scaling
 
@@ -670,10 +670,10 @@ where $\hat{L}$ is the model likelihood, $k$ the number of free parameters, and 
 
 To avoid re-training the full model on nearly identical data every 60 s, `historical_analysis()` uses a two-speed scheme:
 
-| Cadence | Method called | Cost | When |
-|---|---|---|---|
-| Every `HIST_INTERVAL` (60 s) | `predict_current_regime()` | O(n × k) — single Viterbi pass | Iterations 1, 2, 3, 4, 6, 7, … |
-| Every `HMM_REFIT_INTERVAL` (300 s) | `select_hmm_model()` | O(n × k × `HMM_N_ITERATIONS`) per candidate — expensive | Iterations 5, 10, 15, … |
+| Cadence                            | Method called              | Cost                                                    | When                           |
+|------------------------------------|----------------------------|---------------------------------------------------------|--------------------------------|
+| Every `HIST_INTERVAL` (60 s)       | `predict_current_regime()` | O(n × k) — single Viterbi pass                          | Iterations 1, 2, 3, 4, 6, 7, … |
+| Every `HMM_REFIT_INTERVAL` (300 s) | `select_hmm_model()`       | O(n × k × `HMM_N_ITERATIONS`) per candidate — expensive | Iterations 5, 10, 15, …        |
 
 `assign_regime_labels()` runs inside `_regime_lock` on **every** iteration regardless of path.
 
@@ -683,11 +683,11 @@ After each `predict()` call, `predict_proba(features_scaled)` is called to obtai
 
 $$\text{regime\_confidence} = P(\text{state} = \text{current\_regime} \mid \text{observations})$$
 
-| `regime_confidence` | Interpretation |
-|---|---|
-| ≥ `HMM_MIN_CONFIDENCE` (0.60) | Model is confident — gates apply normally |
-| < `HMM_MIN_CONFIDENCE` | Model is uncertain (e.g. 55 % vs 45 %) — **both BUY and SELL are skipped** |
-| `None` (warm-up) | No model fitted yet — gate is transparent |
+| `regime_confidence`           | Interpretation                                                             |
+|-------------------------------|----------------------------------------------------------------------------|
+| ≥ `HMM_MIN_CONFIDENCE` (0.60) | Model is confident — gates apply normally                                  |
+| < `HMM_MIN_CONFIDENCE`        | Model is uncertain (e.g. 55 % vs 45 %) — **both BUY and SELL are skipped** |
+| `None` (warm-up)              | No model fitted yet — gate is transparent                                  |
 
 ### State Labelling
 
@@ -699,24 +699,24 @@ A combined **direction score** is computed per state:
 
 $$\text{direction\_score}_i = \text{rank}(\text{return}_i) + \text{rank}(\text{obi\_proxy}_i)$$
 
-| Assignment | Rule |
-|---|---|
-| `"trending_up"` | State with the **highest** direction score (most bullish: highest return + strongest buy-side flow) |
-| `"trending_down"` | State with the **lowest** direction score (most bearish: lowest return + weakest flow) |
+| Assignment        | Rule                                                                                                |
+|-------------------|-----------------------------------------------------------------------------------------------------|
+| `"trending_up"`   | State with the **highest** direction score (most bullish: highest return + strongest buy-side flow) |
+| `"trending_down"` | State with the **lowest** direction score (most bearish: lowest return + weakest flow)              |
 
 Because `idxmax()` and `idxmin()` are exclusive by definition, duplicate directional labels are structurally impossible regardless of `n_components`.
 
 **Secondary labels** — applied to remaining states via volatility and trade-density thresholds:
 
-| Flag | Condition |
-|---|---|
-| `high_vol` | `volatility > cross-state mean + 1 × std` |
-| `high_td` | `trade_density > cross-state mean + 0.5 × std` |
+| Flag       | Condition                                      |
+|------------|------------------------------------------------|
+| `high_vol` | `volatility > cross-state mean + 1 × std`      |
+| `high_td`  | `trade_density > cross-state mean + 0.5 × std` |
 
-| Condition | Label | Rationale |
-|---|---|---|
+| Condition                   | Label               | Rationale                                                                                                                                                   |
+|-----------------------------|---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `high_vol` **or** `high_td` | `"high_volatility"` | Either large price swings (unpredictable fills) **or** heavy trade fragmentation (noisy, no directional intent) makes the market **unreliable to trade in** |
-| *(default)* | `"neutral"` | No dominant signal |
+| *(default)*                 | `"neutral"`         | No dominant signal                                                                                                                                          |
 
 > **Why OR?** Both `high_vol` and `high_td` independently indicate an unreliable market — one from the price side (large swings), the other from the flow side (fragmented activity). Using OR ensures `trade_density` has a meaningful role in the label assignment rather than being used only for model training.
 
@@ -726,20 +726,20 @@ Two gates are applied **sequentially**:
 
 **Gate 1 — Confidence** (evaluated first, before any label check):
 
-| `regime_confidence` | Result |
-|---|---|
+| `regime_confidence`                  | Result                             |
+|--------------------------------------|------------------------------------|
 | `None` (before first historical run) | ✅ transparent — all orders allowed |
-| ≥ `HMM_MIN_CONFIDENCE` (0.60) | ✅ proceed to direction gate |
-| < `HMM_MIN_CONFIDENCE` | ❌ **both** BUY and SELL skipped |
+| ≥ `HMM_MIN_CONFIDENCE` (0.60)        | ✅ proceed to direction gate        |
+| < `HMM_MIN_CONFIDENCE`               | ❌ **both** BUY and SELL skipped    |
 
 **Gate 2 — Direction** (evaluated only if confidence gate passed):
 
-| Regime | BUY | SELL |
-|---|---|---|
-| `"trending_up"` | ✅ allowed | ❌ suppressed |
-| `"trending_down"` | ❌ suppressed | ✅ allowed |
-| `"high_volatility"` | ❌ suppressed | ❌ suppressed |
-| `"neutral"` | ✅ allowed | ✅ allowed |
+| Regime                               | BUY           | SELL          |
+|--------------------------------------|---------------|---------------|
+| `"trending_up"`                      | ✅ allowed     | ❌ suppressed  |
+| `"trending_down"`                    | ❌ suppressed  | ✅ allowed     |
+| `"high_volatility"`                  | ❌ suppressed  | ❌ suppressed  |
+| `"neutral"`                          | ✅ allowed     | ✅ allowed     |
 | `None` (before first historical run) | ✅ transparent | ✅ transparent |
 
 ### Session Timeline with HMM
@@ -780,10 +780,10 @@ A backtesting framework has been built to replay the live strategy against
 historical 5-minute BTCUSDT klines using a clean **in-sample / out-of-sample
 (IS/OOS) split**:
 
-| Window | Config constant | Rows at 5 m | Used by |
-|---|---|---|---|
-| IS: 360 days ago → 90 days ago (270 days) | `BACKTEST_LOOKBACK` → `BACKTEST_OOS_START` | ~77,760 | `sensitivity.py` (parameter tuning) |
-| OOS: 90 days ago → today (90 days) | `BACKTEST_OOS_START` | ~25,920 | `runner.py` (validation) |
+| Window                                    | Config constant                            | Rows at 5 m | Used by                             |
+|-------------------------------------------|--------------------------------------------|-------------|-------------------------------------|
+| IS: 360 days ago → 90 days ago (270 days) | `BACKTEST_LOOKBACK` → `BACKTEST_OOS_START` | ~77,760     | `sensitivity.py` (parameter tuning) |
+| OOS: 90 days ago → today (90 days)        | `BACKTEST_OOS_START`                       | ~25,920     | `runner.py` (validation)            |
 
 Because Binance does
 not expose historical Level-2 order book data, a **synthetic 50-level depth
@@ -800,17 +800,17 @@ All design decisions, pseudo-code, data-flow diagrams, approximation caveats,
 and a step-by-step implementation roadmap with progress tracking are documented
 in **[`BACKTESTING.md`](BACKTESTING.md)**.
 
-| Module | Status | Purpose |
-|---|---|---|
-| `backtest/data.py` | ✅ done | Download historical klines — `fetch_macro_klines()` (5m, HMM) + `fetch_micro_klines()` (1m, PnL); Parquet cache (`cache/klines/`, 24h TTL, `--flush-cache`); IS/OOS boundary enforced via `end_str` / `lookback` |
-| `backtest/synthetic_book.py` | ✅ done | Build synthetic 50-level order book per candle |
-| `backtest/signals.py` | ✅ done | Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m macro frame, Phase 2 `merge_asof` stitch (zero look-ahead), Phase 3 1m execution loop + confidence/regime/VWAP gates → signal +1/−1/0 |
-| `backtest/pnl.py` | ✅ done | Simulated P&L — **intra-candle whipsaw guard** (`SELL_WHIPSAW` at `low−half_spread` when same 1m bar hits BUY+SELL zones; `n_whipsaw_exits` in stats); **pyramiding with a cash-reserve floor** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY legs stack (each ≤ `MAX_POSITION_PCT` of available USDT) until ~70 % invested, always keeping ≥ `MIN_CASH_RESERVE_PCT` (30 %) of equity as USDT, SELL closes the full stacked position in one shot; balance guard; bps-based `half_spread` fill (`BACKTEST_FILL_SPREAD_BPS`); per-leg position cap (`MAX_POSITION_PCT`) and reserve clamp (`MIN_CASH_RESERVE_PCT`) now **shared with the live path** (`execution/order_executor.py` sizing + `strategy/analysis.py` exposure gate, with a live-only `MAX_PYRAMID_LEGS` guard); equity curve; FIFO round-trip pairing; explicit taker-fee deduction in `_pair_round_trips`; Step 5 metrics |
-| `backtest/runner.py` | ✅ done | Top-level orchestration — fetches **OOS window** (`BACKTEST_OOS_START → today`, ~25,920 rows at 5 m / ~129,600 rows at 1 m) via `fetch_macro_klines` + `fetch_micro_klines` (cached); chains all modules, delegates report/CSV to `reporting/`; **plot is ON by default** (use `--no-plot` to suppress in headless/CI mode), `--save-png`, and `--flush-cache` flags.  Loads `fee_rate` from `best_params.json` and passes to `simulate_pnl()` |
-| `backtest/reporting/formatters.py` | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored |
-| `backtest/diagnostics/regime_validation.py` | ✅ done | Offline long-horizon regime validation — **70/30 train-test split** on 2 years (~210,000 rows, `VALIDATION_LOOKBACK = "730 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~63,000 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation` |
-| `backtest/visualization.py` | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands, VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime |
-| `backtest/sensitivity.py` | ✅ done | **Bayesian optimisation via Optuna TPE (default, 40 trials)**, OAT sweep (`--oat`, 8 runs), and deprecated full-grid (`--full-grid`) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER` on the **IS window** (270 days, ~77,760 5m / ~388,800 1m rows).  `fee_rate` fixed at `SENSITIVITY_FEE_RATE` (0.001).  `--lookback` flag overrides IS start.  `--flush-cache` clears the Parquet cache.  Writes `best_params.json` — loaded by `websocket_main.py` (live) and `runner.py` (backtest). Use Case B deferred. |
+| Module                                      | Status | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+|---------------------------------------------|--------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `backtest/data.py`                          | ✅ done | Download historical klines — `fetch_macro_klines()` (5m, HMM) + `fetch_micro_klines()` (1m, PnL); Parquet cache (`cache/klines/`, 24h TTL, `--flush-cache`); IS/OOS boundary enforced via `end_str` / `lookback`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `backtest/synthetic_book.py`                | ✅ done | Build synthetic 50-level order book per candle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `backtest/signals.py`                       | ✅ done | Two-frame signal pipeline: Phase 1 HMM walk-forward on 5m macro frame, Phase 2 `merge_asof` stitch (zero look-ahead), Phase 3 1m execution loop + confidence/regime/VWAP gates → signal +1/−1/0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `backtest/pnl.py`                           | ✅ done | Simulated P&L — **intra-candle whipsaw guard** (`SELL_WHIPSAW` at `low−half_spread` when same 1m bar hits BUY+SELL zones; `n_whipsaw_exits` in stats); **pyramiding with a cash-reserve floor** (`open_strategy_qty` / `_POSITION_DUST_BTC = 1e-6`): BUY legs stack (each ≤ `MAX_POSITION_PCT` of available USDT) until ~70 % invested, always keeping ≥ `MIN_CASH_RESERVE_PCT` (30 %) of equity as USDT, SELL closes the full stacked position in one shot; balance guard; bps-based `half_spread` fill (`BACKTEST_FILL_SPREAD_BPS`); per-leg position cap (`MAX_POSITION_PCT`) and reserve clamp (`MIN_CASH_RESERVE_PCT`) now **shared with the live path** (`execution/order_executor.py` sizing + `strategy/analysis.py` exposure gate, with a live-only `MAX_PYRAMID_LEGS` guard); equity curve; FIFO round-trip pairing; explicit taker-fee deduction in `_pair_round_trips`; Step 5 metrics |
+| `backtest/runner.py`                        | ✅ done | Top-level orchestration — fetches **OOS window** (`BACKTEST_OOS_START → today`, ~25,920 rows at 5 m / ~129,600 rows at 1 m) via `fetch_macro_klines` + `fetch_micro_klines` (cached); chains all modules, delegates report/CSV to `reporting/`; **plot is ON by default** (use `--no-plot` to suppress in headless/CI mode), `--save-png`, and `--flush-cache` flags.  Loads `fee_rate` from `best_params.json` and passes to `simulate_pnl()`                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `backtest/reporting/formatters.py`          | ✅ done | Console report formatting (`print_report`, `print_regime_validation_report`), sensitivity report helpers (`print_sensitivity_table`, `print_oat_sensitivity_report`, `print_bnh_comparison`), and CSV export (`save_csv`) — AI-authored                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `backtest/diagnostics/regime_validation.py` | ✅ done | Offline long-horizon regime validation — **70/30 train-test split** on 2 years (~210,000 rows, `VALIDATION_LOOKBACK = "730 days ago UTC"`), self-contained (no `RegimeDirector`), fits HMM on full train set, **vectorised** single-pass Viterbi on ~63,000 test candles, six statistical checks, `python -m backtest.diagnostics.regime_validation`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `backtest/visualization.py`                 | ✅ done | Interactive six-panel Plotly chart — equity curve, drawdown, BUY/SELL markers + VWAP lines, regime step-line + scaled confidence + colour bands, VWAP vs micro-price + near-miss dots, signal funnel, signals-by-regime                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `backtest/sensitivity.py`                   | ✅ done | **Bayesian optimisation via Optuna TPE (default, 40 trials)**, OAT sweep (`--oat`, 8 runs), and deprecated full-grid (`--full-grid`) over `HMM_LOOKBACK_ROWS`, `HMM_MAX_REGIMES`, `VWAP_WINDOW`, and `VWAP_THRESHOLD_MULTIPLIER` on the **IS window** (270 days, ~77,760 5m / ~388,800 1m rows).  `fee_rate` fixed at `SENSITIVITY_FEE_RATE` (0.001).  `--lookback` flag overrides IS start.  `--flush-cache` clears the Parquet cache.  Writes `best_params.json` — loaded by `websocket_main.py` (live) and `runner.py` (backtest). Use Case B deferred.                                                                                                                                                                                                                                                                                                                                         |
 
 > **Parameter Flow**
 > ```
@@ -832,11 +832,11 @@ Sharpe ratio over the **IS window** (`BACKTEST_LOOKBACK = "360 days ago UTC"` �
 
 **Why Bayesian, not full-grid?**
 
-| Approach | Combinations / Trials | Typical wall time | Search space |
-|---|---|---|---|
-| Full-grid (deprecated) | ~36 fixed combos | ~70–180 min | Discrete, narrow |
-| OAT sweep | 8 runs | ~1–2 h | One param at a time |
-| **Bayesian / Optuna (default)** | **40 trials (configurable)** | **~3–6 h** | **Continuous, wider** |
+| Approach                        | Combinations / Trials        | Typical wall time | Search space          |
+|---------------------------------|------------------------------|-------------------|-----------------------|
+| Full-grid (deprecated)          | ~36 fixed combos             | ~70–180 min       | Discrete, narrow      |
+| OAT sweep                       | 8 runs                       | ~1–2 h            | One param at a time   |
+| **Bayesian / Optuna (default)** | **40 trials (configurable)** | **~3–6 h**        | **Continuous, wider** |
 
 The TPE sampler builds a probabilistic surrogate of the objective (Sharpe ratio)
 and focuses new trials in regions where it predicts high reward — equivalent to
@@ -856,8 +856,7 @@ exchange cost, not a strategy knob.
 
 `hmm_max_regimes` is **pinned at 3** (low = high = 3). A 2-state BIC ceiling can
 only ever produce `trending_up` + `trending_down` — there is no leftover state to
-label `neutral`, so the mean-reversion BUY gate is blocked in every regime (this
-caused a 2-hour, zero-trade live session on 2026-07-09). Three states is the
+label `neutral`, so the mean-reversion BUY gate is blocked in every regime. Three states is the
 minimum that lets a `neutral` regime exist and equals `len(HMM_FEATURE_COLS) − 1`.
 
 **Key design details:**

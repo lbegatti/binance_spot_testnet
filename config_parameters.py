@@ -29,7 +29,8 @@ N_LEVELS = 50  # number of order book levels used in low_latency_analysis()
 CANDIDATE_MEDIAN_FRAC: float = (
     0.5  # thin-book filter: depth ≥ FRAC × median_depth  (was hardcoded 1.0)
 )
-CANDIDATE_DEPTH_FRAC: float = 0.10  # relative-depth  : depth ≥ FRAC × level_0_depth (0.5→0.25→0.10; live 2026-07-18: 0.25 rejected 98.2% of levels, left 83% of buy ticks with no candidates — sole binding liquidity gate)
+CANDIDATE_DEPTH_FRAC: float = 0.10  # relative-depth  : depth ≥ FRAC × level_0_depth (0.5→0.25→0.10; live 2026-07-18:
+# 0.25 rejected 98.2% of levels, left 83% of buy ticks with no candidates — sole binding liquidity gate)
 
 # Diagnostic: when True, collect_candidates() accumulates per-filter reject counts
 # and logs a cumulative summary every CANDIDATE_FILTER_DEBUG_EVERY calls, so a live
@@ -54,7 +55,7 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 300  # default session length
+DEFAULT_SESSION_MINUTES = 200  # default session length
 # at 60 min: ~3600 low-latency iterations (every 1 s), ~60 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown

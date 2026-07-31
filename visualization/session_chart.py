@@ -9,8 +9,9 @@ during a live trading session:
   Panel 1 (65%) — Strategy equity index vs. Buy & Hold baseline (both = 100 at t0).
                   Orders overlaid: filled BUY (solid green ▲) / SELL (solid
                   orange ▼); unfilled orders (placed but cancelled / never
-                  matched) as hollow grey markers, so an order that moved the
-                  equity line is visibly distinct from one that did nothing.
+                  matched) as hollow green ▲ / red ▼ markers, so an order that
+                  moved the equity line is visibly distinct from one that did
+                  nothing.
   Panel 2 (35%) — Component balances: USDT free vs. BTC value (= btc × mid_price).
 
 Pure function — no global state, no side effects beyond writing the output
@@ -65,7 +66,7 @@ def generate_session_pnl_chart(
         "side" ("BUY"/"SELL"), and "price".  After order_status_report() runs,
         each record is also enriched with "exec_qty" (final executed quantity):
         orders with exec_qty == 0 (cancelled / never matched) are drawn as
-        hollow grey markers, filled orders as solid.  When "exec_qty" is absent
+        hollow green ▲ / red ▼ markers, filled orders as solid.  When "exec_qty" is absent
         the order is assumed filled (a real fill is never hidden).  Entries
         without "placed_at" are skipped (legacy frames).
     start_total_usdt : float
@@ -236,8 +237,10 @@ def generate_session_pnl_chart(
             row=1,
             col=1,
         )
-    # Unfilled BUY — hollow grey ▲ (placed but cancelled / never matched; no
-    # position change, so the equity line stays flat at this marker).
+    # Unfilled BUY — hollow green ▲ (placed but cancelled / never matched; no
+    # position change, so the equity line stays flat at this marker).  Coloured
+    # green like the filled BUY but left hollow, so filled vs unfilled stays
+    # distinguishable while the side (BUY) is obvious at a glance.
     if buy_open_ts:
         fig.add_trace(
             go.Scatter(
@@ -246,16 +249,18 @@ def generate_session_pnl_chart(
                 mode="markers",
                 name="BUY (unfilled)",
                 marker=dict(
-                    color="#9e9e9e",
+                    color="#2ca02c",
                     symbol="triangle-up-open",
                     size=10,
-                    line=dict(width=1.5, color="#9e9e9e"),
+                    line=dict(width=1.5, color="#2ca02c"),
                 ),
             ),
             row=1,
             col=1,
         )
-    # Unfilled SELL — hollow grey ▼
+    # Unfilled SELL — hollow red ▼ (coloured red so the side is obvious; left
+    # hollow so filled vs unfilled stays distinguishable — and red vs the filled
+    # SELL's orange further separates the two).
     if sell_open_ts:
         fig.add_trace(
             go.Scatter(
@@ -264,10 +269,10 @@ def generate_session_pnl_chart(
                 mode="markers",
                 name="SELL (unfilled)",
                 marker=dict(
-                    color="#9e9e9e",
+                    color="#d62728",
                     symbol="triangle-down-open",
                     size=10,
-                    line=dict(width=1.5, color="#9e9e9e"),
+                    line=dict(width=1.5, color="#d62728"),
                 ),
             ),
             row=1,

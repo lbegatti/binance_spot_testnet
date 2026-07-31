@@ -393,8 +393,9 @@ class AnalysisEngine:
         3. **Level construction** — builds the top ``N_LEVELS`` (50) bid/ask
            pairs; computes ``total_depth``, ``mid_price``, ``micro_price``,
            ``OBI``, ``bq``, ``aq`` per level.
-        4. **Candidate selection** — filters levels by depth adequacy (≥ 50 %
-           of level-0 depth) and micro-mid direction (``micro_price > mid_price``
+        4. **Candidate selection** — filters levels by depth adequacy
+           (≥ ``CANDIDATE_DEPTH_FRAC`` × level-0 depth, 10 % at present) and micro-mid
+           direction (``micro_price > mid_price``
            → BUY candidate; ``micro_price < mid_price`` → SELL candidate).
         5. **Scoring** — ranks candidates by
            ``0.70 × norm_depth + 0.30 × norm_delta``; picks the best for each
