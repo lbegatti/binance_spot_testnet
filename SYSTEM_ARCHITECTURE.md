@@ -101,70 +101,53 @@ FILES
   Owns two background threads (started by `websocket_main.py`), both of which
   check `stop_event` on every iteration and exit gracefully when it is set.
 
-  Private cross-thread attributes:
-    _vwap_lock            : Lock          — serialises _bid_vwap / _ask_vwap
-    _bid_vwap             : float | None  — latest bid VWAP from historical_analysis
-    _ask_vwap             : float | None  — latest ask VWAP from historical_analysis
-    _regime_lock          : Lock          — serialises regime_director.regime_label
-                                             AND _trend_paused (same source frame,
-                                             same write cadence)
-    _position_open        : bool          — True while any pyramiding BUY leg is
-                                             open; mirrors open_strategy_qty in
-                                             backtest/pnl.py. BUY legs stack via the
-                                             exposure gate (MAX_PYRAMID_LEGS +
-                                             MIN_CASH_RESERVE_PCT reserve floor); a full
-                                             SELL / stop-loss closes the position. Set
-                                             True at session start when
-                                             balance_status[BTC] ≥ 0.0001 so inherited
-                                             BTC is carried as the session's STARTING
-                                             POSITION and traded around normally (BUY
-                                             more or SELL per signals). Fires when
-                                             FLATTEN_ON_START=False (carry inventory, the
-                                             default); with FLATTEN_ON_START=True the
-                                             account is flattened to USDT-only first and
-                                             this does not fire.
-    _position_guard_skips : int           — BUY signals suppressed this session
-    _pending_buy_placed_at: float | None  — wall-clock time the last GTC BUY was dispatched;
-                                             used by cancel_stale_buy() to detect 10-second timeout
-    _pending_buy_id       : int | None    — Binance orderId of the outstanding GTC BUY order
-                                             (set synchronously on REST, async via handle_order_response on WS)
-    _trend_paused         : bool          — mirrors trend_pause column in
-                                             backtest/signals.py; True ⇒ skip
-                                             BOTH BUY and SELL this tick
-    _trend_pause_skips    : int           — ticks suppressed by the trend-pause
-                                             gate this session
-    _stop_loss_state      : dict          — shared mutable container owned by
-                                             websocket_main.py; keys "pct" and
-                                             "last_day_utc".  AnalysisEngine
-                                             reads it; the refresher closure
-                                             writes it.  Pure decoupling — no
-                                             REST client touches this class.
-    _refresh_stop_loss_fn : Callable | None — closure injected by websocket_main.py
-                                             that re-computes the threshold from
-                                             PRODUCTION daily klines (keyless
-                                             market_data_client — mirrors
-                                             backtest/signals.py, which uses
-                                             production data).  Called once per
-                                             UTC day from historical_analysis().
-    _stop_loss_lock       : Lock          — serialises _stop_loss_state
-    _avg_entry_price      : float         — VWAP entry price of the open
-                                             strategy position (0.0 when flat);
-                                             stop-loss anchor
-    _n_stop_loss_fires    : int           — emergency exits this session
-    _macro_trend_state    : dict          — shared mutable container owned by
-                                             websocket_main.py; keys "state"
-                                             ("down"/"neutral"/"up") and
-                                             "last_day_utc".  AnalysisEngine
-                                             reads it; the refresher closure
-                                             writes it — same REST decoupling as
-                                             _stop_loss_state.
-    _refresh_macro_trend_fn : Callable | None — closure injected by websocket_main.py
-                                             that re-computes the state from
-                                             PRODUCTION daily klines once per UTC
-                                             day (None ⇒ overlay disabled, state
-                                             stays "neutral" forever).
-    _macro_trend_lock     : Lock          — serialises _macro_trend_state
-    _n_macro_downtrend_liquidations : int — force-to-cash exits this session
+  Private cross-thread attributes, grouped by concern:
+
+**Locks** — each serialises the state named:
+
+| Attribute | Type | Serialises |
+|-----------|------|------------|
+| `_vwap_lock` | Lock | `_bid_vwap` / `_ask_vwap` |
+| `_regime_lock` | Lock | `regime_director.regime_label` **and** `_trend_paused` (same source frame, same write cadence) |
+| `_stop_loss_lock` | Lock | `_stop_loss_state` |
+| `_macro_trend_lock` | Lock | `_macro_trend_state` |
+
+**VWAP state** — written by `historical_analysis`, read by `low_latency_analysis` under `_vwap_lock`:
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `_bid_vwap` | float \| None | Latest bid VWAP from `historical_analysis` |
+| `_ask_vwap` | float \| None | Latest ask VWAP from `historical_analysis` |
+
+**Position / order-guard state:**
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `_position_open` | bool | True while any pyramiding BUY leg is open; mirrors `open_strategy_qty` in `backtest/pnl.py`. BUY legs stack via the exposure gate (`MAX_PYRAMID_LEGS` + `MIN_CASH_RESERVE_PCT` reserve floor); a full SELL / stop-loss closes the position. Startup carry behaviour → see the note below the tables. |
+| `_pending_buy_placed_at` | float \| None | Wall-clock time the last GTC BUY was dispatched; used by `cancel_stale_buy()` to detect the 10-second timeout |
+| `_pending_buy_id` | int \| None | Binance orderId of the outstanding GTC BUY order (set synchronously on REST, async via `handle_order_response` on WS) |
+| `_trend_paused` | bool | Mirrors the `trend_pause` column in `backtest/signals.py`; True ⇒ skip BOTH BUY and SELL this tick |
+| `_avg_entry_price` | float | VWAP entry price of the open strategy position (0.0 when flat); stop-loss anchor |
+
+**Stop-loss & macro-trend state** — shared mutable containers owned by `websocket_main.py`; `AnalysisEngine` reads them, the injected refresher closure writes them (pure REST decoupling — no REST client touches this class):
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `_stop_loss_state` | dict | Keys `"pct"`, `"last_day_utc"` |
+| `_refresh_stop_loss_fn` | Callable \| None | Closure injected by `websocket_main.py` that re-computes the threshold from PRODUCTION daily klines (keyless `market_data_client` — mirrors `backtest/signals.py`, which uses production data). Called once per UTC day from `historical_analysis()`. |
+| `_macro_trend_state` | dict | Keys `"state"` (`"down"`/`"neutral"`/`"up"`), `"last_day_utc"` — same REST decoupling as `_stop_loss_state` |
+| `_refresh_macro_trend_fn` | Callable \| None | Closure injected by `websocket_main.py` that re-computes the state from PRODUCTION daily klines once per UTC day (None ⇒ overlay disabled, state stays `"neutral"` forever). |
+
+**Session counters:**
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `_position_guard_skips` | int | BUY signals suppressed this session |
+| `_trend_pause_skips` | int | Ticks suppressed by the trend-pause gate this session |
+| `_n_stop_loss_fires` | int | Emergency exits this session |
+| `_n_macro_downtrend_liquidations` | int | Force-to-cash exits this session |
+
+**Startup inventory carry** (`_position_open` at session start): when `FLATTEN_ON_START=False` (carry inventory, the default), `_position_open` is set True at session start if `balance_status[BTC] ≥ 0.0001`, so inherited BTC is carried as the session's STARTING POSITION and traded around normally (BUY more or SELL per signals). With `FLATTEN_ON_START=True` the account is flattened to USDT-only first and this does not fire.
 
   ▸ low_latency_analysis()  [every HFT_INTERVAL = 1 s]
       Reads balance, copies order book under thread_lock, builds the top
@@ -239,7 +222,7 @@ FILES
 
       After ~5 min the deque is full and becomes a true rolling window.
 
-  ▸ Thread timeline (default 60-min session):
+  ▸ Thread timeline (default 120-min session):
 
       t=0s      Both threads start
                 ├── low_latency: runs immediately, then every 1 s
@@ -451,7 +434,7 @@ FILES
     — at most `MAX_POSITION_PCT` (default 20 %) of available USDT per signal,
     with the taker fee reserved.  The budget is then clamped by the
     **cash-reserve floor** so the leg never spends the account below
-    `MIN_CASH_RESERVE_PCT` (0.30) of mark-to-market equity, mirroring
+    `MIN_CASH_RESERVE_PCT` (0.20) of mark-to-market equity, mirroring
     `backtest/pnl.py`; the dispatched `last_buy_qty` / `last_buy_price` are
     exposed for the strategy's pyramiding cost-basis accrual.  SELL =
     `min(bq, btc)`.  `MAX_POSITION_PCT` and `MIN_CASH_RESERVE_PCT` are the same

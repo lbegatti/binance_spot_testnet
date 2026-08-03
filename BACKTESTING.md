@@ -269,15 +269,21 @@ if open_strategy_qty > _POSITION_DUST_BTC
 
 ### Position model — pyramiding with a cash-reserve floor
 
-`simulate_pnl()` lets BUY legs **stack (pyramid)** via `open_strategy_qty` (BTC held exclusively by strategy signals, excluding `initial_btc`). Each leg spends at most `MAX_POSITION_PCT` (20 %) of the *available* USDT, and successive legs accumulate until invested exposure reaches `(1 − MIN_CASH_RESERVE_PCT)` = 70 % of mark-to-market equity — i.e. at least 30 % of the portfolio is always held as USDT. A BUY that would spend into the reserve is clamped; one fully blocked (cash already at/below the floor) is counted in `n_position_guard_skips` (returned in the `stats` dict). SELL always closes the full stacked position in one shot, guaranteeing the strategy returns to flat. The entry price is tracked as a VWAP across all open legs, which the adaptive stop-loss uses as its anchor.
+`simulate_pnl()` lets BUY legs **stack (pyramid)** via `open_strategy_qty` (BTC held exclusively by strategy signals, excluding `initial_btc`):
 
-> **Note (live/backtest parity):** this pyramiding model is now active on **both paths** (Phase 2 complete). The live path (`execution/order_executor.py` sizing clamp + `strategy/analysis.py` exposure gate) stacks BUY legs to the same `(1 − MIN_CASH_RESERVE_PCT)` = 70 % invested-exposure ceiling as `backtest/pnl.py`, additionally bounded by the live-only `MAX_PYRAMID_LEGS` safety cap (12 legs — enough to reach the 70 % floor with margin at the 20 % per-leg step). A full SELL or stop-loss resets the position to flat.
+- **Per-leg size** — each leg spends at most `MAX_POSITION_PCT` (20 %) of the *available* USDT.
+- **Exposure ceiling** — successive legs accumulate until invested exposure reaches `(1 − MIN_CASH_RESERVE_PCT)` = 80 % of mark-to-market equity — i.e. at least 20 % of the portfolio is always held as USDT.
+- **Reserve clamp** — a BUY that would spend into the reserve is clamped; one fully blocked (cash already at/below the floor) is counted in `n_position_guard_skips` (returned in the `stats` dict).
+- **Exit** — SELL always closes the full stacked position in one shot, guaranteeing the strategy returns to flat.
+- **Cost basis** — the entry price is tracked as a VWAP across all open legs, which the adaptive stop-loss uses as its anchor.
+
+> **Note (live/backtest parity):** this pyramiding model is now active on **both paths** (Phase 2 complete). The live path (`execution/order_executor.py` sizing clamp + `strategy/analysis.py` exposure gate) stacks BUY legs to the same `(1 − MIN_CASH_RESERVE_PCT)` = 80 % invested-exposure ceiling as `backtest/pnl.py`, additionally bounded by the live-only `MAX_PYRAMID_LEGS` safety cap (12 legs — enough to reach the 80 % floor with margin at the 20 % per-leg step). A full SELL or stop-loss resets the position to flat.
 
 ### Trade sizing and costs
 
 - BUY quantity = `aq` from best-buy candidate, capped at `min(aq, usdt / (price × (1 + fee_rate)))` for BUY to reserve taker fee.
 - SELL quantity = `bq` from best-sell candidate, capped at `min(bq, btc_balance)`.
-- `usdt_budget = usdt × MAX_POSITION_PCT` (20 %) limits each BUY **leg** to ~20 % of available USDT; the budget is then clamped by the cash-reserve floor `spendable = usdt − MIN_CASH_RESERVE_PCT × equity` so stacked legs never invest past 70 % of equity.  Both `MAX_POSITION_PCT` and the reserve clamp are now shared live in `execution/order_executor.py` + `strategy/analysis.py` (Phase 2 complete).
+- `usdt_budget = usdt × MAX_POSITION_PCT` (20 %) limits each BUY **leg** to ~20 % of available USDT; the budget is then clamped by the cash-reserve floor `spendable = usdt − MIN_CASH_RESERVE_PCT × equity` so stacked legs never invest past 80 % of equity.  Both `MAX_POSITION_PCT` and the reserve clamp are now shared live in `execution/order_executor.py` + `strategy/analysis.py` (Phase 2 complete).
 - Taker fee: 0.10 % per side (`BACKTEST_FEE_RATE = 0.001`).
 - Fill prices: `close ± half_spread` where `half_spread = close × BACKTEST_FILL_SPREAD_BPS / 20 000` (default 5 bps, ~$20 at $80k BTC).
 
@@ -359,7 +365,7 @@ matches the live paper-trading account (~250k USDT + 1 BTC ≈ 315k).
 | **Confidence filter hit rate**   | `confidence_filter_hit_rate_pct` | `(confidence_blocked_buy + confidence_blocked_sell) / total_raw_candidates × 100` — % of raw candidates blocked because `regime_confidence < HMM_MIN_CONFIDENCE` (model too uncertain)                                                                                                                                                                                                                                           |
 | **Regime filter hit rate**       | `regime_filter_hit_rate_pct`     | `(regime_blocked_buy + regime_blocked_sell) / total_raw_candidates × 100` — % of raw candidates (that passed the confidence gate) blocked by the regime direction gate                                                                                                                                                                                                                                                           |
 | **VWAP filter hit rate**         | `vwap_filter_hit_rate_pct`       | Residual: `raw − executed − confidence_blocked − regime_blocked − macro_blocked`, divided by `total_raw_candidates × 100` — % blocked by the VWAP dip/strength gate (now the fourth and final gate, after the macro-trend gate)                                                                                                                                                                                                  |
-| **Position guard skips**         | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the **cash-reserve floor** was already reached (no spendable USDT above `MIN_CASH_RESERVE_PCT × equity`, i.e. the book is at its ~70 % invested cap). Stat key retained for backward-compat.                                                                                                                                                        |
+| **Position guard skips**         | `n_position_guard_skips`         | Count of BUY signals that passed all three gates but were suppressed because the **cash-reserve floor** was already reached (no spendable USDT above `MIN_CASH_RESERVE_PCT × equity`, i.e. the book is at its ~80 % invested cap). Stat key retained for backward-compat.                                                                                                                                                        |
 | **Whipsaw exits**                | `n_whipsaw_exits`                | Count of forced pessimistic exits triggered by the intra-candle whipsaw guard (same 1-minute bar's Low ≤ best-buy micro AND High ≥ best-sell micro).  Each event records a `SELL_WHIPSAW` trade at `candle_low − half_spread`                                                                                                                                                                                                    |
 | **Stop-loss fires**              | `n_stop_loss_fires`              | Count of positions force-closed by the adaptive stop-loss (`close < avg_entry_price × (1 − stop_loss_pct)`).  Each event records a `SELL_STOP_LOSS` trade.  See §Stop-loss vs B&H above for calibration guidance                                                                                                                                                                                                                 |
 | **Trend-pause skips**            | `n_trend_pause_skips`            | Count of 1-minute bars where a BUY or SELL signal was suppressed because `trend_pause == True` (the macro frame was in a sustained directional run of ≥ `TREND_CONSECUTIVE_BARS` bars).  The stop-loss check still fires unconditionally on paused bars                                                                                                                                                                          |
@@ -846,9 +852,6 @@ concrete file in `backtest/`.
   sequential gates (confidence, regime, VWAP dip/strength) → signal `+1`/`−1`/`0`.
   `high` and `low` columns retained in output for the whipsaw guard.
   *(Implemented.)*
-- ✅ **Step 4 — `backtest/pnl.py`** — Converts the signal Series into
-  simulated trades (using ``bq``/``aq`` quantities and the balance guard)
-  and computes the Step 5 performance metrics: total return, win rate,
 - ✅ **Step 4 — `backtest/pnl.py`** — Converts the signal DataFrame into
   simulated trades (using ``bq``/``aq`` quantities and the balance guard)
   and computes the Step 5 performance metrics: total return, win rate,
@@ -856,7 +859,7 @@ concrete file in `backtest/`.
   and regime / VWAP filter hit rates.  **Pyramiding with a cash-reserve
   floor** (``open_strategy_qty`` / ``_POSITION_DUST_BTC = 1e-6``): BUY legs
   stack, each ≤ ``MAX_POSITION_PCT`` of available USDT, until invested
-  exposure hits ``(1 − MIN_CASH_RESERVE_PCT)`` = 70 % of equity; SELL closes
+  exposure hits ``(1 − MIN_CASH_RESERVE_PCT)`` = 80 % of equity; SELL closes
   the full stacked position in one shot and resets to flat; BUYs blocked by
   the reserve floor are returned as ``n_position_guard_skips`` in the stats
   dict and reported in the console summary.  **Intra-candle whipsaw guard** (Step 9): fires when same 1-minute

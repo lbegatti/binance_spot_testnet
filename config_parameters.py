@@ -55,8 +55,8 @@ MIN_SNAPSHOTS = 100  # minimum snapshots required before historical analysis run
 # ---------------------------------------------------------------------------
 # WebSocket session
 # ---------------------------------------------------------------------------
-DEFAULT_SESSION_MINUTES = 200  # default session length
-# at 60 min: ~3600 low-latency iterations (every 1 s), ~60 historical runs (every 60 s)
+DEFAULT_SESSION_MINUTES = 120  # default session length
+# at 120 min: ~7200 low-latency iterations (every 1 s), ~120 historical runs (every 60 s)
 HTF_JOIN_TIMEOUT = 10  # s — max wait for low_latency_analysis thread on shutdown
 HIST_JOIN_TIMEOUT = 15  # s — max wait for historical_analysis thread on shutdown
 # Cadence of the REST balance-refresh daemon (driver-side, defense in depth).
@@ -316,8 +316,8 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # Cash-reserve floor (fraction of mark-to-market equity that must always remain
 # in USDT).  BUY legs may PYRAMID — each leg is still ≤ MAX_POSITION_PCT of the
 # available USDT, but successive legs stack until invested exposure reaches
-# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.30 → at most 70 % invested, always
-# ≥ 30 % cash held back.  Replaces the old single-position rule that left the
+# (1 − MIN_CASH_RESERVE_PCT) of equity.  0.20 → at most 80 % invested, always
+# ≥ 20 % cash held back.  Replaces the old single-position rule that left the
 # book ~90 % idle in cash, without ever going fully all-in.  Applies to BOTH the
 # live system and the backtest so simulated and live sizing stay aligned.
 #
@@ -341,9 +341,13 @@ MAX_POSITION_PCT: float = 0.20  # 20 % of available USDT per BUY leg (live + bac
 # DD brake, so exposure is loosened to recover return in the neutral/up regimes
 # where the strategy makes money.  Re-run IS+OOS to confirm the tail does not
 # re-inflate (the overlay should now catch it instead of the reserve).
+# Lowered 2026-08-03 from 0.30 → 0.20 (70 % → 80 % invested) — same rationale:
+# with the macro-trend overlay as the primary tail control, loosen the always-on
+# reserve further to recover neutral/up-regime return.  Re-run IS+OOS to confirm
+# the tail does not re-inflate.
 #
 # Risk-management parameter — DO NOT add to the Optuna search space.
-MIN_CASH_RESERVE_PCT: float = 0.30  # keep ≥ 30 % of equity as USDT (live + backtest)
+MIN_CASH_RESERVE_PCT: float = 0.20  # keep ≥ 20 % of equity as USDT (live + backtest)
 
 # -- Pyramiding control (live path — execution/order_executor.py +
 #    strategy/analysis.py) ------------------------------------------------
@@ -357,7 +361,7 @@ MIN_CASH_RESERVE_PCT: float = 0.30  # keep ≥ 30 % of equity as USDT (live + ba
 # Risk-management parameter — DO NOT add to the Optuna search space.
 # Each leg spends MAX_POSITION_PCT (20 %) of REMAINING free cash, so invested
 # exposure after n legs ≈ 1 − 0.8ⁿ of cash: n=3 → ~49 %, n=6 → ~74 %, n=12 → ~93 %.
-# The 30 % MIN_CASH_RESERVE_PCT floor (→ 70 % invested) binds at ~6 legs, so the
+# The 20 % MIN_CASH_RESERVE_PCT floor (→ 80 % invested) binds at ~8 legs, so the
 # 12-leg cap leaves comfortable margin (the reserve clamp trims the final leg to
 # land exactly at the floor).  Also keeps the live cap consistent with the
 # backtest, which has no leg cap and reaches the 70 % ceiling from the reserve

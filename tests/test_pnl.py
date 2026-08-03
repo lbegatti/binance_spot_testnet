@@ -69,8 +69,8 @@ def test_simulate_pnl_pyramids_second_buy():
     MAX_POSITION_PCT (20%) of the *remaining* cash, so both execute and no
     reserve-floor skip is recorded. A large book qty makes the budget bind:
     leg 1 spends 20% of 1000 (= 2.0 BTC @ 100); leg 2 spends 20% of the
-    remaining 800 (= 160/101 BTC @ 101). The 30% reserve floor does not bind
-    (cash stays above 30% of equity for both legs)."""
+    remaining 800 (= 160/101 BTC @ 101). The 20% reserve floor does not bind
+    (cash stays above 20% of equity for both legs)."""
     sig = make_signals(
         [
             {"signal": 1, "close": 100.0, "buy_qty": 100.0, "best_buy_micro": 100.0},
@@ -87,10 +87,10 @@ def test_simulate_pnl_pyramids_second_buy():
 
 
 def test_simulate_pnl_reserve_floor_blocks_buy():
-    """When cash is already at/below MIN_CASH_RESERVE_PCT (30%) of mark-to-market
+    """When cash is already at/below MIN_CASH_RESERVE_PCT (20%) of mark-to-market
     equity, a BUY is suppressed (counted in n_position_guard_skips) so the book
-    never invests past 70%. Here 100 USDT cash + 10 BTC @ 100 → equity 1100, and
-    the 330 reserve floor (30% × 1100) already exceeds the 100 cash, so the BUY is
+    never invests past 80%. Here 100 USDT cash + 10 BTC @ 100 → equity 1100, and
+    the 220 reserve floor (20% × 1100) already exceeds the 100 cash, so the BUY is
     refused and no trade fires."""
     sig = make_signals(
         [

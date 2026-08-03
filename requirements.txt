@@ -1,3 +1,8 @@
+# NOTE: two Binance client libs coexist and share the `binance` namespace —
+#   binance-connector (live + backtest paths: binance.spot / .websocket / .lib)
+#   and python_binance (restapi_main.py only: binance.client.Client).
+#   Both import cleanly in .venv314; on a fresh install keep BOTH so the REST
+#   reference script (restapi_main.py) can still resolve binance.client.
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
 aiosignal==1.4.0
