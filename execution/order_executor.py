@@ -18,6 +18,29 @@ from config_parameters import (
 )
 
 
+def _retry_transient(fn, *, attempts: int = 3, base_delay: float = 0.5):
+    """
+    Call ``fn()`` and retry on transient failures (Binance 5xx / nginx 502-504,
+    network timeouts) with exponential backoff.  Re-raises the last exception
+    if all attempts fail.
+
+    Used for shutdown-critical REST calls where a single server-side blip must
+    not leave session orders stranded on the book.  Any exception triggers a
+    retry — safe here because the wrapped calls are shutdown-time and
+    effectively idempotent (``get_open_orders`` is read-only; re-cancelling an
+    already-cancelled order errors harmlessly).
+    """
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — transient guard, re-raised below
+            last_exc = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))  # 0.5 s, 1.0 s, …
+    raise last_exc  # type: ignore[misc]
+
+
 class OrderExecutor:
     """
     Responsible for placing LIMIT GTC orders and maintaining real-time
@@ -1006,12 +1029,14 @@ class OrderExecutor:
         if self.rest_client is None or not self.placed_orders:
             return
         try:
-            open_orders = self.rest_client.get_open_orders(
-                symbol=SYMBOL, recvWindow=RECV_WINDOW
+            open_orders = _retry_transient(
+                lambda: self.rest_client.get_open_orders(
+                    symbol=SYMBOL, recvWindow=RECV_WINDOW
+                )
             )
         except Exception as e:
             logging.warning(
-                "Shutdown cancel: could not fetch open orders (%s) — "
+                "Shutdown cancel: could not fetch open orders after retries (%s) — "
                 "session orders may remain on the book.",
                 e,
             )
@@ -1025,8 +1050,10 @@ class OrderExecutor:
         freed_usdt = freed_btc = 0.0
         for o in to_cancel:
             try:
-                self.rest_client.cancel_order(
-                    symbol=SYMBOL, orderId=o["orderId"], recvWindow=RECV_WINDOW
+                _retry_transient(
+                    lambda o=o: self.rest_client.cancel_order(
+                        symbol=SYMBOL, orderId=o["orderId"], recvWindow=RECV_WINDOW
+                    )
                 )
                 remaining = float(o["origQty"]) - float(o["executedQty"])
                 if o.get("side") == "BUY":

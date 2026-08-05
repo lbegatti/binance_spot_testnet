@@ -292,7 +292,11 @@ FILES
   shutdown and fill unattended afterwards.  Only
   the session's own orderIds are touched; foreign open orders on the shared
   testnet account are left alone.  The order report that follows shows these
-  orders as CANCELED rather than OPEN.
+  orders as CANCELED rather than OPEN.  Both the open-orders fetch and each
+  per-order cancel are wrapped in `_retry_transient` (3 attempts, 0.5 s → 1 s
+  exponential backoff) so a single transient Binance-side error (nginx 502-504 /
+  5xx) during shutdown does not silently skip the cancel and strand orders on the
+  book.
 
   **REST balance-refresh daemon (`BALANCE_REFRESH_INTERVAL`, default 60 s):**
   the WS user-data push (`outboundAccountPosition` over
