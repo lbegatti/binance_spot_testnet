@@ -156,38 +156,43 @@ with self._regime_lock:
     current_regime = self.regime_director.regime_label   # fast read
 ```
 
-The label is then used as the **first gate** before the VWAP filter:
+The label is one gate in a longer per-tick sequence. Full order: stop-loss →
+macro-trend force-to-cash → confidence gate → trend-pause gate → macro-trend
+BUY/SELL gate → **regime direction gate** → VWAP dead-zone gate → exposure gate
+(BUY) / resting-exit check (SELL). Simplified to just the regime + VWAP +
+exposure logic:
 
 ```python
 if best_buy:
-    if current_regime in ("trending_down", "high_volatility"):
-        # regime blocks BUY — skip entirely, do not evaluate VWAP
-        pass
+    if macro_state == "down":
+        pass                                   # macro overlay: no dip-buying in a downtrend
+    elif current_regime in ("trending_down", "high_volatility"):
+        pass                                   # regime blocks BUY
     elif bid_vwap is not None and micro_price >= bid_vwap * (1.0 - VWAP_THRESHOLD_MULTIPLIER):
-        # VWAP dead-zone blocks BUY — dip too shallow to cover fees (inside ±δ of bid_vwap)
-        pass
-    elif self._position_open:
-        # Position guard — already holding a strategy-opened position.
-        # Prevents order stacking (grid behaviour) in both REST-fallback mode
-        # (balance never updated) and the WS race window (balance update arrives late).
-        # Mirrors the identical guard in backtest/pnl.py.
-        self._position_guard_skips += 1
-        logging.info("HFT #%d [buy] — skipped: position already open (guard skips: %d)",
-                     iteration, self._position_guard_skips)
+        pass                                   # VWAP dead-zone: dip too shallow
     else:
-        self._position_open = True        # mark position as open BEFORE calling execute
-        executor.execute("BUY", best_buy)      # all filters passed
+        # Exposure gate (pyramiding). A new BUY leg is dispatched only if: no
+        # order is in flight (serialized legs), fewer than MAX_PYRAMID_LEGS are
+        # open, AND free USDT stays above the MIN_CASH_RESERVE_PCT reserve floor.
+        # Otherwise it is a skip (_position_guard_skips++). A dispatched leg is
+        # added to the running volume-weighted cost basis (the stop-loss anchor).
+        if leg_allowed:
+            executor.execute("BUY", best_buy)
+            self._add_leg_to_basis(executor.last_buy_price, executor.last_buy_qty)
 
-if best_sell:
-    if current_regime in ("trending_up", "high_volatility"):
-        # regime blocks SELL — skip entirely
-        pass
+if best_sell and not buy_dispatched:           # at most one trade per tick
+    if macro_state == "up":
+        pass                                   # macro overlay: hold & ride, don't sell strength
+    elif not self._position_open and current_regime in ("trending_up", "high_volatility"):
+        pass                                   # regime blocks a NEW short; an exit is always allowed
     elif ask_vwap is not None and micro_price < ask_vwap * (1.0 + VWAP_THRESHOLD_MULTIPLIER):
-        # VWAP dead-zone blocks SELL — rally too weak to cover fees (inside ±δ of ask_vwap)
-        pass
-    else:
-        self._position_open = False           # reset guard — strategy is now flat
-        executor.execute("SELL", best_sell)    # both filters passed
+        pass                                   # VWAP dead-zone: rally too weak
+    elif not executor.has_pending_sell():
+        # Planned exit rests as a LIMIT GTC (maker). The position stays OPEN and
+        # the stop-loss anchor intact until cancel_stale_sell() confirms the fill;
+        # the flag is NOT flipped to flat here, or a BUY could stack behind the
+        # unfilled SELL.
+        executor.execute("SELL", best_sell)
 ```
 
 BUY is anchored to `bid_vwap` (volume-weighted bid pressure); SELL is anchored to `ask_vwap` (volume-weighted ask pressure). Using separate anchors avoids cross-side VWAP bias.
@@ -206,7 +211,7 @@ config_parameters.py
 websocket_main.py  ── step 4b, single-threaded, BEFORE threads start ──
   RegimeDirector()
     .get_klines_data()           ← Binance public REST (no auth needed)
-    .select_hmm_model()          ← GaussianHMM BIC search (n = 2 … 4)
+    .select_hmm_model()          ← GaussianHMM BIC search (n = 2 … 3)
     .assign_regime_labels()     ← regime_label = "trending_up" / ...
         │
         │  injected as parameter

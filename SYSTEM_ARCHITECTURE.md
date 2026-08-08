@@ -26,7 +26,7 @@ FILES
     quotes.py                         — find_best_quote(): best bid/ask selection helpers
 
   execution/
-    order_executor.py                 — OrderExecutor: LIMIT GTC (BUY) / IOC (SELL) orders via WebSocket API + balance refresh + 10-second stale-BUY cancel
+    order_executor.py                 — OrderExecutor: LIMIT GTC (BUY) / MARKET (urgent stop-loss SELL) or LIMIT GTC (planned SELL) via WebSocket API + balance refresh + 10-second stale-BUY/SELL cancel
 
   visualization/
     plot_helpers.py                   — Charting utilities for the REST snapshot path
@@ -222,7 +222,7 @@ FILES
 
       After ~5 min the deque is full and becomes a true rolling window.
 
-  ▸ Thread timeline (default 120-min session):
+  ▸ Thread timeline (default 150-min session; the t=…20min walkthrough below is illustrative):
 
       t=0s      Both threads start
                 ├── low_latency: runs immediately, then every 1 s
@@ -259,9 +259,11 @@ FILES
   `train_end = 80`.  `regime_confidence = predict_proba(full_scaled)[-1,
   current_regime]`.
 
-  Label assignment (rank-based, no hard-coded price constants):
+  Label assignment (rank-based, gated by an absolute-return threshold):
     direction_score = return.rank() + obi_proxy.rank()
-    idxmax → "trending_up"    idxmin → "trending_down"
+    idxmax → "trending_up"   only if mean log-return > +REGIME_DIRECTIONAL_RETURN_THRESHOLD (0.0005)
+    idxmin → "trending_down" only if mean log-return < −REGIME_DIRECTIONAL_RETURN_THRESHOLD
+    a best/worst state failing the ±threshold is non-directional → falls through
     remaining states: high_vol OR high_td → "high_volatility"; else "neutral"
 
   Regime gates in low_latency_analysis (sequential):

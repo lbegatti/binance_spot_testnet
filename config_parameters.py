@@ -441,7 +441,8 @@ MACRO_TREND_BAND_PCT: float = 0.02  # ±2 % dead-zone around the SMA before a tr
 #
 # Imported by: strategy/analysis.py (live WebSocket path),
 #              backtest/signals.py  (backtest path),
-#              backtest/sensitivity.py (fixed baseline — not tuned in grid).
+#              backtest/sensitivity.py (OAT/full-grid baseline only; the Bayesian
+#                Optuna search DOES tune it — range 0.002–0.003, see _OPTUNA_SPACE).
 VWAP_THRESHOLD_MULTIPLIER: float = (
     0.002  # 0.20 % dead zone — exact round-trip break-even
 )

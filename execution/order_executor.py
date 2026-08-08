@@ -37,7 +37,7 @@ def _retry_transient(fn, *, attempts: int = 3, base_delay: float = 0.5):
         except Exception as e:  # noqa: BLE001 — transient guard, re-raised below
             last_exc = e
             if i < attempts - 1:
-                time.sleep(base_delay * (2 ** i))  # 0.5 s, 1.0 s, …
+                time.sleep(base_delay * (2**i))  # 0.5 s, 1.0 s, …
     raise last_exc  # type: ignore[misc]
 
 
